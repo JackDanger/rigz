@@ -1,0 +1,8 @@
+rigz (0.1.0-1) unstable; urgency=medium
+
+  * Initial release.
+  * Parallel gzip compression using Rust and rayon
+  * Compatible with standard gzip/gunzip tools
+  * Drop-in replacement for gzip command-line interface
+
+ -- rigz contributors <rigz@example.com>  Wed, 15 Jan 2025 00:00:00 +0000

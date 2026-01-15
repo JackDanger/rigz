@@ -1,0 +1,50 @@
+[package]
+name = "rigz"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of pigz - parallel gzip replacement"
+license = "Zlib"
+authors = ["Rust port"]
+
+[dependencies]
+# NO gzp - we implement our own parallel compression to control the zlib backend
+
+# Use flate2 with system zlib (libz-sys) - matches gzip's compression exactly
+# This is the key to matching gzip's output at ALL compression levels
+flate2 = { version = "1.0", default-features = false, features = ["zlib"] }
+
+# For CRC32 calculation
+crc32fast = "1.4"
+
+# Command line parsing
+clap = { version = "4.5", features = ["derive"] }
+
+# File system operations
+walkdir = "2.4"
+filetime = "0.2"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Utility
+num_cpus = "1.16"
+
+# High-performance parallel processing
+crossbeam-channel = "0.5"
+crossbeam-deque = "0.8"
+rayon = "1.8"
+
+# Memory-mapped I/O for zero-copy file access
+memmap2 = "0.9"
+
+# CPU optimization and system info
+core_affinity = "0.8"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.8"
+assert_cmd = "2.0"
+predicates = "3.0"
+
+# Binary is created automatically from src/main.rs

@@ -1,0 +1,23 @@
+Source: rigz
+Section: utils
+Priority: optional
+Maintainer: rigz contributors <rigz@example.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc, zlib1g-dev
+Standards-Version: 4.6.0
+Homepage: https://github.com/example/rigz
+Vcs-Git: https://github.com/example/rigz.git
+Rules-Requires-Root: no
+
+Package: rigz
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Parallel gzip compressor written in Rust
+ rigz is a drop-in replacement for gzip that uses multiple processors
+ and cores for compression. It produces fully gzip-compatible output
+ and achieves significant speedup on multi-core systems.
+ .
+ Features:
+  - Parallel compression using all available CPU cores
+  - Drop-in replacement for gzip (same command-line interface)
+  - Cross-platform (Linux, macOS, Windows)
+  - Based on pigz by Mark Adler

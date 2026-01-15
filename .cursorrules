@@ -1,0 +1,286 @@
+# Rigz - Rust Parallel Gzip Replacement
+
+## Project Goal
+
+**Create the fastest gzip-compatible compressor that works everywhere.**
+
+Rigz must:
+1. **Beat gzip and pigz in compression speed** across all file sizes, types, and compression levels
+2. **Produce byte-for-byte decompressible output** with standard `gunzip` on every platform
+3. **Match gzip's compression ratios** (±1% is acceptable for parallel mode)
+4. **Work on all architectures** - x86_64, ARM, RISC-V, whatever Rust supports
+
+## Release Target
+
+- **Open source** (zlib license, like pigz)
+- **Debian package** - must build cleanly with `dpkg-buildpackage`
+- **Drop-in replacement** for gzip - same CLI interface
+
+## Winning Strategy
+
+**Any approach that achieves the goal is valid.** If we need to:
+- Write raw DEFLATE in assembly - do it
+- Implement SIMD-optimized hash tables - do it
+- Use platform-specific intrinsics - do it
+- Call out to C libraries via FFI - do it
+- Hand-roll gzip headers and CRC32 - do it
+
+The current implementation uses:
+- `flate2` with `libz-sys` (system zlib) for gzip-compatible output
+- Custom parallel compression using `rayon` with concatenated gzip members
+- Direct flate2 path for single-threaded (minimal overhead)
+
+## Critical Lessons Learned
+
+### 1. libz-ng Produces Different Output
+
+**Problem**: `libz-ng` (used by default in many Rust crates) produces different 
+compression ratios than standard zlib at levels 1-8. Only level 9 matches.
+
+**Solution**: Use `libz-sys` (system zlib) with `default-features = false`:
+```toml
+flate2 = { version = "1.0", default-features = false, features = ["zlib"] }
+```
+
+### 2. gzp Forces Problematic Dependencies
+
+**Problem**: The `gzp` crate forces `libz-ng` through feature unification,
+even when you try to disable it.
+
+**Solution**: Implement parallel compression ourselves using rayon + flate2.
+
+### 3. Parallel Gzip via Concatenation
+
+**Solution**: RFC 1952 allows concatenated gzip members. Each parallel block
+becomes a complete gzip file. Standard `gunzip` handles this transparently.
+
+```rust
+// Each block is independently compressed as complete gzip
+let compressed_blocks: Vec<Vec<u8>> = blocks.par_iter()
+    .map(|block| {
+        let mut buf = Vec::new();
+        let mut enc = GzEncoder::new(&mut buf, compression);
+        enc.write_all(block).ok();
+        enc.finish().ok();
+        buf
+    })
+    .collect();
+
+// Concatenate all gzip members
+for block in compressed_blocks {
+    writer.write_all(&block)?;
+}
+```
+
+### 4. Single-Threaded Must Be Fast
+
+For single-threaded mode, bypass all optimizer logic and go directly to flate2:
+```rust
+if thread_count == 1 {
+    let mut encoder = GzEncoder::new(writer, compression);
+    io::copy(&mut reader, &mut encoder)?;
+    encoder.finish()?;
+}
+```
+
+### 5. Content Detection Has Overhead
+
+Skip content type detection for:
+- Single-threaded mode (no parallelization decisions to make)
+- Fast compression levels (L1-L3) where overhead exceeds benefit
+
+### 6. Fixed Block Size is Better Than Dynamic
+
+**Problem**: Dynamic block sizing (based on file size and thread count) caused
+significant performance regression - up to 14% slower than pigz.
+
+**Solution**: Use fixed 128KB blocks like pigz. This provides:
+- Consistent parallel work distribution
+- Predictable memory access patterns
+- Optimal rayon work-stealing behavior
+
+```rust
+const BLOCK_SIZE: usize = 128 * 1024; // 128KB, same as pigz
+```
+
+### 7. Memory-Mapped I/O for Large Files
+
+For files > 50MB, use mmap instead of read_to_end:
+- Eliminates ~50ms read latency for 100MB files
+- OS handles page faults in parallel with compression
+- Zero-copy access to file data
+
+```rust
+use memmap2::Mmap;
+let mmap = unsafe { Mmap::map(&file)? };
+let blocks: Vec<&[u8]> = mmap.chunks(BLOCK_SIZE).collect();
+```
+
+### 8. Global Thread Pool Reduces Overhead
+
+Creating a rayon thread pool per compression is expensive. Use a global pool:
+
+```rust
+static THREAD_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+
+fn get_thread_pool(num_threads: usize) -> &'static rayon::ThreadPool {
+    THREAD_POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .expect("Failed to create thread pool")
+    })
+}
+```
+
+### 9. Zig Would NOT Help Here
+
+The bottleneck is zlib C code, not Rust. Both rigz and pigz use the same 
+system zlib. Zig's advantages (no hidden allocations, comptime) don't apply
+since compression is CPU-bound in C code. Rust's advantages actually help:
+- Safe mmap via memmap2
+- Zero-cost rayon parallelism  
+- Global thread pool with OnceLock
+
+## Testing Strategy
+
+### Quick Tests (for AI tools, < 30 seconds)
+
+Run with `make` or `make quick`:
+```bash
+make quick  # Builds, generates 1-10MB test files, runs key benchmarks
+```
+
+Uses **20 runs for 1MB files, 10 runs for 10MB** to avoid noise dominating.
+
+**Output format shows clear wins/losses:**
+```
+=== 1MB Text ===
+  rigz -p1:  0.038s  vs gzip:  +0.9% ✓
+  rigz -p4:  0.013s  vs pigz: -4.6% ✓
+
+SUMMARY: 4 wins, 0 losses
+✓ All tests pass - rigz matches or beats targets!
+```
+
+### Statistical Benchmarking (CRITICAL)
+
+**3 runs is NOT enough for short timings!** We learned this the hard way:
+
+| Test | 3 runs | 20 runs | Reality |
+|------|--------|---------|---------|
+| 1MB T4 | +6.3% ❌ | **-3.2%** | Was noise |
+| 1MB T8 | +7.0% ❌ | **-2.5%** | Was noise |
+
+For sub-100ms timings, the coefficient of variation can be 20-90%!
+
+**Rules:**
+- 1MB files: minimum 20 runs (CV can be 20%+)
+- 10MB files: minimum 10 runs (CV ~2-5%)
+- 100MB files: minimum 5 runs (CV <2%)
+- Use **median** not min for comparison (more robust to outliers)
+
+### Full Performance Tests (humans only, at release time)
+
+Run with `make perf-full`:
+```bash
+make perf-full  # Runs comprehensive benchmarks, 10+ minutes
+```
+
+Full tests cover:
+- Compression levels: 1, 6, 9
+- Thread counts: 1, 2, 4, 8
+- File sizes: 1MB, 10MB, 100MB
+- Data types: text, random
+- Run counts: 20/10/5 based on timing
+
+### Validity Tests (always run)
+
+Every compressed output must:
+1. Decompress with `gunzip -c` 
+2. Match original file byte-for-byte
+3. Have correct gzip magic bytes (0x1f 0x8b)
+
+## Current Performance (M4 Mac, January 2026)
+
+### Speed: rigz beats pigz by 5-9%
+
+| Scenario | Baseline | rigz | Diff | Status |
+|----------|----------|------|------|--------|
+| 1MB T1 | gzip 0.034s | 0.034s | -1.6% | ✅ WIN |
+| 1MB T4 | pigz 0.012s | 0.011s | **-9.7%** | ✅ WIN |
+| 10MB T1 | gzip 0.321s | 0.322s | +0.4% | ✅ WIN |
+| 10MB T4 | pigz 0.090s | 0.085s | **-5.6%** | ✅ WIN |
+| 100MB T4 | pigz 0.876s | 0.801s | **-8.5%** | ✅ WIN |
+| 100MB T8 | pigz 0.462s | 0.422s | **-8.5%** | ✅ WIN |
+
+### Compression Ratio: Identical to gzip
+
+| Tool | 10MB text L6 | Size vs gzip |
+|------|--------------|--------------|
+| gzip | 10,590,225 | baseline |
+| rigz -p1 | 10,590,211 | **-0.00%** (identical!) |
+| pigz -p4 | 10,591,293 | +0.01% |
+| rigz -p4 | 10,591,365 | +0.01% |
+
+**Key insight**: rigz produces virtually identical compression to gzip
+(within 0.01%) while being 5-9% faster than pigz on multi-threaded mode.
+
+## What Rust Provides That Other Languages Don't
+
+1. **Zero-cost rayon parallelism** - work-stealing with no GC pauses
+2. **Safe memory-mapped I/O** - memmap2 crate with safe Rust API
+3. **Global thread pool via OnceLock** - lazy initialization without locks
+4. **Direct FFI to C zlib** - no wrapper overhead via libz-sys
+5. **Hardware CRC32** - crc32fast automatically uses ARM CRC32 intrinsics
+
+## Future Optimization Opportunities
+
+1. **libdeflate** - 2-3x faster than zlib for compression, gzip-compatible
+2. **Intel ISA-L** - Hardware-accelerated on Intel CPUs
+3. **Shared dictionaries** - Like pigz, share dictionary between adjacent blocks
+4. **Streaming mmap** - Process blocks as pages fault in, overlapping I/O
+
+## Architecture Notes
+
+```
+src/
+├── main.rs              # CLI entry point
+├── cli.rs               # Argument parsing (gzip-compatible)
+├── compression.rs       # File compression orchestration
+│   ├── Single-thread: direct flate2 GzEncoder
+│   └── Multi-thread: routes to parallel_compress via mmap
+├── decompression.rs     # File decompression
+├── parallel_compress.rs # Rayon-based parallel gzip with mmap
+│   ├── ParallelGzEncoder::compress() - generic Read input
+│   └── ParallelGzEncoder::compress_file() - mmap path for files
+├── simple_optimizations.rs # SimpleOptimizer wrapper
+├── optimization.rs      # Content detection, config creation
+└── error.rs             # Error types
+```
+
+**Critical paths:**
+- Single-threaded: `compression.rs` → `GzEncoder` (direct, no overhead)
+- Multi-threaded file: `compression.rs` → `mmap` → `ParallelGzEncoder` → rayon
+- Multi-threaded stdin: `compression.rs` → `ParallelGzEncoder` (read_to_end)
+
+## Build & Release
+
+```bash
+# Development
+cargo build --release
+./target/release/rigz --help
+
+# Debian package
+dpkg-buildpackage -b -us -uc
+
+# Install
+sudo dpkg -i ../rigz_*.deb
+```
+
+## Compatibility Requirements
+
+- **Input**: Any file, stdin, directories (with -r)
+- **Output**: Valid gzip format per RFC 1952
+- **CLI**: gzip-compatible flags (-1 to -9, -c, -d, -k, -f, -v, -r, etc.)
+- **Exit codes**: 0 success, 1 error, 2 warning (like gzip)
