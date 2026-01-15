@@ -96,9 +96,9 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn test_thread_optimization() {
+    fn test_thread_count_passthrough() {
         let config = OptimizationConfig {
-            thread_count: 2,
+            thread_count: 4,
             buffer_size: 65536,
             backend: CompressionBackend::Gzp,
             content_type: ContentType::Binary,
@@ -107,7 +107,8 @@ mod tests {
         };
 
         let optimizer = SimpleOptimizer::new(config);
-        assert_eq!(optimizer.calculate_optimal_threads(), 1);
+        // Thread count should pass through (no longer reduced)
+        assert_eq!(optimizer.calculate_optimal_threads(), 4);
     }
 
     #[test]

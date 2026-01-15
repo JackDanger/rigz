@@ -4,17 +4,19 @@
 # Quick tests (<30s) run with 'make' or 'make quick' - for AI tools and iteration
 # Full perf tests (10+ min) run with 'make perf-full' - for humans at release time
 
-# Build configuration
-PIGZ_DIR := ..
+# Build configuration - submodules are in ./gzip and ./pigz
+GZIP_DIR := ./gzip
+PIGZ_DIR := ./pigz
 RIGZ_DIR := .
 TEST_DATA_DIR := test_data
 RESULTS_DIR := test_results
 
 # Build targets
+GZIP_BIN := $(GZIP_DIR)/gzip
 PIGZ_BIN := $(PIGZ_DIR)/pigz
 RIGZ_BIN := $(RIGZ_DIR)/target/release/rigz
 
-.PHONY: all build quick perf-full test-data clean help validate
+.PHONY: all build quick perf-full test-data clean help validate deps
 
 # =============================================================================
 # Default target: quick benchmark for fast iteration (< 30 seconds)
@@ -27,8 +29,17 @@ all: quick
 
 build: $(RIGZ_BIN)
 
+deps: $(GZIP_BIN) $(PIGZ_BIN)
+	@echo "✓ Dependencies ready"
+
+$(GZIP_BIN):
+	@echo "Building gzip from source..."
+	@cd $(GZIP_DIR) && ./configure --quiet 2>/dev/null || true
+	@$(MAKE) -C $(GZIP_DIR) -j4 2>/dev/null || $(MAKE) -C $(GZIP_DIR)
+	@echo "✓ Built gzip"
+
 $(PIGZ_BIN):
-	@echo "Building pigz..."
+	@echo "Building pigz from source..."
 	@$(MAKE) -C $(PIGZ_DIR) clean >/dev/null 2>&1 || true
 	@$(MAKE) -C $(PIGZ_DIR) pigz >/dev/null 2>&1
 	@echo "✓ Built pigz"
@@ -43,14 +54,14 @@ FORCE:
 # =============================================================================
 # Quick benchmark (~20 seconds) - for AI tools and fast iteration
 # =============================================================================
-quick: $(RIGZ_BIN) $(PIGZ_BIN)
+quick: $(RIGZ_BIN) $(GZIP_BIN) $(PIGZ_BIN)
 	@chmod +x scripts/quick_bench.sh
 	@./scripts/quick_bench.sh
 
 # =============================================================================
 # Full performance tests (10+ minutes) - for humans at release time
 # =============================================================================
-perf-full: $(RIGZ_BIN) $(PIGZ_BIN) test-data
+perf-full: $(RIGZ_BIN) $(GZIP_BIN) $(PIGZ_BIN) test-data
 	@echo "============================================"
 	@echo "  RIGZ Full Performance Suite"
 	@echo "  (This will take 10+ minutes)"
@@ -105,6 +116,7 @@ clean:
 	@echo "Cleaning..."
 	@rm -rf $(TEST_DATA_DIR) $(RESULTS_DIR)
 	@$(MAKE) -C $(PIGZ_DIR) clean >/dev/null 2>&1 || true
+	@$(MAKE) -C $(GZIP_DIR) clean >/dev/null 2>&1 || true
 	@cd $(RIGZ_DIR) && cargo clean >/dev/null 2>&1
 	@echo "✓ Cleaned"
 
@@ -119,6 +131,7 @@ help:
 	@echo "  make              Build and run quick benchmark (< 30 seconds)"
 	@echo "  make quick        Same as above"
 	@echo "  make build        Build rigz only"
+	@echo "  make deps         Build gzip and pigz from submodules"
 	@echo "  make validate     Run validation suite"
 	@echo ""
 	@echo "Full testing (for humans at release time):"

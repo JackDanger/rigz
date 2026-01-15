@@ -1,1 +1,0 @@
-This is a text file for testing content type detection and optimization

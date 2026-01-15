@@ -5,8 +5,8 @@
 set -euo pipefail
 
 RIGZ_BIN="./target/release/rigz"
-PIGZ_BIN="../pigz"
-GZIP_BIN=$(which gzip)
+PIGZ_BIN="./pigz/pigz"
+GZIP_BIN="./gzip/gzip"
 TEST_DATA_DIR="test_data"
 
 # Configuration - Full matrix
@@ -23,6 +23,11 @@ RUNS_LONG=5     # For >1s tests (100MB)
 echo "============================================"
 echo "  Rigz Full Performance Suite"
 echo "============================================"
+echo ""
+echo "Using:"
+echo "  gzip: $GZIP_BIN"
+echo "  pigz: $PIGZ_BIN"
+echo "  rigz: $RIGZ_BIN"
 echo ""
 echo "Configuration:"
 echo "  Levels: $LEVELS"
@@ -88,6 +93,10 @@ import statistics
 import tempfile
 import os
 
+GZIP_BIN = "$GZIP_BIN"
+PIGZ_BIN = "$PIGZ_BIN"
+RIGZ_BIN = "$RIGZ_BIN"
+
 def benchmark(cmd, runs):
     times = []
     for _ in range(runs):
@@ -113,8 +122,8 @@ runs = $runs
 input_size = $input_size
 
 # Get gzip baseline (time and size)
-gzip_min, gzip_med, gzip_std = benchmark(["$GZIP_BIN", "-$level", "-c", file], runs)
-gzip_size = get_compressed_size(["$GZIP_BIN", "-$level"], file)
+gzip_min, gzip_med, gzip_std = benchmark([GZIP_BIN, "-" + level, "-c", file], runs)
+gzip_size = get_compressed_size([GZIP_BIN, "-" + level], file)
 gzip_ratio = gzip_size / input_size * 100
 
 print(f"  gzip:       {gzip_med:.3f}s (±{gzip_std:.3f})  size: {gzip_size:,} bytes ({gzip_ratio:.1f}%)")
@@ -122,8 +131,8 @@ print(f"  gzip:       {gzip_med:.3f}s (±{gzip_std:.3f})  size: {gzip_size:,} by
 # rigz and pigz for each thread count
 for threads in [1, 2, 4, 8]:
     rigz_min, rigz_med, rigz_std = benchmark(
-        ["$RIGZ_BIN", "-$level", f"-p{threads}", "-c", file], runs)
-    rigz_size = get_compressed_size(["$RIGZ_BIN", "-$level", f"-p{threads}"], file)
+        [RIGZ_BIN, "-" + level, f"-p{threads}", "-c", file], runs)
+    rigz_size = get_compressed_size([RIGZ_BIN, "-" + level, f"-p{threads}"], file)
     
     # Size comparison vs gzip
     size_diff = (rigz_size / gzip_size - 1) * 100
@@ -135,8 +144,8 @@ for threads in [1, 2, 4, 8]:
         baseline_med = gzip_med
     else:
         pigz_min, pigz_med, pigz_std = benchmark(
-            ["$PIGZ_BIN", "-$level", f"-p{threads}", "-c", file], runs)
-        pigz_size = get_compressed_size(["$PIGZ_BIN", "-$level", f"-p{threads}"], file)
+            [PIGZ_BIN, "-" + level, f"-p{threads}", "-c", file], runs)
+        pigz_size = get_compressed_size([PIGZ_BIN, "-" + level, f"-p{threads}"], file)
         time_diff = (rigz_med / pigz_med - 1) * 100
         baseline_name = "pigz"
         baseline_med = pigz_med

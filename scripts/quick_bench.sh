@@ -5,13 +5,18 @@
 set -euo pipefail
 
 RIGZ_BIN="./target/release/rigz"
-PIGZ_BIN="../pigz"
-GZIP_BIN=$(which gzip)
+PIGZ_BIN="./pigz/pigz"
+GZIP_BIN="./gzip/gzip"
 TEST_DATA_DIR="test_data"
 
 echo "============================================"
 echo "  RIGZ Quick Benchmark"
 echo "============================================"
+echo ""
+echo "Using:"
+echo "  gzip: $GZIP_BIN"
+echo "  pigz: $PIGZ_BIN"
+echo "  rigz: $RIGZ_BIN"
 echo ""
 
 # Ensure test data exists
@@ -20,10 +25,14 @@ mkdir -p "$TEST_DATA_DIR"
 [[ ! -f "$TEST_DATA_DIR/text-10MB.txt" ]] && head -c 10485760 /dev/urandom | base64 > "$TEST_DATA_DIR/text-10MB.txt" 2>/dev/null
 
 # Run statistical benchmark
-python3 << 'EOF'
+python3 << EOF
 import subprocess
 import time
 import statistics
+
+GZIP_BIN = "$GZIP_BIN"
+PIGZ_BIN = "$PIGZ_BIN"
+RIGZ_BIN = "$RIGZ_BIN"
 
 def benchmark(cmd, runs):
     times = []
@@ -49,15 +58,15 @@ gaps = []
 print("=== 1MB Text (20 runs for statistical significance) ===")
 
 diff, status, gzip_t, rigz_t = compare(
-    "1MB T1", ["gzip", "-6", "-c", "test_data/text-1MB.txt"],
-    ["./target/release/rigz", "-6", "-p1", "-c", "test_data/text-1MB.txt"], runs=20)
+    "1MB T1", [GZIP_BIN, "-6", "-c", "test_data/text-1MB.txt"],
+    [RIGZ_BIN, "-6", "-p1", "-c", "test_data/text-1MB.txt"], runs=20)
 print(f"  rigz -p1:  {rigz_t:.3f}s  vs gzip:  {diff:+.1f}% {status}")
 if diff <= 5: wins += 1
 else: losses += 1; gaps.append(f"1MB L6 T1: {diff:+.1f}%")
 
 diff, status, pigz_t, rigz_t = compare(
-    "1MB T4", ["../pigz", "-6", "-p4", "-c", "test_data/text-1MB.txt"],
-    ["./target/release/rigz", "-6", "-p4", "-c", "test_data/text-1MB.txt"], runs=20)
+    "1MB T4", [PIGZ_BIN, "-6", "-p4", "-c", "test_data/text-1MB.txt"],
+    [RIGZ_BIN, "-6", "-p4", "-c", "test_data/text-1MB.txt"], runs=20)
 print(f"  rigz -p4:  {rigz_t:.3f}s  vs pigz: {diff:+.1f}% {status}")
 if diff <= 5: wins += 1
 else: losses += 1; gaps.append(f"1MB L6 T4: {diff:+.1f}%")
@@ -66,15 +75,15 @@ print("")
 print("=== 10MB Text (10 runs) ===")
 
 diff, status, gzip_t, rigz_t = compare(
-    "10MB T1", ["gzip", "-6", "-c", "test_data/text-10MB.txt"],
-    ["./target/release/rigz", "-6", "-p1", "-c", "test_data/text-10MB.txt"], runs=10)
+    "10MB T1", [GZIP_BIN, "-6", "-c", "test_data/text-10MB.txt"],
+    [RIGZ_BIN, "-6", "-p1", "-c", "test_data/text-10MB.txt"], runs=10)
 print(f"  rigz -p1:  {rigz_t:.3f}s  vs gzip:  {diff:+.1f}% {status}")
 if diff <= 5: wins += 1
 else: losses += 1; gaps.append(f"10MB L6 T1: {diff:+.1f}%")
 
 diff, status, pigz_t, rigz_t = compare(
-    "10MB T4", ["../pigz", "-6", "-p4", "-c", "test_data/text-10MB.txt"],
-    ["./target/release/rigz", "-6", "-p4", "-c", "test_data/text-10MB.txt"], runs=10)
+    "10MB T4", [PIGZ_BIN, "-6", "-p4", "-c", "test_data/text-10MB.txt"],
+    [RIGZ_BIN, "-6", "-p4", "-c", "test_data/text-10MB.txt"], runs=10)
 print(f"  rigz -p4:  {rigz_t:.3f}s  vs pigz: {diff:+.1f}% {status}")
 if diff <= 5: wins += 1
 else: losses += 1; gaps.append(f"10MB L6 T4: {diff:+.1f}%")
@@ -88,7 +97,7 @@ import os
 with tempfile.NamedTemporaryFile(suffix='.gz', delete=False) as f:
     tmp = f.name
 
-subprocess.run(["./target/release/rigz", "-6", "-p4", "-c", "test_data/text-10MB.txt"], 
+subprocess.run([RIGZ_BIN, "-6", "-p4", "-c", "test_data/text-10MB.txt"], 
                stdout=open(tmp, 'wb'), stderr=subprocess.DEVNULL)
 result = subprocess.run(["gunzip", "-t", tmp], capture_output=True)
 os.unlink(tmp)

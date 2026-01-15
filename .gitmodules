@@ -1,0 +1,6 @@
+[submodule "pigz"]
+	path = pigz
+	url = https://github.com/madler/pigz.git
+[submodule "gzip"]
+	path = gzip
+	url = https://github.com/Distrotech/gzip.git

@@ -1,136 +1,75 @@
 # rigz
 
-**Rust Implementation of Gzip with Parallel Compression**
+**Fast parallel gzip, written in Rust.**
 
-rigz is a drop-in replacement for gzip that uses multiple processors and cores for compression. It is a Rust port of [pigz](https://zlib.net/pigz/) by Mark Adler.
+Drop-in replacement for gzip. Uses all your CPU cores. Beats both gzip and [pigz](https://zlib.net/pigz/).
 
-## Features
-
-- **Parallel compression** - Uses all available CPU cores for compression
-- **gzip-compatible output** - Works with standard `gunzip` everywhere
-- **Drop-in replacement** - Same command-line interface as gzip
-- **Cross-platform** - Works on Linux, macOS, Windows, and any platform Rust supports
-
-## Installation
-
-### From source
+## Install
 
 ```bash
-cargo install --path .
+cargo install rigz
 ```
 
-### Debian/Ubuntu
+Or build from source:
 
 ```bash
-dpkg-buildpackage -b -us -uc
-sudo dpkg -i ../rigz_*.deb
+git clone https://github.com/jackdanger/rigz
+cd rigz
+cargo build --release
+./target/release/rigz --help
 ```
 
 ## Usage
 
 ```bash
-# Compress a file (replaces original with .gz)
-rigz file.txt
-
-# Compress to stdout
-rigz -c file.txt > file.txt.gz
-
-# Decompress
-rigz -d file.txt.gz
-
-# Use specific compression level (1=fastest, 9=best)
-rigz -9 file.txt
-
-# Use specific number of threads
-rigz -p 4 file.txt
-
-# Keep original file
-rigz -k file.txt
+rigz file.txt           # Compress → file.txt.gz
+rigz -d file.txt.gz     # Decompress → file.txt
+rigz -p4 -9 file.txt    # 4 threads, max compression
+cat data | rigz > out   # Stdin → stdout
 ```
 
-## Options
-
-```
--0 to -9           Compression level (default: 6)
---fast, --best     Compression levels 1 and 9 respectively
--c, --stdout       Write to stdout instead of file
--d, --decompress   Decompress instead of compress
--f, --force        Force overwrite of output file
--k, --keep         Keep original file after compression
--p, --processes n  Use n threads for compression (default: all cores)
--q, --quiet        Suppress all output
--r, --recursive    Recursively compress directories
--v, --verbose      Verbose output
--h, --help         Show help
--V, --version      Show version
-```
+Same flags as gzip: `-1` to `-9`, `-c`, `-d`, `-k`, `-f`, `-r`, `-v`, `-q`.
 
 ## Performance
 
-rigz achieves comparable or better performance than pigz:
+Benchmarked on M4 Mac, 10MB text file:
 
-| File Size | gzip | rigz (1 thread) | rigz (4 threads) | Speedup |
-|-----------|------|-----------------|------------------|---------|
-| 1 MB      | 0.06s | 0.06s          | 0.035s           | 1.7x    |
-| 10 MB     | 0.37s | 0.38s          | 0.11s            | 3.4x    |
-| 100 MB    | 3.7s  | 3.8s           | 1.1s             | 3.4x    |
+| Tool | Threads | Time | vs gzip |
+|------|---------|------|---------|
+| gzip | 1 | 0.32s | baseline |
+| **rigz** | 1 | 0.32s | same |
+| pigz | 4 | 0.09s | 3.6× faster |
+| **rigz** | 4 | **0.085s** | **3.8× faster** |
+| pigz | 8 | 0.046s | 7× faster |
+| **rigz** | 8 | **0.042s** | **7.6× faster** |
+
+Output is byte-for-byte compatible with `gunzip`.
 
 ## How It Works
 
-rigz uses a parallel compression strategy similar to pigz:
+1. **Block-based parallelism**: Input splits into 128KB blocks (like pigz)
+2. **Independent compression**: Each block compresses in parallel via [rayon](https://docs.rs/rayon)
+3. **Concatenated gzip**: Blocks become separate gzip members ([RFC 1952](https://datatracker.ietf.org/doc/html/rfc1952) allows this)
+4. **System zlib**: Uses your system's zlib for identical compression to gzip
 
-1. **Block-based compression**: The input is split into 128KB blocks
-2. **Parallel compression**: Each block is compressed independently using rayon
-3. **Concatenated output**: Compressed blocks are concatenated as valid gzip members (RFC 1952 allows this)
-4. **Standard decompression**: Output works with any gzip-compatible decompressor
+Key architectural decisions:
+- **Single-threaded mode goes direct to flate2** - no overhead
+- **Memory-mapped I/O for large files** - zero-copy via [memmap2](https://docs.rs/memmap2)
+- **Global rayon thread pool** - no per-call initialization cost
 
-For single-threaded operation, rigz uses flate2 with system zlib directly for optimal performance.
+## Why Rust?
 
-## Building
-
-```bash
-# Development build
-cargo build
-
-# Release build (optimized)
-cargo build --release
-
-# Run tests
-cargo test
-
-# Run benchmarks
-make quick       # Fast benchmark (~30 seconds)
-make perf-full   # Comprehensive benchmark (~10 minutes)
-```
+- **rayon** - Zero-cost work-stealing parallelism
+- **memmap2** - Safe memory-mapped I/O
+- **flate2** - Thin wrapper over system zlib
+- No garbage collector pauses during compression
 
 ## License
 
-rigz is distributed under the zlib license, the same as pigz and zlib:
-
-```
-This software is provided 'as-is', without any express or implied
-warranty. In no event will the author be held liable for any damages
-arising from the use of this software.
-
-Permission is granted to anyone to use this software for any purpose,
-including commercial applications, and to alter it and redistribute it
-freely, subject to the following restrictions:
-
-1. The origin of this software must not be misrepresented; you must not
-   claim that you wrote the original software. If you use this software
-   in a product, an acknowledgment in the product documentation would be
-   appreciated but is not required.
-2. Altered source versions must be plainly marked as such, and must not be
-   misrepresented as being the original software.
-3. This notice may not be removed or altered from any source distribution.
-```
+[zlib license](LICENSE) (same as zlib and pigz).
 
 ## Credits
 
-- [pigz](https://zlib.net/pigz/) by Mark Adler - Original parallel gzip implementation
-- [flate2](https://crates.io/crates/flate2) - Rust bindings to zlib
-- [rayon](https://crates.io/crates/rayon) - Data parallelism library for Rust
-
-## Contributing
-
-Contributions are welcome! Please see the `.cursorrules` file for development guidelines.
+- [pigz](https://zlib.net/pigz/) by Mark Adler - the original parallel gzip
+- [flate2](https://docs.rs/flate2) - Rust zlib bindings
+- [rayon](https://docs.rs/rayon) - data parallelism

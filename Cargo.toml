@@ -2,43 +2,45 @@
 name = "rigz"
 version = "0.1.0"
 edition = "2021"
-description = "Rust port of pigz - parallel gzip replacement"
+description = "A fast, parallel gzip replacement written in Rust"
 license = "Zlib"
-authors = ["Rust port"]
+repository = "https://github.com/jackdanger/rigz"
+homepage = "https://github.com/jackdanger/rigz"
+documentation = "https://github.com/jackdanger/rigz#readme"
+readme = "README.md"
+keywords = ["gzip", "compression", "parallel", "pigz"]
+categories = ["compression", "command-line-utilities"]
+authors = ["Jack Danger Canty"]
 
 [dependencies]
-# NO gzp - we implement our own parallel compression to control the zlib backend
-
-# Use flate2 with system zlib (libz-sys) - matches gzip's compression exactly
-# This is the key to matching gzip's output at ALL compression levels
+# Compression: flate2 with system zlib for gzip-identical output at all levels
+# IMPORTANT: Do NOT use libz-ng - it produces different compression ratios at L1-L8
 flate2 = { version = "1.0", default-features = false, features = ["zlib"] }
 
-# For CRC32 calculation
-crc32fast = "1.4"
+# Parallel processing
+rayon = "1.8"
 
-# Command line parsing
+# CLI and utilities  
 clap = { version = "4.5", features = ["derive"] }
-
-# File system operations
 walkdir = "2.4"
 filetime = "0.2"
+num_cpus = "1.16"
+
+# Memory-mapped I/O for zero-copy file access
+memmap2 = "0.9"
 
 # Error handling
 anyhow = "1.0"
 thiserror = "1.0"
 
-# Utility
-num_cpus = "1.16"
-
-# High-performance parallel processing
+# Parallelization utilities (used by rayon)
 crossbeam-channel = "0.5"
 crossbeam-deque = "0.8"
-rayon = "1.8"
 
-# Memory-mapped I/O for zero-copy file access
-memmap2 = "0.9"
+# CRC32 (hardware-accelerated on ARM/x86)
+crc32fast = "1.4"
 
-# CPU optimization and system info
+# System utilities
 core_affinity = "0.8"
 libc = "0.2"
 
@@ -47,4 +49,7 @@ tempfile = "3.8"
 assert_cmd = "2.0"
 predicates = "3.0"
 
-# Binary is created automatically from src/main.rs
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
