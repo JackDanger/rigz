@@ -12,10 +12,13 @@ TEST_DATA_DIR := test_data
 RESULTS_DIR := test_results
 
 # Build targets
-GZIP_BIN := $(GZIP_DIR)/gzip
-PIGZ_BIN := $(PIGZ_DIR)/pigz
 RIGZ_BIN := $(RIGZ_DIR)/target/release/rigz
 UNRIGZ_BIN := $(RIGZ_DIR)/target/release/unrigz
+PIGZ_BIN := $(PIGZ_DIR)/pigz
+
+# Prefer local gzip build, fall back to system gzip
+GZIP_BIN := $(shell if [ -x $(GZIP_DIR)/gzip ]; then echo $(GZIP_DIR)/gzip; else echo $$(which gzip); fi)
+SYSTEM_GZIP := $(shell which gzip)
 
 .PHONY: all build quick perf-full test-data clean help validate deps
 
@@ -30,14 +33,22 @@ all: quick
 
 build: $(RIGZ_BIN) $(UNRIGZ_BIN)
 
-deps: $(GZIP_BIN) $(PIGZ_BIN)
-	@echo "✓ Dependencies ready"
+deps: $(PIGZ_BIN)
+	@# Try to build gzip, but don't fail if it doesn't work
+	@$(MAKE) $(GZIP_DIR)/gzip 2>/dev/null || true
+	@echo "✓ Dependencies ready (gzip: $(GZIP_BIN))"
 
-$(GZIP_BIN):
+$(GZIP_DIR)/gzip:
 	@echo "Building gzip from source..."
+	@# Fix autotools timestamps to prevent regeneration
+	@cd $(GZIP_DIR) && find . -name "*.in" -exec touch {} \; 2>/dev/null; \
+		touch configure aclocal.m4 Makefile.in 2>/dev/null || true
 	@cd $(GZIP_DIR) && ./configure --quiet 2>/dev/null || true
-	@$(MAKE) -C $(GZIP_DIR) -j4 2>/dev/null || $(MAKE) -C $(GZIP_DIR)
-	@echo "✓ Built gzip"
+	@if $(MAKE) -C $(GZIP_DIR) -j4 2>/dev/null; then \
+		echo "✓ Built gzip from source"; \
+	else \
+		echo "⚠ gzip build failed, using system gzip: $(SYSTEM_GZIP)"; \
+	fi
 
 $(PIGZ_BIN):
 	@echo "Building pigz from source..."
@@ -60,13 +71,13 @@ FORCE:
 # =============================================================================
 # Quick benchmark (~30 seconds) - for AI tools and fast iteration
 # =============================================================================
-quick: $(RIGZ_BIN) $(UNRIGZ_BIN) $(GZIP_BIN) $(PIGZ_BIN)
+quick: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
 	@python3 scripts/perf.py --sizes 1,10 --levels 6 --threads 1,4
 
 # =============================================================================
 # Full performance tests (10+ minutes) - for humans at release time
 # =============================================================================
-perf-full: $(RIGZ_BIN) $(UNRIGZ_BIN) $(GZIP_BIN) $(PIGZ_BIN)
+perf-full: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
 	@mkdir -p $(RESULTS_DIR)
 	@python3 scripts/perf.py --full 2>&1 | tee $(RESULTS_DIR)/perf_full_$$(date +%Y%m%d_%H%M%S).log
 
@@ -87,7 +98,7 @@ test-data:
 # =============================================================================
 # Validation target - cross-tool compression/decompression matrix
 # =============================================================================
-validate: $(RIGZ_BIN) $(UNRIGZ_BIN) $(GZIP_BIN) $(PIGZ_BIN)
+validate: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
 	@python3 scripts/validate.py
 
 # =============================================================================
