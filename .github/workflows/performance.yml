@@ -42,7 +42,7 @@ jobs:
 
       - name: Detect cores and run benchmark
         run: |
-          CORES=$(nproc)
+          CORES=4
           echo "Available cores: $CORES"
           
           if [ "${{ matrix.thread_mode }}" = "single" ]; then
