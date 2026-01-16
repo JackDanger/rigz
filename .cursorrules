@@ -61,20 +61,22 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 6. ✅ **CPU feature detection** - Runtime AVX/NEON/CRC32 detection
 7. ✅ **Vectorized I/O** - write_vectored for reduced syscalls in compression
 8. ✅ **Statistical validation** - 5+ trials per test with median/stdev reporting
+9. ✅ **BGZF-style block markers** - Embed block sizes in FEXTRA for instant boundary detection
+10. ✅ **Parallel BGZF decompression** - rigz→rigz uses parallel libdeflate via rayon
 
 ## Future Optimizations (see OPTIMIZATION_OPPORTUNITIES.md)
 
-- 🔲 Intel ISA-L integration (2-4x on AVX-512)
-- 🔲 io_uring async I/O on Linux
+- 🔲 io_uring async I/O on Linux (medium complexity)
 
 ## What Doesn't Work
 
 1. **Manual deflate boundary detection** - Deflate streams contain false gzip headers
 2. **Dynamic block sizing** - Added complexity, 14% slower
 3. **gzp crate** - Threading issues; custom rayon is better
-4. **Parallel libdeflate per-member** - Boundary detection requires full inflate (2x overhead)
+4. **Parallel libdeflate per-member (without markers)** - Boundary detection requires full inflate (2x overhead)
 5. **zlib-ng Level 1 directly** - Uses RLE strategy, produces 2-5x larger files on repetitive data (we map L1→L2)
-6. **Parallel decompression** - Requires finding member boundaries first, which means decompressing once to find them, then again in parallel. 2x overhead made it slower for files with many small members (like rigz's 128KB chunks). Sequential MultiGzDecoder is faster.
+6. **Parallel decompression without BGZF** - Requires finding member boundaries first, which means decompressing once to find them, then again in parallel. 2x overhead made it slower for files with many small members (like rigz's 128KB chunks). Sequential MultiGzDecoder is faster.
+7. **Intel ISA-L integration** - Requires autotools/autoreconf to build from source, complex build setup. The isal-rs crate fails on systems without autotools. Not worth the portability issues for marginal gains since libdeflate already uses SIMD.
 
 ## Benchmarking
 
