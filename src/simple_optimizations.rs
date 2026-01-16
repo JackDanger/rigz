@@ -69,8 +69,10 @@ impl SimpleOptimizer {
         mut reader: R,
         writer: W,
     ) -> io::Result<u64> {
-        // Use the actual compression level - system zlib produces correct output
-        let compression = Compression::new(self.config.compression_level as u32);
+        // zlib-ng level 1 uses a different strategy that produces worse output.
+        // Map level 1 → 2 for better compression ratio with similar speed.
+        let adjusted_level = if self.config.compression_level == 1 { 2 } else { self.config.compression_level };
+        let compression = Compression::new(adjusted_level as u32);
 
         let mut encoder = GzEncoder::new(writer, compression);
         let bytes_written = io::copy(&mut reader, &mut encoder)?;

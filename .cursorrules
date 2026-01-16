@@ -32,6 +32,7 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 
 **Compression:**
 - zlib-ng via flate2 (2-3x faster than standard zlib)
+- **Level 1 → Level 2 mapping** (zlib-ng L1 produces 2-5x larger output)
 - 128KB fixed blocks (dynamic sizing regressed 14%)
 - Global rayon pool (avoids per-call initialization)
 - Thread-local buffer reuse (reduces allocator pressure)
@@ -72,6 +73,7 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 2. **Dynamic block sizing** - Added complexity, 14% slower
 3. **gzp crate** - Threading issues; custom rayon is better
 4. **Parallel libdeflate per-member** - Boundary detection requires full inflate
+5. **zlib-ng Level 1 directly** - Uses RLE strategy, produces 2-5x larger files on repetitive data (we map L1→L2)
 
 ## Benchmarking
 

@@ -9,6 +9,7 @@
 //! - Global thread pool to avoid per-call initialization
 //! - Thread-local buffer reuse to minimize allocations
 //! - 128KB fixed blocks (matches pigz default)
+//! - Level adjustment for zlib-ng (L1→L2 for better compression ratio)
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -19,6 +20,16 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::OnceLock;
+
+/// Adjust compression level for zlib-ng compatibility
+/// 
+/// zlib-ng's level 1 uses a faster but much less effective strategy than standard zlib.
+/// This produces files 2-5x larger than expected for repetitive data.
+/// We map level 1 to level 2 which gives similar speed but much better ratios.
+#[inline]
+fn adjust_compression_level(level: u32) -> u32 {
+    if level == 1 { 2 } else { level }
+}
 
 // Thread-local compression buffer to avoid per-block allocation
 thread_local! {
@@ -62,7 +73,7 @@ impl ParallelGzEncoder {
 
         if input_data.is_empty() {
             // Write empty gzip file
-            let encoder = GzEncoder::new(&mut writer, Compression::new(self.compression_level));
+            let encoder = GzEncoder::new(&mut writer, Compression::new(adjust_compression_level(self.compression_level)));
             encoder.finish()?;
             return Ok(0);
         }
@@ -75,7 +86,7 @@ impl ParallelGzEncoder {
 
         // For small files or single thread, use simple streaming compression
         if input_data.len() <= block_size || self.num_threads == 1 {
-            let mut encoder = GzEncoder::new(&mut writer, Compression::new(self.compression_level));
+            let mut encoder = GzEncoder::new(&mut writer, Compression::new(adjust_compression_level(self.compression_level)));
             encoder.write_all(&input_data)?;
             encoder.finish()?;
             return Ok(bytes_read);
@@ -87,7 +98,7 @@ impl ParallelGzEncoder {
 
         // Use global thread pool to avoid per-call initialization
         let pool = get_thread_pool(self.num_threads);
-        let compression_level = self.compression_level;
+        let compression_level = adjust_compression_level(self.compression_level);
 
         // Compress blocks in parallel using thread-local buffers
         let compressed_blocks: Vec<Vec<u8>> = pool.install(|| {
@@ -121,7 +132,7 @@ impl ParallelGzEncoder {
 
         if file_len == 0 {
             // Write empty gzip file
-            let encoder = GzEncoder::new(&mut writer, Compression::new(self.compression_level));
+            let encoder = GzEncoder::new(&mut writer, Compression::new(adjust_compression_level(self.compression_level)));
             encoder.finish()?;
             return Ok(0);
         }
@@ -133,7 +144,7 @@ impl ParallelGzEncoder {
         // For small files or single thread, use simple streaming compression
         let block_size = self.calculate_block_size(file_len);
         if file_len <= block_size || self.num_threads == 1 {
-            let mut encoder = GzEncoder::new(&mut writer, Compression::new(self.compression_level));
+            let mut encoder = GzEncoder::new(&mut writer, Compression::new(adjust_compression_level(self.compression_level)));
             encoder.write_all(&mmap)?;
             encoder.finish()?;
             return Ok(file_len as u64);
@@ -145,7 +156,7 @@ impl ParallelGzEncoder {
 
         // Use global thread pool to avoid per-call initialization
         let pool = get_thread_pool(self.num_threads);
-        let compression_level = self.compression_level;
+        let compression_level = adjust_compression_level(self.compression_level);
 
         // Compress blocks in parallel using thread-local buffers
         let compressed_blocks: Vec<Vec<u8>> = pool.install(|| {

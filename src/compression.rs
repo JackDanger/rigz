@@ -227,7 +227,10 @@ fn compress_with_pipeline<R: Read, W: Write>(
             eprintln!("rigz: using direct flate2 single-threaded path");
         }
         
-        let compression = Compression::new(args.compression_level as u32);
+        // zlib-ng level 1 uses a different strategy that produces 2-5x larger output
+        // on repetitive data. Map level 1 → 2 for better compression ratio.
+        let adjusted_level = if args.compression_level == 1 { 2 } else { args.compression_level };
+        let compression = Compression::new(adjusted_level as u32);
         let mut encoder = GzEncoder::new(writer, compression);
         let bytes = io::copy(&mut reader, &mut encoder)?;
         encoder.finish()?;
