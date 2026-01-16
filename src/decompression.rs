@@ -2,19 +2,27 @@
 //!
 //! Uses flate2's MultiGzDecoder to handle concatenated gzip members
 //! (which rigz produces in parallel mode).
+//!
+//! Optimizations:
+//! - Memory-mapped input for zero-copy reads
+//! - Large output buffers to reduce syscall overhead
 
 use std::fs::File;
-use std::io::{self, stdin, stdout, BufReader, BufWriter, Read, Write};
+use std::io::{self, stdin, stdout, BufReader, BufWriter, Cursor, Read, Write};
 use std::path::Path;
+
+use memmap2::Mmap;
 
 use crate::cli::RigzArgs;
 use crate::error::{RigzError, RigzResult};
 use crate::format::CompressionFormat;
 use crate::utils::strip_compression_extension;
 
-/// Large buffer size for I/O operations (512KB)
-/// Larger buffers reduce syscall overhead significantly
-const BUFFER_SIZE: usize = 512 * 1024;
+/// Large buffer size for I/O operations (1MB)
+const BUFFER_SIZE: usize = 1024 * 1024;
+
+/// Minimum file size to use mmap (smaller files don't benefit)
+const MMAP_THRESHOLD: u64 = 64 * 1024;
 
 pub fn decompress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
     if filename == "-" {
@@ -50,25 +58,45 @@ pub fn decompress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
         }
     }
 
-    // Open input file with large buffer
+    // Open input file
     let input_file = File::open(input_path)?;
     let file_size = input_file.metadata()?.len();
-    let input_reader = BufReader::with_capacity(BUFFER_SIZE, input_file);
 
     // Determine compression format
     let format = detect_compression_format_from_path(input_path)?;
 
-    // Perform decompression
-    let result = if args.stdout {
-        // stdout - use buffered writer
-        let stdout = stdout();
-        let writer = BufWriter::with_capacity(BUFFER_SIZE, stdout.lock());
-        decompress_stream(input_reader, writer, format)
+    // Use mmap for larger files - zero-copy from kernel page cache
+    let use_mmap = file_size >= MMAP_THRESHOLD;
+
+    let result = if use_mmap {
+        // MMAP path - zero-copy input
+        let mmap = unsafe { Mmap::map(&input_file)? };
+        let reader = Cursor::new(&mmap[..]);
+        
+        if args.stdout {
+            let stdout = stdout();
+            let writer = BufWriter::with_capacity(BUFFER_SIZE, stdout.lock());
+            decompress_stream(reader, writer, format)
+        } else {
+            let output_path = output_path.clone().unwrap();
+            let output_file = File::create(&output_path)?;
+            let writer = BufWriter::with_capacity(BUFFER_SIZE, output_file);
+            decompress_stream(reader, writer, format)
+        }
     } else {
-        let output_path = output_path.unwrap();
-        let output_file = File::create(&output_path)?;
-        let writer = BufWriter::with_capacity(BUFFER_SIZE, output_file);
-        decompress_stream(input_reader, writer, format)
+        // Buffered I/O for small files
+        let input_reader = BufReader::with_capacity(BUFFER_SIZE, input_file);
+        
+        if args.stdout {
+            let stdout = stdout();
+            let writer = BufWriter::with_capacity(BUFFER_SIZE, stdout.lock());
+            decompress_stream(input_reader, writer, format)
+        } else {
+            let output_path = output_path.clone().unwrap();
+            let output_file = File::create(&output_path)?;
+            let writer = BufWriter::with_capacity(BUFFER_SIZE, output_file);
+            decompress_stream(input_reader, writer, format)
+        }
     };
 
     match result {
@@ -126,7 +154,6 @@ fn decompress_stream<R: Read, W: Write>(
             use flate2::read::MultiGzDecoder;
             let mut decoder = MultiGzDecoder::new(reader);
             
-            // Use larger copy buffer than default
             let bytes_written = copy_with_buffer(&mut decoder, &mut writer)?;
             writer.flush()?;
             Ok(bytes_written)

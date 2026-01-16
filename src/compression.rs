@@ -83,10 +83,10 @@ pub fn compress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
         );
     }
 
-    // Use advanced compression pipeline for better performance
-    // For multi-threaded large file compression, use mmap for zero-copy access
-    // Mmap has overhead that only pays off for files > 50MB
-    let use_mmap = opt_config.thread_count > 1 && file_size > 50 * 1024 * 1024;
+    // Use mmap for multi-threaded compression
+    // On Linux, mmap is faster even for small files due to zero-copy and kernel page cache
+    // Threshold: 128KB (one block) - below this, overhead exceeds benefit
+    let use_mmap = opt_config.thread_count > 1 && file_size > 128 * 1024;
     
     let result = if use_mmap {
         // MMAP PATH: Zero-copy parallel compression for large files
