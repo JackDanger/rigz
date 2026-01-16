@@ -50,7 +50,7 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 - Platform-specific defaults (Apple Silicon 128-byte cache lines)
 - Physical core count for thread limiting
 
-## Implemented Optimizations (P0)
+## Implemented Optimizations (P0/P1)
 
 1. ✅ **Thread-local compression buffers** - Reuse buffers across parallel blocks
 2. ✅ **SIMD multi-member detection** - memchr for fast gzip header scanning
@@ -58,11 +58,11 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 4. ✅ **ISIZE buffer sizing** - Read gzip trailer for accurate pre-allocation
 5. ✅ **Thread-local decompressor** - Reuse libdeflate decompressor
 6. ✅ **CPU feature detection** - Runtime AVX/NEON/CRC32 detection
+7. ✅ **Parallel decompression** - rayon + libdeflate for multi-member files (>1MB)
 
 ## Future Optimizations (see OPTIMIZATION_OPPORTUNITIES.md)
 
 - 🔲 Intel ISA-L integration (2-4x on AVX-512)
-- 🔲 Parallel decompression for multi-member files
 - 🔲 Shared dictionary between compression blocks
 - 🔲 io_uring async I/O on Linux
 

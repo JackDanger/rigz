@@ -440,7 +440,7 @@ fn detect_amd() -> bool {
 | Thread-local decompressor | Low | Low | ✅ Full | **P0** | ✅ Done |
 | CPU feature detection | Low | Low | ✅ Full | **P0** | ✅ Done |
 | Intel ISA-L integration | High | Medium | ✅ Full | **P1** | 🔲 TODO |
-| Parallel decompression | High | Medium | ✅ Full | **P1** | 🔲 TODO |
+| Parallel decompression | High | Medium | ✅ Full | **P1** | ✅ Done |
 | Shared dictionaries | Medium | Medium | ✅ Full | **P2** | 🔲 TODO |
 | io_uring async I/O | Medium | Medium | ✅ Full | **P3** | 🔲 TODO |
 | Custom SIMD DEFLATE | High | High | ✅ Full | **P4** | 🔲 TODO |
