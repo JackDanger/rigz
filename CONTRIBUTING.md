@@ -1,103 +1,205 @@
 # Contributing to rigz
 
+Welcome! This guide will help you understand the codebase and make your first contribution.
+
+## What is rigz?
+
+rigz is a **parallel gzip** - it compresses files using multiple CPU cores. The key insight is simple:
+
+1. Split input into 128KB chunks
+2. Compress each chunk in parallel using [rayon](https://docs.rs/rayon)
+3. Concatenate the results (gzip allows this per [RFC 1952](https://datatracker.ietf.org/doc/html/rfc1952))
+
+That's it! The rest is optimization details.
+
 ## Quick Start
 
 ```bash
-make         # Build and run quick benchmarks (<30s)
-make validate  # Verify output works with gunzip
-cargo test   # Run unit tests
+# Build and run quick benchmarks
+make
+
+# Verify output works with gunzip  
+make validate
+
+# Run tests
+cargo test
 ```
 
-## Architecture
+## Understanding the Code
+
+### The 30-Second Tour
 
 ```
-src/
-├── main.rs                     # CLI entry point
-├── cli.rs                      # gzip-compatible argument parsing
-├── compression.rs              # File compression orchestration
-├── decompression.rs            # File decompression
-├── parallel_compress.rs        # Rayon-based parallel gzip (the core)
-├── optimization.rs             # Content detection, thread tuning
-├── simple_optimizations.rs     # SimpleOptimizer wrapper
-├── error.rs                    # Error types
-├── format.rs                   # Gzip/zlib format detection
-└── utils.rs                    # File utilities
+rigz file.txt
+     │
+     ▼
+┌─────────────┐
+│   main.rs   │  Parse args, decide compress vs decompress
+└──────┬──────┘
+       │
+       ▼
+┌──────────────────┐     ┌─────────────────────┐
+│ compression.rs   │ or  │ decompression.rs    │
+│ (orchestration)  │     │ (libdeflate/flate2) │
+└────────┬─────────┘     └─────────────────────┘
+         │
+         ▼
+┌─────────────────────────┐
+│ parallel_compress.rs    │  ← THE CORE: rayon + flate2
+│                         │
+│  1. mmap the file       │
+│  2. chunk into 128KB    │
+│  3. compress in parallel│
+│  4. concatenate output  │
+└─────────────────────────┘
 ```
 
-**Critical paths:**
-- **Single-threaded**: `compression.rs` → direct `GzEncoder` (no overhead)
-- **Multi-threaded**: `compression.rs` → `mmap` → `ParallelGzEncoder` → rayon
+### File-by-File Guide
 
-## Hard-Won Lessons
+| File | Purpose | Complexity |
+|------|---------|------------|
+| `main.rs` | CLI entry, routes to compress/decompress | Simple |
+| `cli.rs` | gzip-compatible argument parsing | Boring but thorough |
+| `compression.rs` | File handling, decides single vs parallel | Medium |
+| `decompression.rs` | libdeflate for speed, flate2 for multi-member | Medium |
+| **`parallel_compress.rs`** | **The heart: rayon parallel gzip** | **Read this first** |
+| `optimization.rs` | Thread/buffer tuning heuristics | Can ignore initially |
+| `simple_optimizations.rs` | Wrapper around parallel_compress | Can ignore initially |
+| `error.rs` | Error types | Simple |
+| `format.rs` | gzip/zlib format detection | Simple |
+| `utils.rs` | File utilities | Simple |
 
-### 1. Use zlib-ng for maximum performance
+### Start Here: parallel_compress.rs
 
-```toml
-# zlib-ng is 2-3x faster than standard zlib (SIMD-optimized)
-flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
-```
-
-zlib-ng produces valid gzip with equal or better compression ratios. The only reason to use standard zlib is byte-for-byte identical output to `gzip`, which is rarely needed.
-
-### 2. Fixed block size beats dynamic
-
-Use 128KB blocks like pigz. Dynamic sizing based on file size caused 14% regression.
-
-### 3. Single-threaded must be zero-overhead
+This is the core algorithm. Read it first:
 
 ```rust
-if thread_count == 1 {
-    // Go directly to flate2, skip all optimizer logic
-    let mut encoder = GzEncoder::new(writer, compression);
-    io::copy(&mut reader, &mut encoder)?;
-    encoder.finish()?;
+// The key function - parallel compression using rayon
+pub fn compress_file<P: AsRef<Path>, W: Write>(&self, path: P, writer: W) -> io::Result<u64> {
+    // 1. Memory-map the file (zero-copy)
+    let mmap = unsafe { Mmap::map(&file)? };
+    
+    // 2. Split into 128KB chunks
+    let blocks: Vec<&[u8]> = mmap.chunks(block_size).collect();
+    
+    // 3. Compress each chunk in parallel
+    let compressed_blocks: Vec<Vec<u8>> = pool.install(|| {
+        blocks
+            .par_iter()  // rayon parallel iterator
+            .map(|block| {
+                let mut encoder = GzEncoder::new(...);
+                encoder.write_all(block);
+                encoder.finish()
+            })
+            .collect()
+    });
+    
+    // 4. Concatenate (gzip allows this!)
+    for block in compressed_blocks {
+        writer.write_all(&block)?;
+    }
 }
 ```
 
-### 4. Benchmarking needs many runs
+## First Contribution Ideas
 
-| File Size | Minimum Runs | Why |
-|-----------|--------------|-----|
-| 1MB | 20 | Coefficient of variation can be 20%+ |
-| 10MB | 10 | CV is 2-5% |
-| 100MB | 5 | CV is <2% |
+### Easy (Good First Issues)
 
-Use **median** not min. 3 runs gave us false failures.
+1. **Add `--no-color` flag** - Disable colored output
+2. **Improve error messages** - Make them more helpful
+3. **Add `--version` details** - Show zlib version, CPU count
 
-### 5. mmap for zero-copy I/O
+### Medium
 
-For compression: mmap files >128KB (parallel mode benefits from zero-copy access).
-For decompression: always use mmap (faster than buffered reads on all platforms).
+1. **Better progress output** - Show compression progress for large files
+2. **Benchmark harness** - Add criterion benchmarks
+3. **ARM-specific tuning** - Optimize block size for Apple Silicon
 
-### 6. Global thread pool
+### Advanced
 
-Creating a rayon thread pool per compression is expensive:
+1. **Shared dictionary compression** - Use previous block as dictionary (like pigz `-i`)
+2. **Intel ISA-L backend** - Hardware-accelerated compression on Intel
+3. **Parallel decompression** - Decompress multi-member files in parallel
 
-```rust
-static THREAD_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+## How Compression Works
+
+### Single-threaded (fast path)
 ```
+Input → flate2::GzEncoder → Output
+```
+Just use zlib-ng directly. No overhead.
+
+### Multi-threaded (parallel path)
+```
+Input → mmap → [chunk1, chunk2, chunk3, ...]
+                    ↓ rayon parallel
+              [gzip1, gzip2, gzip3, ...]
+                    ↓ concatenate
+                 Output
+```
+
+Each chunk becomes a complete gzip "member". The gzip format allows concatenation.
+
+### Decompression Strategy
+- **Single-member gzip**: libdeflate (30-50% faster than zlib)
+- **Multi-member gzip**: zlib-ng via flate2 (reliable boundary parsing)
+
+We can't easily parallelize decompression because deflate streams can contain bytes that look like gzip headers (`1f 8b 08`), making boundary detection unreliable.
+
+## Key Dependencies
+
+| Crate | Why |
+|-------|-----|
+| `flate2` | Rust bindings to zlib-ng (compression) |
+| `libdeflater` | Rust bindings to libdeflate (fast decompression) |
+| `rayon` | Work-stealing parallelism |
+| `memmap2` | Memory-mapped I/O |
+| `clap` | CLI parsing |
 
 ## Performance Testing
 
 ```bash
-make quick      # Fast iteration (<30s)
-make perf-full  # Full suite (10+ min)
+# Quick iteration (< 30s)
+make quick
+
+# Full suite (10+ min, includes 100MB files)
+make perf-full
+
+# Specific test
+python3 scripts/perf.py --sizes 1,10 --levels 6 --threads 1,4
 ```
 
-**Targets:**
-- Single-threaded: Match gzip (within 5%)
-- Multi-threaded: Beat pigz
+### Benchmarking Rules
+
+| File Size | Runs Needed | Why |
+|-----------|-------------|-----|
+| 1MB | 30 | High variance (CV can be 20%+) |
+| 10MB | 15 | Medium variance |
+| 100MB | 7 | Low variance |
+
+**Use median, not min.** Too few runs give false positives.
+
+### Performance Targets
+
+- **Single-threaded**: Beat gzip (we're ~50% faster)
+- **Multi-threaded**: Beat pigz (we're ~40-50% faster)
 
 ## Pull Request Checklist
 
 - [ ] `cargo test` passes
 - [ ] `make validate` passes (output works with gunzip)
 - [ ] `make quick` shows no regressions
-- [ ] Single-threaded compression ratio matches gzip (within 0.1%)
+- [ ] Code is formatted (`cargo fmt`)
 
-## Future Optimization Ideas
+## What NOT to Do
 
-- **libdeflate** - Even faster single-block compression (but non-streaming API)
-- **Intel ISA-L** - Hardware-accelerated on Intel CPUs
-- **Shared dictionaries** - Like pigz, improve compression between adjacent blocks
-- **Parallel decompression** - Scan for gzip member boundaries and inflate in parallel
+These things were tried and failed:
+
+1. **Dynamic block sizing** - Caused 14% performance regression
+2. **Manual deflate boundary detection** - Deflate streams contain false gzip headers
+3. **gzp crate** - Threading issues; custom rayon is better
+4. **Creating thread pools per-call** - Use global `OnceLock<ThreadPool>`
+
+## Questions?
+
+Open an issue! We're happy to help newcomers understand the codebase.

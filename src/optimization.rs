@@ -9,8 +9,10 @@ pub enum ContentType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionBackend {
-    Gzp,
-    Flate2,
+    /// Parallel compression using rayon (multi-threaded)
+    Parallel,
+    /// Single-threaded compression using flate2 directly
+    SingleThreaded,
 }
 
 #[derive(Debug, Clone)]
@@ -209,19 +211,18 @@ fn choose_compression_backend(
     file_size: u64,
     thread_count: usize,
 ) -> CompressionBackend {
-    // For very small files (<64KB), flate2 has lower startup overhead
+    // For very small files (<64KB), single-threaded has lower startup overhead
     if file_size <= 65_536 {
-        return CompressionBackend::Flate2;
+        return CompressionBackend::SingleThreaded;
     }
 
-    // Multi-threaded: Use Gzp for parallel compression
+    // Multi-threaded: Use parallel compression
     if thread_count > 1 {
-        return CompressionBackend::Gzp;
+        return CompressionBackend::Parallel;
     }
 
-    // Single-threaded: Always use flate2 (zlib-ng) for correct compression ratios
-    // gzp at level 1 produces poor compression, flate2 matches gzip output
-    CompressionBackend::Flate2
+    // Single-threaded: Use flate2 directly (zlib-ng)
+    CompressionBackend::SingleThreaded
 }
 
 /// Determine if NUMA pinning would be beneficial

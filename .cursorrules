@@ -2,63 +2,52 @@
 
 Fast, parallel gzip replacement. Beats gzip and pigz by 40-50%.
 
-## Quick Commands
+## Quick Start
 
 ```bash
-make         # Build + quick benchmark (<30s)
+make           # Build + quick benchmark
 make validate  # Verify output works with gunzip
-cargo test   # Unit tests
+cargo test     # Unit tests
 ```
 
-## Key Architecture Decisions
+## Core Algorithm (parallel_compress.rs)
 
-1. **zlib-ng for compression** - `flate2` with `features = ["zlib-ng"]` for 2-3x faster compression
-2. **libdeflate for decompression** - 30-50% faster than zlib for in-memory operations
-3. **128KB fixed blocks** - Dynamic sizing regressed performance 14%
-4. **Single-thread = direct path** - No optimizer overhead for `-p1`
-5. **mmap for parallel compression** - Zero-copy via memmap2 for files > 128KB
-6. **Global rayon pool** - `OnceLock<ThreadPool>` avoids per-call cost
+```
+Input → mmap → [chunk1, chunk2, ...] → rayon parallel → [gzip1, gzip2, ...] → concatenate → Output
+```
 
-## Decompression Strategy
+Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 
-- **Single-member gzip**: Use libdeflate (fastest, 30-50% faster than zlib)
-- **Multi-member gzip**: Use zlib-ng via flate2 (reliable member boundary parsing)
-- Quick-scan first 256KB to detect multi-member files from parallel compression
-- Don't try to parse deflate stream boundaries manually - deflate data can contain false gzip magic bytes
+## Key Files
+
+| File | What it does |
+|------|--------------|
+| `parallel_compress.rs` | **THE CORE**: rayon + flate2 parallel compression |
+| `compression.rs` | Routes single vs multi-threaded |
+| `decompression.rs` | libdeflate (fast) + flate2 (multi-member) |
+| `cli.rs` | gzip-compatible argument parsing |
+
+## Performance Strategy
+
+**Compression:**
+- zlib-ng via flate2 (2-3x faster than standard zlib)
+- 128KB fixed blocks (dynamic sizing regressed 14%)
+- Global rayon pool (avoids per-call initialization)
+
+**Decompression:**
+- Single-member: libdeflate (30-50% faster than zlib)
+- Multi-member: zlib-ng via flate2 (reliable boundary parsing)
 
 ## What Doesn't Work
 
-- **Parallel decompression with manual boundary detection** - Deflate streams can contain bytes that look like gzip headers (`1f 8b 08`), making boundary detection unreliable
-- **Dynamic block sizing** - Added complexity with 14% performance regression
-- **gzp crate** - Had threading issues; custom rayon implementation is better
+1. **Manual deflate boundary detection** - Deflate streams contain false gzip headers
+2. **Dynamic block sizing** - Added complexity, 14% slower
+3. **gzp crate** - Threading issues; custom rayon is better
 
-## Performance Rules
+## Benchmarking
 
-- **30 runs** for 1MB tests (CV can be 20%+)
-- **15 runs** for 10MB tests
-- Use **median** not min
-- Target: beat both gzip and pigz in all scenarios
+- 30 runs for 1MB (high variance)
+- 15 runs for 10MB  
+- Use median, not min
 
-## Current Performance (Level 6)
-
-| Size | Threads | vs gzip | vs pigz |
-|------|---------|---------|---------|
-| 1MB  | 1       | -47%    | -47%    |
-| 1MB  | 4       | -80%    | -41%    |
-| 10MB | 1       | -52%    | -52%    |
-| 10MB | 4       | -87%    | -53%    |
-
-## File Map
-
-```
-src/
-├── main.rs              # CLI
-├── compression.rs       # File compression orchestration  
-├── parallel_compress.rs # Core: rayon parallel gzip with mmap
-├── cli.rs               # gzip-compatible args
-├── decompression.rs     # Decompression (libdeflate + flate2)
-├── optimization.rs      # Thread/buffer tuning
-└── simple_optimizations.rs # SimpleOptimizer wrapper
-```
-
-See CONTRIBUTING.md for detailed lessons learned.
+See CONTRIBUTING.md for detailed architecture guide.

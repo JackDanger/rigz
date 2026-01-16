@@ -29,8 +29,8 @@ impl SimpleOptimizer {
     /// Optimized compression with improved threading and buffer management
     pub fn compress<R: Read, W: Write>(&self, reader: R, writer: W) -> io::Result<u64> {
         match self.config.backend {
-            CompressionBackend::Gzp => self.compress_parallel(reader, writer),
-            CompressionBackend::Flate2 => self.compress_single_threaded(reader, writer),
+            CompressionBackend::Parallel => self.compress_parallel(reader, writer),
+            CompressionBackend::SingleThreaded => self.compress_single_threaded(reader, writer),
         }
     }
 
@@ -100,7 +100,7 @@ mod tests {
         let config = OptimizationConfig {
             thread_count: 4,
             buffer_size: 65536,
-            backend: CompressionBackend::Gzp,
+            backend: CompressionBackend::Parallel,
             content_type: ContentType::Binary,
             use_numa_pinning: false,
             compression_level: 6,
@@ -116,7 +116,7 @@ mod tests {
         let config = OptimizationConfig {
             thread_count: 4,
             buffer_size: 65536,
-            backend: CompressionBackend::Gzp,
+            backend: CompressionBackend::Parallel,
             content_type: ContentType::Text,
             use_numa_pinning: false,
             compression_level: 6,
@@ -138,7 +138,7 @@ mod tests {
         let config = OptimizationConfig {
             thread_count: 1,
             buffer_size: 65536,
-            backend: CompressionBackend::Flate2,
+            backend: CompressionBackend::SingleThreaded,
             content_type: ContentType::Text,
             use_numa_pinning: false,
             compression_level: 6,
