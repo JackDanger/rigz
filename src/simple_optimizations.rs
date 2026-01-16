@@ -7,13 +7,14 @@
 //! - Memory-mapped I/O for zero-copy file access (eliminates read latency)
 //! - Global thread pool to avoid per-call initialization
 //! - System zlib for gzip-compatible output at all compression levels
+//! - Cache-aware block sizing based on detected L2 cache
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use crate::optimization::{CompressionBackend, OptimizationConfig};
+use crate::optimization::{CompressionBackend, CpuFeatures, OptimizationConfig};
 use crate::parallel_compress::ParallelGzEncoder;
 
 /// Simple but effective optimizations that address pigz performance gaps
@@ -78,14 +79,40 @@ impl SimpleOptimizer {
         Ok(bytes_written)
     }
 
-    /// Calculate optimal thread count based on pigz analysis
+    /// Calculate optimal thread count based on CPU features and request
     fn calculate_optimal_threads(&self) -> usize {
         let base_threads = self.config.thread_count;
-
-        // Use requested threads - the "2-thread problem" was specific to gzp
-        // which we no longer use. Our rayon-based parallel compression works
-        // correctly with any thread count.
-        base_threads
+        let cpu = CpuFeatures::get();
+        
+        // Cap at physical cores to avoid hyperthreading contention
+        // for CPU-bound compression work
+        base_threads.min(cpu.physical_cores)
+    }
+    
+    /// Get CPU feature summary for debugging/verbosity
+    #[allow(dead_code)]
+    pub fn cpu_features_summary() -> String {
+        let cpu = CpuFeatures::get();
+        let mut features = Vec::new();
+        
+        if cpu.has_avx512 {
+            features.push("AVX-512");
+        } else if cpu.has_avx2 {
+            features.push("AVX2");
+        }
+        if cpu.has_neon {
+            features.push("NEON");
+        }
+        if cpu.has_crc32 {
+            features.push("CRC32");
+        }
+        
+        format!(
+            "CPU: {} cores, L2={}KB, features=[{}]",
+            cpu.physical_cores,
+            cpu.l2_cache_size / 1024,
+            features.join(", ")
+        )
     }
 }
 
