@@ -20,6 +20,8 @@ flate2 = { version = "1.0", default-features = false, features = ["zlib-ng"] }
 # Decompression: libdeflater provides Rust bindings to libdeflate 
 # (30-50% faster than zlib for in-memory operations)
 libdeflater = "1.0"
+# Low-level bindings for _ex functions (returns consumed bytes)
+libdeflate-sys = "1.0"
 
 # Parallel processing
 rayon = "1.8"

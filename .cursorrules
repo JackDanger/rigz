@@ -24,7 +24,8 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 |------|--------------|
 | `parallel_compress.rs` | **THE CORE**: rayon + flate2 parallel compression |
 | `compression.rs` | Routes single vs multi-threaded |
-| `decompression.rs` | libdeflate (fast) + flate2 (multi-member) |
+| `decompression.rs` | libdeflate (fast) for all paths |
+| `libdeflate_ext.rs` | DecompressorEx wrapper for `_ex` functions |
 | `optimization.rs` | CPU detection, buffer sizing, content analysis |
 | `cli.rs` | gzip-compatible argument parsing |
 
@@ -39,11 +40,12 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 
 **Decompression:**
 - Single-member: libdeflate (30-50% faster than zlib)
-- Multi-member: flate2 MultiGzDecoder (reliable boundary parsing)
+- Multi-member: libdeflate via DecompressorEx (returns consumed bytes)
 - SIMD header detection via memchr (10-50x faster scanning)
 - ISIZE trailer hint for accurate buffer pre-allocation
 - Thread-local decompressor reuse (avoids init overhead)
 - Cache-aligned buffer allocation (better memory access)
+- `libdeflate_ext.rs`: Uses libdeflate-sys directly for `_ex` functions
 
 **Architecture Awareness:**
 - Runtime CPU feature detection (AVX2, AVX-512, NEON, CRC32)
@@ -63,6 +65,7 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 8. ✅ **Statistical validation** - 5+ trials per test with median/stdev reporting
 9. ✅ **BGZF-style block markers** - Embed block sizes in FEXTRA for instant boundary detection
 10. ✅ **Parallel BGZF decompression** - rigz→rigz uses parallel libdeflate via rayon
+11. ✅ **libdeflate _ex bindings** - Direct libdeflate-sys access for gzip_decompress_ex
 
 ## Future Optimizations (see OPTIMIZATION_OPPORTUNITIES.md)
 

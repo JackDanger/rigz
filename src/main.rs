@@ -12,6 +12,7 @@ mod compression;
 mod decompression;
 mod error;
 mod format;
+mod libdeflate_ext;
 mod optimization;
 mod parallel_compress;
 mod simple_optimizations;

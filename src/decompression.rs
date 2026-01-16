@@ -223,7 +223,8 @@ fn has_bgzf_markers(data: &[u8]) -> bool {
     let mut pos = 0;
     while pos + 4 <= extra_field.len() {
         let subfield_id = &extra_field[pos..pos + 2];
-        let subfield_len = u16::from_le_bytes([extra_field[pos + 2], extra_field[pos + 3]]) as usize;
+        let subfield_len =
+            u16::from_le_bytes([extra_field[pos + 2], extra_field[pos + 3]]) as usize;
 
         if subfield_id == crate::parallel_compress::RIGZ_SUBFIELD_ID.as_slice() {
             return true;
@@ -280,8 +281,7 @@ fn parse_bgzf_blocks(data: &[u8]) -> Vec<(usize, usize)> {
                 && pos + 4 + 2 <= extra_field.len()
             {
                 // Block size is stored as (size - 1)
-                let size_minus_1 =
-                    u16::from_le_bytes([extra_field[pos + 4], extra_field[pos + 5]]);
+                let size_minus_1 = u16::from_le_bytes([extra_field[pos + 4], extra_field[pos + 5]]);
                 block_size = Some((size_minus_1 as usize) + 1);
                 break;
             }
@@ -450,8 +450,66 @@ fn decompress_multi_member_zlibng<W: Write>(data: &[u8], writer: &mut W) -> Rigz
     decompress_multi_member_sequential(data, writer)
 }
 
-/// Sequential multi-member decompression using flate2
+/// Sequential multi-member decompression using libdeflate (fastest)
+///
+/// Uses our DecompressorEx wrapper that returns consumed bytes,
+/// allowing us to iterate through members without re-decompressing.
 fn decompress_multi_member_sequential<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
+    use crate::libdeflate_ext::{DecompressError, DecompressorEx};
+
+    let mut decompressor = DecompressorEx::new();
+    let mut total_bytes = 0u64;
+    let mut offset = 0;
+
+    // Pre-allocate a reasonably sized output buffer
+    let mut output_buf = alloc_aligned_buffer(256 * 1024);
+
+    while offset < data.len() {
+        // Check for gzip magic
+        if data.len() - offset < 10 {
+            break;
+        }
+        if data[offset] != 0x1f || data[offset + 1] != 0x8b {
+            break;
+        }
+
+        let remaining = &data[offset..];
+
+        // Ensure buffer is large enough for estimated output
+        let min_size = remaining.len().saturating_mul(4).max(128 * 1024);
+        if output_buf.len() < min_size {
+            output_buf.resize(min_size, 0);
+        }
+
+        loop {
+            match decompressor.gzip_decompress_ex(remaining, &mut output_buf) {
+                Ok(result) => {
+                    writer.write_all(&output_buf[..result.output_size])?;
+                    total_bytes += result.output_size as u64;
+                    offset += result.input_consumed;
+                    break;
+                }
+                Err(DecompressError::InsufficientSpace) => {
+                    // Grow buffer and retry
+                    let new_size = output_buf.len().saturating_mul(2);
+                    output_buf.resize(new_size, 0);
+                    continue;
+                }
+                Err(DecompressError::BadData) => {
+                    // Might be trailing garbage, stop processing
+                    break;
+                }
+            }
+        }
+    }
+
+    writer.flush()?;
+    Ok(total_bytes)
+}
+
+/// Fallback to flate2 for edge cases where libdeflate fails
+#[allow(dead_code)]
+fn decompress_multi_member_flate2<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
     use flate2::bufread::MultiGzDecoder;
     use std::io::Read;
 
