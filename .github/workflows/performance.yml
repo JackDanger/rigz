@@ -1,0 +1,130 @@
+name: Performance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:  # Allow manual runs
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Performance (${{ matrix.size }}MB, L${{ matrix.level }}, T${{ matrix.threads }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        size: [1, 10]
+        level: [1, 6, 9]
+        threads: [1, 4]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential zlib1g-dev
+
+      - name: Build rigz
+        run: cargo build --release
+
+      - name: Build pigz
+        run: make -C pigz
+
+      - name: Run benchmark
+        id: bench
+        run: |
+          python3 scripts/benchmark_ci.py \
+            --size ${{ matrix.size }} \
+            --level ${{ matrix.level }} \
+            --threads ${{ matrix.threads }} \
+            --output benchmark-results.json
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.size }}mb-l${{ matrix.level }}-t${{ matrix.threads }}
+          path: benchmark-results.json
+
+  compression-ratio:
+    name: Compression Ratio (${{ matrix.level }}, T${{ matrix.threads }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        level: [1, 6, 9]
+        threads: [1, 4]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential zlib1g-dev
+
+      - name: Build rigz
+        run: cargo build --release
+
+      - name: Build pigz
+        run: make -C pigz
+
+      - name: Check compression ratio
+        run: |
+          python3 scripts/benchmark_ci.py \
+            --size 10 \
+            --level ${{ matrix.level }} \
+            --threads ${{ matrix.threads }} \
+            --check-ratio \
+            --max-ratio-overhead 5.0
+
+  summary:
+    name: Performance Summary
+    runs-on: ubuntu-latest
+    needs: [benchmark, compression-ratio]
+    if: always()
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: results
+
+      - name: Summarize results
+        run: |
+          echo "## Performance Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Count pass/fail
+          passed=0
+          failed=0
+          
+          for f in results/*/benchmark-results.json; do
+            if [ -f "$f" ]; then
+              status=$(cat "$f" | python3 -c "import json,sys; d=json.load(sys.stdin); print('pass' if d.get('passed', False) else 'fail')" 2>/dev/null || echo "unknown")
+              if [ "$status" = "pass" ]; then
+                passed=$((passed + 1))
+              else
+                failed=$((failed + 1))
+              fi
+            fi
+          done
+          
+          echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| ✅ Passed | $passed |" >> $GITHUB_STEP_SUMMARY
+          echo "| ❌ Failed | $failed |" >> $GITHUB_STEP_SUMMARY
