@@ -176,7 +176,8 @@ fn is_multi_member_quick(data: &[u8]) -> bool {
 /// Decompress gzip - chooses optimal strategy based on content
 ///
 /// - Single member: libdeflate (fastest, 30-50% faster than zlib)
-/// - Multi member: zlib-ng via flate2 (reliable member boundary handling)
+/// - BGZF-style (rigz output): parallel libdeflate using embedded block sizes
+/// - Other multi-member: sequential zlib-ng
 fn decompress_gzip_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
     if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
         return Ok(0);
@@ -188,9 +189,190 @@ fn decompress_gzip_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> RigzResu
         return decompress_single_member_libdeflate(data, writer);
     }
 
-    // Multi-member file: use zlib-ng which correctly handles member boundaries
-    // by actually inflating each stream (can't reliably detect boundaries otherwise)
+    // Check for BGZF-style markers (rigz output with embedded block sizes)
+    // These allow parallel decompression without scanning for boundaries
+    if has_bgzf_markers(data) {
+        return decompress_bgzf_parallel(data, writer);
+    }
+
+    // Multi-member file without markers: use zlib-ng sequential
     decompress_multi_member_zlibng(data, writer)
+}
+
+/// Check if data has BGZF-style "RZ" markers in the first gzip header
+#[inline]
+fn has_bgzf_markers(data: &[u8]) -> bool {
+    // Minimum header with FEXTRA: 10 base + 2 XLEN + 4 subfield header
+    if data.len() < 16 {
+        return false;
+    }
+
+    // Check FEXTRA flag (bit 2 of flags byte at offset 3)
+    if data[3] & 0x04 == 0 {
+        return false;
+    }
+
+    // Get XLEN (2 bytes at offset 10, little-endian)
+    let xlen = u16::from_le_bytes([data[10], data[11]]) as usize;
+    if xlen < 6 || data.len() < 12 + xlen {
+        return false;
+    }
+
+    // Look for "RZ" subfield ID
+    let extra_field = &data[12..12 + xlen];
+    let mut pos = 0;
+    while pos + 4 <= extra_field.len() {
+        let subfield_id = &extra_field[pos..pos + 2];
+        let subfield_len = u16::from_le_bytes([extra_field[pos + 2], extra_field[pos + 3]]) as usize;
+
+        if subfield_id == crate::parallel_compress::RIGZ_SUBFIELD_ID.as_slice() {
+            return true;
+        }
+
+        pos += 4 + subfield_len;
+    }
+
+    false
+}
+
+/// Parse BGZF block boundaries from "RZ" markers
+/// Returns vector of (start_offset, block_size) tuples
+fn parse_bgzf_blocks(data: &[u8]) -> Vec<(usize, usize)> {
+    let mut blocks = Vec::new();
+    let mut offset = 0;
+
+    while offset < data.len() {
+        // Check for gzip magic
+        if data.len() - offset < 18 {
+            break;
+        }
+        if data[offset] != 0x1f || data[offset + 1] != 0x8b {
+            break;
+        }
+
+        // Check FEXTRA flag
+        if data[offset + 3] & 0x04 == 0 {
+            break; // No FEXTRA, can't parse block size
+        }
+
+        // Get XLEN
+        if data.len() - offset < 12 {
+            break;
+        }
+        let xlen = u16::from_le_bytes([data[offset + 10], data[offset + 11]]) as usize;
+        if data.len() - offset < 12 + xlen {
+            break;
+        }
+
+        // Find "RZ" subfield
+        let extra_start = offset + 12;
+        let extra_field = &data[extra_start..extra_start + xlen];
+        let mut block_size = None;
+        let mut pos = 0;
+
+        while pos + 4 <= extra_field.len() {
+            let subfield_id = &extra_field[pos..pos + 2];
+            let subfield_len =
+                u16::from_le_bytes([extra_field[pos + 2], extra_field[pos + 3]]) as usize;
+
+            if subfield_id == crate::parallel_compress::RIGZ_SUBFIELD_ID.as_slice()
+                && subfield_len >= 2
+                && pos + 4 + 2 <= extra_field.len()
+            {
+                // Block size is stored as (size - 1)
+                let size_minus_1 =
+                    u16::from_le_bytes([extra_field[pos + 4], extra_field[pos + 5]]);
+                block_size = Some((size_minus_1 as usize) + 1);
+                break;
+            }
+
+            pos += 4 + subfield_len;
+        }
+
+        match block_size {
+            Some(size) if size > 0 && offset + size <= data.len() => {
+                blocks.push((offset, size));
+                offset += size;
+            }
+            _ => break, // Invalid or missing block size
+        }
+    }
+
+    blocks
+}
+
+/// Parallel decompression for BGZF-style files (rigz output)
+/// Uses embedded block size markers to find boundaries without inflating
+fn decompress_bgzf_parallel<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
+    use libdeflater::{DecompressionError, Decompressor};
+    use rayon::prelude::*;
+
+    let blocks = parse_bgzf_blocks(data);
+
+    // Fall back to sequential if we couldn't parse blocks
+    if blocks.is_empty() {
+        return decompress_multi_member_zlibng(data, writer);
+    }
+
+    // For few blocks, sequential is faster (avoids rayon overhead)
+    if blocks.len() < 4 {
+        return decompress_multi_member_sequential(data, writer);
+    }
+
+    // Decompress blocks in parallel
+    let results: Vec<Result<Vec<u8>, String>> = blocks
+        .par_iter()
+        .map(|&(start, len)| {
+            let block_data = &data[start..start + len];
+            let mut decompressor = Decompressor::new();
+
+            // Read ISIZE from trailer for buffer sizing
+            let isize_hint = if len >= 8 {
+                let trailer = &block_data[len - 4..];
+                u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]) as usize
+            } else {
+                0
+            };
+
+            let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
+                isize_hint + 1024
+            } else {
+                len.saturating_mul(4).max(64 * 1024)
+            };
+
+            let mut output = vec![0u8; initial_size];
+
+            loop {
+                match decompressor.gzip_decompress(block_data, &mut output) {
+                    Ok(size) => {
+                        output.truncate(size);
+                        return Ok(output);
+                    }
+                    Err(DecompressionError::InsufficientSpace) => {
+                        let new_size = output.len().saturating_mul(2);
+                        output.resize(new_size, 0);
+                        continue;
+                    }
+                    Err(e) => return Err(format!("decompression error: {:?}", e)),
+                }
+            }
+        })
+        .collect();
+
+    // Collect results and write in order
+    let mut total_bytes = 0u64;
+    for result in results {
+        match result {
+            Ok(decompressed) => {
+                writer.write_all(&decompressed)?;
+                total_bytes += decompressed.len() as u64;
+            }
+            Err(e) => return Err(RigzError::invalid_argument(e)),
+        }
+    }
+
+    writer.flush()?;
+    Ok(total_bytes)
 }
 
 /// Read the ISIZE field from gzip trailer (last 4 bytes) for buffer sizing

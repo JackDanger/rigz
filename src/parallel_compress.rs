@@ -10,6 +10,7 @@
 //! - Thread-local buffer reuse to minimize allocations
 //! - 128KB fixed blocks (matches pigz default)
 //! - Level adjustment for zlib-ng (L1→L2 for better compression ratio)
+//! - BGZF-style block size markers in FEXTRA for fast parallel decompression
 
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -20,6 +21,10 @@ use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::OnceLock;
+
+/// BGZF-style subfield ID for block size markers
+/// Using "RZ" to identify rigz-compressed blocks
+pub const RIGZ_SUBFIELD_ID: [u8; 2] = [b'R', b'Z'];
 
 /// Adjust compression level for zlib-ng compatibility
 ///
@@ -257,20 +262,96 @@ fn write_compressed_blocks<W: Write>(blocks: &[Vec<u8>], writer: &mut W) -> io::
 }
 
 /// Compress a single block using thread-local buffer to minimize allocations
+/// Writes BGZF-style header with block size in FEXTRA for fast parallel decompression
 #[inline]
 fn compress_block_with_reuse(block: &[u8], compression_level: u32) -> Vec<u8> {
     COMPRESS_BUF.with(|buf| {
         let mut buf = buf.borrow_mut();
         buf.clear();
 
-        // Each block is a complete gzip file
-        let mut encoder = GzEncoder::new(&mut *buf, Compression::new(compression_level));
-        encoder.write_all(block).ok();
-        encoder.finish().ok();
+        // Compress with BGZF-style header (includes block size marker)
+        compress_block_bgzf(&mut *buf, block, compression_level);
 
         // Return a copy (buffer stays allocated for next use)
         buf.clone()
     })
+}
+
+/// Compress a block with BGZF-style gzip header containing block size
+///
+/// The header includes:
+/// - Standard gzip magic (0x1f 0x8b)
+/// - FEXTRA flag set (0x04)
+/// - "RZ" subfield with compressed block size (allows parallel decompression)
+///
+/// This is compatible with all gzip decompressors (they ignore unknown subfields)
+/// but enables rigz to find block boundaries without inflating.
+fn compress_block_bgzf(output: &mut Vec<u8>, block: &[u8], compression_level: u32) {
+    use crc32fast::Hasher;
+    use flate2::Compress;
+    use flate2::FlushCompress;
+    use flate2::Status;
+
+    // Reserve space for header (we'll write block size later)
+    let header_start = output.len();
+
+    // Write gzip header with FEXTRA flag
+    // 10 bytes base header + 6 bytes XLEN + subfield
+    output.extend_from_slice(&[
+        0x1f, 0x8b, // Magic
+        0x08,       // Compression method (deflate)
+        0x04,       // Flags: FEXTRA
+        0, 0, 0, 0, // MTIME (zero)
+        0x00,       // XFL (no extra flags)
+        0xff,       // OS (unknown)
+    ]);
+
+    // XLEN: 6 bytes (2 byte ID + 2 byte len + 2 byte block size)
+    output.extend_from_slice(&[6, 0]);
+
+    // Subfield: "RZ" + 2 bytes len + 2 bytes block size (placeholder)
+    output.extend_from_slice(&RIGZ_SUBFIELD_ID);
+    output.extend_from_slice(&[2, 0]); // Subfield data length
+    let block_size_offset = output.len();
+    output.extend_from_slice(&[0, 0]); // Placeholder for block size
+
+    // Compress the data
+    let mut compress = Compress::new(Compression::new(compression_level), false);
+    let deflate_start = output.len();
+
+    // Reserve space for compressed data (worst case: slightly larger than input)
+    let max_compressed_size = block.len() + (block.len() >> 12) + (block.len() >> 14) + 11 + 1024;
+    output.resize(deflate_start + max_compressed_size, 0);
+
+    let status = compress
+        .compress(block, &mut output[deflate_start..], FlushCompress::Finish)
+        .expect("compression failed");
+
+    if status != Status::StreamEnd {
+        // Shouldn't happen with Finish flush, but handle gracefully
+        panic!("Unexpected compression status: {:?}", status);
+    }
+
+    let compressed_len = compress.total_out() as usize;
+    output.truncate(deflate_start + compressed_len);
+
+    // Compute CRC32 of uncompressed data
+    let mut hasher = Hasher::new();
+    hasher.update(block);
+    let crc32 = hasher.finalize();
+
+    // Write gzip trailer: CRC32 + ISIZE (uncompressed size mod 2^32)
+    output.extend_from_slice(&crc32.to_le_bytes());
+    output.extend_from_slice(&(block.len() as u32).to_le_bytes());
+
+    // Now write the total block size (including header and trailer)
+    let total_block_size = output.len() - header_start;
+
+    // Block size is stored as (size - 1) to match BGZF convention
+    // This allows block sizes up to 65536 to fit in 16 bits
+    let block_size_minus_1 = (total_block_size - 1) as u16;
+    output[block_size_offset..block_size_offset + 2]
+        .copy_from_slice(&block_size_minus_1.to_le_bytes());
 }
 
 #[cfg(test)]
