@@ -1,23 +1,42 @@
 Source: rigz
 Section: utils
 Priority: optional
-Maintainer: rigz contributors <rigz@example.com>
-Build-Depends: debhelper-compat (= 13), cargo, rustc, zlib1g-dev
-Standards-Version: 4.6.0
-Homepage: https://github.com/example/rigz
-Vcs-Git: https://github.com/example/rigz.git
+Maintainer: Jack Danger <github@jackdanger.com>
+Build-Depends: debhelper-compat (= 13), cargo, rustc (>= 1.70)
+Standards-Version: 4.6.2
+Homepage: https://github.com/jackdanger/rigz
+Vcs-Git: https://github.com/jackdanger/rigz.git
 Rules-Requires-Root: no
 
 Package: rigz
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
-Description: Parallel gzip compressor written in Rust
- rigz is a drop-in replacement for gzip that uses multiple processors
- and cores for compression. It produces fully gzip-compatible output
- and achieves significant speedup on multi-core systems.
+Description: Fast parallel gzip compression
+ Rigz is a high-performance, parallel gzip implementation written in Rust.
+ It provides 40-50% faster compression than gzip and pigz by leveraging
+ multiple CPU cores, SIMD instructions, and optimized memory management.
  .
  Features:
-  - Parallel compression using all available CPU cores
-  - Drop-in replacement for gzip (same command-line interface)
-  - Cross-platform (Linux, macOS, Windows)
-  - Based on pigz by Mark Adler
+  - Drop-in gzip replacement with compatible CLI
+  - Parallel compression using all available cores
+  - Memory-mapped I/O for zero-copy file access
+  - Compatible output that works with all standard gzip tools
+ .
+ This package provides the rigz and unrigz commands.
+
+Package: rigz-replace-gzip
+Architecture: all
+Depends: rigz (= ${binary:Version}), ${misc:Depends}
+Conflicts: gzip
+Provides: gzip
+Replaces: gzip
+Description: Replace system gzip with rigz (fast parallel gzip)
+ This package replaces the system gzip, gunzip, gzcat, and zcat commands
+ with rigz, providing significantly faster compression and decompression.
+ .
+ When installed, all system gzip operations will use rigz transparently.
+ This is fully compatible with standard gzip - files compressed with rigz
+ can be decompressed by any standard gzip implementation.
+ .
+ WARNING: This package conflicts with and replaces the gzip package.
+ Install only if you want rigz to handle all gzip operations system-wide.

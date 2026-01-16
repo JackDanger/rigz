@@ -1,0 +1,2 @@
+# Main rigz package installs the binary
+# Installation handled in debian/rules

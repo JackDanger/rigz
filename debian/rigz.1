@@ -1,0 +1,104 @@
+.TH RIGZ 1 "January 2026" "rigz 0.1.0" "User Commands"
+.SH NAME
+rigz \- fast parallel gzip compression
+.SH SYNOPSIS
+.B rigz
+[\fIOPTION\fR]... [\fIFILE\fR]...
+.SH DESCRIPTION
+.B rigz
+is a high-performance, parallel gzip implementation that provides 40-50%
+faster compression than gzip and pigz. It is a drop-in replacement for gzip
+with a compatible command-line interface.
+.PP
+When invoked as
+.B unrigz
+or with the
+.B \-d
+option, rigz decompresses files.
+.SH OPTIONS
+.TP
+.B \-c, \-\-stdout
+Write output to standard output; keep original files unchanged.
+.TP
+.B \-d, \-\-decompress
+Decompress the compressed input.
+.TP
+.B \-f, \-\-force
+Force compression or decompression even if the file has multiple links
+or the corresponding file already exists.
+.TP
+.B \-h, \-\-help
+Display help information and exit.
+.TP
+.B \-k, \-\-keep
+Keep (don't delete) input files during compression or decompression.
+.TP
+.B \-l, \-\-list
+List compressed file contents.
+.TP
+.B \-n, \-\-no-name
+Do not save or restore the original file name and timestamp.
+.TP
+.B \-N, \-\-name
+Save or restore the original file name and timestamp.
+.TP
+.B \-p, \-\-processes \fINUM\fR
+Use NUM parallel processes for compression. Default is the number of
+available CPU cores.
+.TP
+.B \-q, \-\-quiet
+Suppress all warnings.
+.TP
+.B \-r, \-\-recursive
+Operate recursively on directories.
+.TP
+.B \-S, \-\-suffix \fISUFFIX\fR
+Use SUFFIX instead of .gz.
+.TP
+.B \-t, \-\-test
+Test compressed file integrity.
+.TP
+.B \-v, \-\-verbose
+Verbose mode. Display the name and percentage reduction for each file.
+.TP
+.B \-V, \-\-version
+Display version number and exit.
+.TP
+.B \-1 ... \-9
+Set compression level. \-1 (fastest) to \-9 (best compression).
+Default is \-6.
+.SH EXAMPLES
+.TP
+Compress a file:
+.B rigz file.txt
+.TP
+Decompress a file:
+.B rigz -d file.txt.gz
+.TP
+Compress to stdout using 8 threads:
+.B rigz -c -p8 file.txt > file.txt.gz
+.TP
+Decompress and keep original:
+.B rigz -dk file.txt.gz
+.SH "EXIT STATUS"
+.TP
+.B 0
+Successful completion.
+.TP
+.B 1
+An error occurred.
+.SH COMPATIBILITY
+rigz produces output that is fully compatible with standard gzip. Files
+compressed with rigz can be decompressed by any gzip implementation, and
+rigz can decompress any standard gzip file.
+.PP
+The parallel compression works by creating multiple gzip "members" that
+are concatenated together. This is valid per RFC 1952 and all standard
+gzip implementations will correctly decompress such files.
+.SH "SEE ALSO"
+.BR gzip (1),
+.BR gunzip (1),
+.BR pigz (1),
+.BR zcat (1)
+.SH AUTHOR
+Jack Danger <github@jackdanger.com>

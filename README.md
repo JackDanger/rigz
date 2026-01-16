@@ -10,11 +10,32 @@ Inspired by [pigz](https://zlib.net/pigz/) from [Mark Adler](https://en.wikipedi
 
 ## Install
 
+### From crates.io
 ```bash
 cargo install rigz
 ```
 
-Or build from source:
+### Debian/Ubuntu packages
+
+Build and install Debian packages:
+
+```bash
+git clone --recursive https://github.com/jackdanger/rigz
+cd rigz
+
+# Build packages (requires: debhelper cargo rustc devscripts)
+./scripts/build-deb.sh
+
+# Install rigz
+sudo dpkg -i ../rigz_*.deb
+
+# Optional: Replace system gzip entirely
+sudo dpkg -i ../rigz-replace-gzip_*.deb
+```
+
+The `rigz-replace-gzip` package replaces `/usr/bin/gzip`, `gunzip`, `zcat`, etc. with rigz symlinks. Every gzip operation on your system will automatically use rigz.
+
+### From source
 
 ```bash
 git clone --recursive https://github.com/jackdanger/rigz

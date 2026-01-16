@@ -1,8 +1,9 @@
 rigz (0.1.0-1) unstable; urgency=medium
 
   * Initial release.
-  * Parallel gzip compression using Rust and rayon
-  * Compatible with standard gzip/gunzip tools
-  * Drop-in replacement for gzip command-line interface
+  * Parallel gzip compression using rayon and zlib-ng
+  * Fast decompression using libdeflate
+  * Drop-in gzip replacement with compatible CLI
+  * Optional rigz-replace-gzip package for system-wide replacement
 
- -- rigz contributors <rigz@example.com>  Wed, 15 Jan 2025 00:00:00 +0000
+ -- Jack Danger <github@jackdanger.com>  Thu, 15 Jan 2026 23:00:00 -0800
