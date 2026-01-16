@@ -58,23 +58,17 @@ $(UNRIGZ_BIN): $(RIGZ_BIN)
 FORCE:
 
 # =============================================================================
-# Quick benchmark (~20 seconds) - for AI tools and fast iteration
+# Quick benchmark (~30 seconds) - for AI tools and fast iteration
 # =============================================================================
 quick: $(RIGZ_BIN) $(UNRIGZ_BIN) $(GZIP_BIN) $(PIGZ_BIN)
-	@chmod +x scripts/quick_bench.sh
-	@./scripts/quick_bench.sh
+	@python3 scripts/perf.py --sizes 1,10 --levels 6 --threads 1,4
 
 # =============================================================================
 # Full performance tests (10+ minutes) - for humans at release time
 # =============================================================================
-perf-full: $(RIGZ_BIN) $(UNRIGZ_BIN) $(GZIP_BIN) $(PIGZ_BIN) test-data
-	@echo "============================================"
-	@echo "  RIGZ Full Performance Suite"
-	@echo "  (This will take 10+ minutes)"
-	@echo "============================================"
+perf-full: $(RIGZ_BIN) $(UNRIGZ_BIN) $(GZIP_BIN) $(PIGZ_BIN)
 	@mkdir -p $(RESULTS_DIR)
-	@chmod +x scripts/perf_full.sh
-	@./scripts/perf_full.sh 2>&1 | tee $(RESULTS_DIR)/perf_full_$$(date +%Y%m%d_%H%M%S).log
+	@python3 scripts/perf.py --full 2>&1 | tee $(RESULTS_DIR)/perf_full_$$(date +%Y%m%d_%H%M%S).log
 
 # Generate all test data files
 test-data:
@@ -91,38 +85,10 @@ test-data:
 	@echo "✓ Test data ready"
 
 # =============================================================================
-# Validation target - verify all outputs decompress correctly
+# Validation target - cross-tool compression/decompression matrix
 # =============================================================================
-validate: $(RIGZ_BIN) $(UNRIGZ_BIN)
-	@echo "Running validation suite..."
-	@mkdir -p $(TEST_DATA_DIR)
-	@echo "test content for validation" > $(TEST_DATA_DIR)/validate.txt
-	@passed=0; failed=0; \
-	for level in 1 6 9; do \
-		for threads in 1 4; do \
-			$(RIGZ_BIN) -$$level -p$$threads -c $(TEST_DATA_DIR)/validate.txt > /tmp/v.gz 2>/dev/null; \
-			if gunzip -c /tmp/v.gz 2>/dev/null | diff -q - $(TEST_DATA_DIR)/validate.txt >/dev/null 2>&1; then \
-				echo "✓ Level $$level, $$threads thread(s)"; \
-				passed=$$((passed+1)); \
-			else \
-				echo "✗ Level $$level, $$threads thread(s) FAILED"; \
-				failed=$$((failed+1)); \
-			fi; \
-		done; \
-	done; \
-	echo "Testing unrigz symlink..."; \
-	$(RIGZ_BIN) -c $(TEST_DATA_DIR)/validate.txt > /tmp/v.gz 2>/dev/null; \
-	if $(UNRIGZ_BIN) -c /tmp/v.gz 2>/dev/null | diff -q - $(TEST_DATA_DIR)/validate.txt >/dev/null 2>&1; then \
-		echo "✓ unrigz decompression"; \
-		passed=$$((passed+1)); \
-	else \
-		echo "✗ unrigz decompression FAILED"; \
-		failed=$$((failed+1)); \
-	fi; \
-	rm -f /tmp/v.gz; \
-	echo ""; \
-	echo "Passed: $$passed, Failed: $$failed"; \
-	[ $$failed -eq 0 ] || exit 1
+validate: $(RIGZ_BIN) $(UNRIGZ_BIN) $(GZIP_BIN) $(PIGZ_BIN)
+	@python3 scripts/validate.py
 
 # =============================================================================
 # Install target

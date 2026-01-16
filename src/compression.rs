@@ -113,9 +113,13 @@ pub fn compress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
     };
 
     match result {
-        Ok(output_size) => {
-            if args.verbosity > 0 && !args.quiet {
-                print_compression_stats(file_size, output_size, input_path, args);
+        Ok(_) => {
+            // Print stats if verbose (get actual compressed size from output file)
+            if args.verbosity > 0 && !args.quiet && !args.stdout {
+                let output_path = get_output_filename(input_path, args);
+                if let Ok(metadata) = std::fs::metadata(&output_path) {
+                    print_compression_stats(file_size, metadata.len(), input_path, args);
+                }
             }
 
             // Delete original file if not keeping it
@@ -276,35 +280,48 @@ fn get_output_filename(input_path: &Path, args: &RigzArgs) -> std::path::PathBuf
 }
 
 fn print_compression_stats(input_size: u64, output_size: u64, path: &Path, args: &RigzArgs) {
-    if args.verbosity >= 1 {
-        let filename = path
-            .file_name()
-            .unwrap_or_default()
-            .to_str()
-            .unwrap_or("<unknown>");
-        let compression_ratio = if input_size > 0 {
-            (output_size as f64 / input_size as f64) * 100.0
-        } else {
-            0.0
-        };
-
-        let speedup_estimate = if input_size > 1_000_000 {
-            match args.processes {
-                1 => "1.0x",
-                2 => "1.8x",
-                4 => "3.2x",
-                8 => "5.5x",
-                _ => "?x",
-            }
-        } else {
-            "1.0x"
-        };
-
+    let filename = path
+        .file_name()
+        .unwrap_or_default()
+        .to_str()
+        .unwrap_or("<unknown>");
+    
+    let ratio = if input_size > 0 {
+        output_size as f64 / input_size as f64
+    } else {
+        1.0
+    };
+    let saved_pct = (1.0 - ratio) * 100.0;
+    
+    // Format sizes nicely
+    let (in_size, in_unit) = format_size(input_size);
+    let (out_size, out_unit) = format_size(output_size);
+    
+    if args.processes > 1 {
         eprintln!(
-            "{}: {:.1}% compression, ~{} speedup",
-            filename,
-            100.0 - compression_ratio,
-            speedup_estimate
+            "{}: {:.1}{} → {:.1}{} ({:.1}% saved, {} threads)",
+            filename, in_size, in_unit, out_size, out_unit, saved_pct, args.processes
         );
+    } else {
+        eprintln!(
+            "{}: {:.1}{} → {:.1}{} ({:.1}% saved)",
+            filename, in_size, in_unit, out_size, out_unit, saved_pct
+        );
+    }
+}
+
+fn format_size(bytes: u64) -> (f64, &'static str) {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+    
+    if bytes >= GB {
+        (bytes as f64 / GB as f64, "GB")
+    } else if bytes >= MB {
+        (bytes as f64 / MB as f64, "MB")
+    } else if bytes >= KB {
+        (bytes as f64 / KB as f64, "KB")
+    } else {
+        (bytes as f64, "B")
     }
 }
