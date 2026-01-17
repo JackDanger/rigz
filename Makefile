@@ -20,7 +20,7 @@ PIGZ_BIN := $(PIGZ_DIR)/pigz
 GZIP_BIN := $(shell if [ -x $(GZIP_DIR)/gzip ]; then echo $(GZIP_DIR)/gzip; else echo $$(which gzip); fi)
 SYSTEM_GZIP := $(shell which gzip)
 
-.PHONY: all build quick perf-full test-data clean help validate deps
+.PHONY: all build quick perf-full test-data test-data-quick clean help validate deps
 
 # =============================================================================
 # Default target: quick benchmark for fast iteration (< 30 seconds)
@@ -80,19 +80,15 @@ perf-full: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
 	@mkdir -p $(RESULTS_DIR)
 	@python3 scripts/perf.py --full 2>&1 | tee $(RESULTS_DIR)/perf_full_$$(date +%Y%m%d_%H%M%S).log
 
-# Generate all test data files
+# Generate test data files using Python script
+# Uses test_data/text-1MB.txt (Proust) as seed for highly-compressible text
 test-data:
-	@echo "Generating test data files..."
-	@mkdir -p $(TEST_DATA_DIR)
-	@[ -f $(TEST_DATA_DIR)/text-10KB.txt ] || head -c 10240 /dev/urandom | base64 > $(TEST_DATA_DIR)/text-10KB.txt 2>/dev/null
-	@[ -f $(TEST_DATA_DIR)/text-1MB.txt ] || head -c 1048576 /dev/urandom | base64 > $(TEST_DATA_DIR)/text-1MB.txt 2>/dev/null
-	@[ -f $(TEST_DATA_DIR)/text-10MB.txt ] || head -c 10485760 /dev/urandom | base64 > $(TEST_DATA_DIR)/text-10MB.txt 2>/dev/null
-	@[ -f $(TEST_DATA_DIR)/text-100MB.txt ] || head -c 104857600 /dev/urandom | base64 > $(TEST_DATA_DIR)/text-100MB.txt 2>/dev/null
-	@[ -f $(TEST_DATA_DIR)/random-10KB.dat ] || head -c 10240 /dev/urandom > $(TEST_DATA_DIR)/random-10KB.dat 2>/dev/null
-	@[ -f $(TEST_DATA_DIR)/random-1MB.dat ] || head -c 1048576 /dev/urandom > $(TEST_DATA_DIR)/random-1MB.dat 2>/dev/null
-	@[ -f $(TEST_DATA_DIR)/random-10MB.dat ] || head -c 10485760 /dev/urandom > $(TEST_DATA_DIR)/random-10MB.dat 2>/dev/null
-	@[ -f $(TEST_DATA_DIR)/random-100MB.dat ] || head -c 104857600 /dev/urandom > $(TEST_DATA_DIR)/random-100MB.dat 2>/dev/null
-	@echo "✓ Test data ready"
+	@python3 scripts/generate_test_data.py --output-dir $(TEST_DATA_DIR) --size 10
+	@python3 scripts/generate_test_data.py --output-dir $(TEST_DATA_DIR) --size 100
+
+# Generate just 10MB test files (faster for quick testing)
+test-data-quick:
+	@python3 scripts/generate_test_data.py --output-dir $(TEST_DATA_DIR) --size 10
 
 # =============================================================================
 # Validation target - cross-tool compression/decompression matrix
@@ -100,20 +96,26 @@ test-data:
 validate: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
 	@python3 scripts/validate.py
 
-# Validation with JSON output
+# Validation with JSON output (run tests, save results)
 validate-json: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
-	@python3 scripts/validate.py --json -o $(RESULTS_DIR)/validation.json
-	@echo "Results saved to $(RESULTS_DIR)/validation.json"
-
-# Generate performance chart from validation results
-validation-chart: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
 	@mkdir -p $(RESULTS_DIR)
-	@echo "Running validation suite..."
 	@python3 scripts/validate.py --json -o $(RESULTS_DIR)/validation.json
+	@echo "✓ Results saved to $(RESULTS_DIR)/validation.json"
+
+# Run validation + generate charts (full workflow)
+validation-chart: validate-json render-chart
+
+# Render charts from existing JSON (fast iteration on chart rendering)
+render-chart:
+	@if [ ! -f $(RESULTS_DIR)/validation.json ]; then \
+		echo "Error: $(RESULTS_DIR)/validation.json not found. Run 'make validate-json' first."; \
+		exit 1; \
+	fi
 	@echo ""
 	@python3 scripts/validation_chart.py $(RESULTS_DIR)/validation.json
 	@python3 scripts/validation_chart.py $(RESULTS_DIR)/validation.json --html > $(RESULTS_DIR)/validation.html
-	@echo "HTML chart saved to $(RESULTS_DIR)/validation.html"
+	@echo ""
+	@echo "✓ HTML chart: $(RESULTS_DIR)/validation.html"
 
 # =============================================================================
 # Lint target
@@ -159,14 +161,18 @@ help:
 	@echo "======================================"
 	@echo ""
 	@echo "Quick commands (for AI tools and iteration):"
-	@echo "  make              			Build and run quick benchmark (< 30 seconds)"
-	@echo "  make quick        			Same as above"
-	@echo "  make build        			Build rigz and unrigz"
-	@echo "  make deps         			Build gzip and pigz from submodules"
-	@echo "  make validate     			Run validation suite (adaptive 3-10 trials)"
-	@echo "  make lint         			Run rustfmt and clippy (auto-fix)"
-	@echo "  make lint-check   			Check formatting without changes"
-	@echo "  make validation-chart  Run validation + generate charts"
+	@echo "  make              Build and run quick benchmark (< 30 seconds)"
+	@echo "  make quick        Same as above"
+	@echo "  make build        Build rigz and unrigz"
+	@echo "  make deps         Build gzip and pigz from submodules"
+	@echo "  make validate     Run validation suite (adaptive 3-17 trials)"
+	@echo "  make lint         Run rustfmt and clippy (auto-fix)"
+	@echo "  make lint-check   Check formatting without changes"
+	@echo ""
+	@echo "Charting (separate test running from rendering):"
+	@echo "  make validate-json     Run tests, save JSON to test_results/"
+	@echo "  make render-chart      Generate charts from existing JSON (fast)"
+	@echo "  make validation-chart  Both: run tests + generate charts"
 	@echo ""
 	@echo "Full testing (for humans at release time):"
 	@echo "  make perf-full    			Comprehensive performance tests (10+ minutes)"

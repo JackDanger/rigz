@@ -2,470 +2,336 @@
 
 A comprehensive analysis of optimization opportunities for rigz, organized by implementation complexity and expected impact.
 
-## Current Architecture Baseline
+## Current Performance Gap
 
-```
-Compression:  Input → mmap → 128KB chunks → rayon parallel → flate2/zlib-ng → concatenate → Output
-Decompression: Input → mmap → detect single/multi → libdeflate OR flate2 → Output
-```
+**Where rigz wins:**
+- Level 1, all thread counts: 17-50% faster
+- Level 6, single-threaded: 35% faster
+- Decompression, all configs: 10-25% faster
 
-**Current performance (vs competitors):**
-- Compression: 40-53% faster than pigz
-- Decompression: ~0-10% faster than pigz (variable)
+**Where pigz wins (the problem):**
+- Level 6, max threads: pigz 12% faster
+- Level 9, max threads: pigz 32% faster
+
+**Root cause:** At high compression levels with max threads, the overhead of rigz's independent block approach (each block restarts compression with empty dictionary) exceeds the gains from parallelism. pigz uses a pipelined approach where dictionary context flows between blocks.
 
 ---
 
-## Tier 1: High Impact, Low Complexity
+## Architecture Options to Beat pigz Everywhere
 
-### 1.1 Use Intel ISA-L for Compression (Intel CPUs)
+### Option A: Pipeline Compression (Like pigz)
 
-**What:** Intel's Intelligent Storage Acceleration Library has hardware-accelerated DEFLATE.
-
-**Why:** ISA-L is 2-4x faster than zlib-ng on Intel CPUs with AVX-512.
-
-**How:**
-```toml
-# Cargo.toml - add conditional dependency
-[target.'cfg(target_arch = "x86_64")'.dependencies]
-isal = "0.3"  # Rust bindings to ISA-L
+**How pigz works:**
+```
+Thread 1: compress block 0 → extract last 32KB as dict
+Thread 2: wait for dict → compress block 1 → extract dict
+Thread 3: wait for dict → compress block 2 → ...
 ```
 
+**Trade-off:** Loses parallel decompression (blocks depend on previous blocks)
+
+**Implementation:**
 ```rust
-// Detect at runtime and use ISA-L when available
-#[cfg(target_arch = "x86_64")]
-fn compress_block(data: &[u8], level: u32) -> Vec<u8> {
-    if is_x86_feature_detected!("avx512f") {
-        return isal_compress(data, level);
+fn compress_pipelined(data: &[u8], level: u32, threads: usize) -> Vec<Vec<u8>> {
+    let blocks: Vec<&[u8]> = data.chunks(BLOCK_SIZE).collect();
+    let mut results = vec![Vec::new(); blocks.len()];
+    let mut dict_channel: Vec<Sender<[u8; 32768]>> = Vec::new();
+    
+    // Pipeline: each thread waits for previous dictionary
+    crossbeam::scope(|s| {
+        for i in 0..blocks.len() {
+            s.spawn(move |_| {
+                let dict = if i == 0 { None } else { Some(dict_rx.recv()) };
+                let compressed = compress_with_dict(blocks[i], dict, level);
+                if i + 1 < blocks.len() {
+                    dict_tx.send(extract_last_32kb(blocks[i]));
+                }
+                results[i] = compressed;
+            });
+        }
+    });
+    results
+}
+```
+
+**Expected gain:** Match pigz at L6/L9 max threads
+**Complexity:** Medium
+**Downside:** Blocks have ordering dependency, loses independent-block advantage
+
+---
+
+### Option B: Hybrid Strategy (Best of Both)
+
+**Idea:** Use pipelined compression but mark blocks as independently decompressible anyway.
+
+**How:** Each block's dictionary is the *uncompressed* data from previous block (not compressed). Reader can reconstruct by decompressing sequentially, OR if they have the original, they can decompress any block.
+
+**Better idea:** Mark blocks with a flag:
+- First block of each "chain" (e.g., every 8th block) is independent
+- Other blocks use shared dictionary
+- Decompressor can parallel-decompress chains, sequential within chains
+
+**Implementation:**
+```rust
+const CHAIN_LENGTH: usize = 8;  // Every 8th block is independent
+
+fn compress_hybrid(data: &[u8], level: u32) -> Vec<u8> {
+    let blocks: Vec<&[u8]> = data.chunks(BLOCK_SIZE).collect();
+    
+    blocks.par_chunks(CHAIN_LENGTH).flat_map(|chain| {
+        let mut dict = None;
+        chain.iter().map(|block| {
+            let result = compress_with_dict(block, dict, level);
+            dict = Some(&block[block.len().saturating_sub(32768)..]);
+            result
+        }).collect::<Vec<_>>()
+    }).flatten().collect()
+}
+```
+
+**Expected gain:** 80-90% of pigz's L9 performance, keeps parallel decomp
+**Complexity:** Medium-High
+
+---
+
+### Option C: Larger Blocks at High Levels
+
+**Insight:** Block overhead is fixed. At L9, deflate does more work per byte. Larger blocks amortize the overhead.
+
+**Current:** 64KB blocks (BGZF-compatible)
+**Proposal:** Level-dependent block sizing
+
+```rust
+fn optimal_block_size(level: u32, thread_count: usize) -> usize {
+    match (level, thread_count) {
+        (1..=3, _) => 64 * 1024,      // Small blocks for fast levels
+        (4..=6, 1) => 128 * 1024,     // Medium blocks single-threaded
+        (4..=6, _) => 256 * 1024,     // Larger for parallel
+        (7..=9, 1) => 256 * 1024,     // Large for slow levels
+        (7..=9, _) => 512 * 1024,     // Very large for L9 parallel
+        _ => 128 * 1024,
     }
+}
+```
+
+**Downside:** Larger blocks = fewer parallel units. With 2 cores and 512KB blocks on a 10MB file, only 20 blocks = limited parallelism.
+
+**Expected gain:** 10-20% at L9 max threads
+**Complexity:** Low
+
+---
+
+### Option D: Intel ISA-L for Compression
+
+**What:** Intel's ISA-L has AVX-512 optimized DEFLATE that's 2-4x faster than zlib-ng.
+
+**Why this matters:** If compression per block is 2x faster, we can afford the independent-block overhead.
+
+**Challenge:** ISA-L requires autotools to build from source. The `isal-rs` crate fails on systems without autotools.
+
+**Solution:** Vendor a pre-built ISA-L binary or use conditional compilation:
+
+```rust
+#[cfg(all(target_arch = "x86_64", feature = "isa-l"))]
+fn compress_block_isal(data: &[u8], level: u32) -> Vec<u8> {
+    // Use ISA-L when available
+    unsafe { isal_deflate(data, level) }
+}
+
+#[cfg(not(all(target_arch = "x86_64", feature = "isa-l")))]
+fn compress_block_isal(data: &[u8], level: u32) -> Vec<u8> {
+    // Fall back to zlib-ng
     flate2_compress(data, level)
 }
 ```
 
-**Compatibility:** ✅ Full - ISA-L produces standard DEFLATE
+**Alternative:** Use `libdeflate` for compression too (it's faster than zlib-ng at most levels).
 
-**Expected gain:** 50-100% on Intel CPUs with AVX-512
-
----
-
-### 1.2 Pre-allocate Thread-Local Buffers
-
-**What:** Avoid per-block allocation by reusing buffers.
-
-**Current problem:**
-```rust
-// Current: allocates new Vec for each block
-.map(|block| {
-    let mut compressed = Vec::with_capacity(estimated_compressed_size);  // ALLOCATION
-    // ...
-})
-```
-
-**Solution:**
-```rust
-use std::cell::RefCell;
-
-thread_local! {
-    static COMPRESS_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256 * 1024));
-    static ENCODER: RefCell<Option<flate2::Compress>> = RefCell::new(None);
-}
-
-fn compress_block_reuse(data: &[u8], level: u32) -> Vec<u8> {
-    COMPRESS_BUF.with(|buf| {
-        let mut buf = buf.borrow_mut();
-        buf.clear();
-        // Reuse the allocated capacity
-        // ...
-    })
-}
-```
-
-**Expected gain:** 5-15% on small blocks (reduces allocator pressure)
+**Expected gain:** 50-100% on AVX-512 systems
+**Complexity:** High (build system issues)
 
 ---
 
-### 1.3 SIMD-Accelerated Multi-Member Detection
+### Option E: libdeflate for Compression
 
-**What:** Replace byte-by-byte scan with SIMD search.
+**What:** libdeflate is already used for decompression. It also has compression that's faster than zlib-ng.
 
-**Current problem:**
+**Current stack:** flate2 → zlib-ng (compression) → libdeflate (decompression)
+**Proposal:** libdeflate → libdeflate (both directions)
+
 ```rust
-// Current: O(n) byte scan
-for i in 10..scan_end.saturating_sub(2) {
-    if data[i] == 0x1f && data[i + 1] == 0x8b && data[i + 2] == 8 {
-        return true;
-    }
+use libdeflater::{Compressor, CompressionLvl};
+
+fn compress_block_libdeflate(data: &[u8], level: u32) -> Vec<u8> {
+    let lvl = CompressionLvl::new(level as i32).unwrap_or(CompressionLvl::default());
+    let mut compressor = Compressor::new(lvl);
+    
+    // libdeflate needs pre-allocated output buffer
+    let max_size = compressor.gzip_compress_bound(data.len());
+    let mut output = vec![0u8; max_size];
+    
+    let actual_size = compressor.gzip_compress(data, &mut output).unwrap();
+    output.truncate(actual_size);
+    output
 }
 ```
 
-**Solution using memchr crate:**
-```rust
-use memchr::memmem;
+**Benchmark needed:** libdeflate vs zlib-ng at L6/L9 with max threads
 
-fn is_multi_member_fast(data: &[u8]) -> bool {
-    const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b, 0x08];
-    // memchr uses SIMD internally (AVX2/NEON)
-    memmem::find(&data[10..], GZIP_MAGIC).is_some()
-}
-```
-
-**Expected gain:** 10-50x faster detection on large files
+**Expected gain:** 10-30% (libdeflate is faster but doesn't have shared dictionary)
+**Complexity:** Low (already have the crate)
 
 ---
 
-### 1.4 Hardware CRC32 via crc32fast
+### Option F: Zopfli-style Optimal Parsing (Level 10+)
 
-**What:** Ensure CRC32 uses CPU instructions (already in Cargo.toml but verify usage).
+**What:** For maximum compression, use Zopfli's optimal LZ77 parsing.
 
-**Status:** `crc32fast` is listed in dependencies but may not be directly used.
+**Trade-off:** 100x slower but 5-10% better compression.
 
-**Verify:**
+**Implementation:** Add a `--level 10` or `--best` flag that uses Zopfli algorithm.
+
 ```rust
-// Check if flate2/libdeflate use hardware CRC
-// If not, compute CRC separately using crc32fast
-use crc32fast::Hasher;
-
-fn compute_crc32(data: &[u8]) -> u32 {
-    let mut hasher = Hasher::new();
-    hasher.update(data);
-    hasher.finalize()
+#[cfg(feature = "zopfli")]
+fn compress_optimal(data: &[u8]) -> Vec<u8> {
+    use zopfli::{Format, Options, compress};
+    let options = Options::default();
+    compress(&options, &Format::Gzip, data).unwrap()
 }
 ```
 
-**Note:** Both ARM (CRC32 instruction) and x86 (SSE4.2 CRC32C) have hardware support.
+**Expected gain:** N/A for speed, but adds a "best compression" option
+**Complexity:** Low
 
 ---
 
-## Tier 2: High Impact, Medium Complexity
+## Low-Level Optimizations
 
-### 2.1 Shared Dictionary Between Blocks (Pigz-style)
+### 1. Memory and I/O
 
-**What:** Use the last N bytes of the previous block as a preset dictionary.
+| Optimization | Description | Expected Gain | Status |
+|-------------|-------------|---------------|--------|
+| **Thread-local buffers** | Reuse compression buffers | 5-15% | ✅ Done |
+| **Cache-aligned buffers** | 64/128-byte alignment | 2-5% | ✅ Done |
+| **Huge pages** | Use 2MB pages for large buffers | 5-10% | 🔲 TODO |
+| **mmap output** | Write directly to memory-mapped file | 5-15% | 🔲 TODO |
+| **io_uring** | Async I/O on Linux | 10-30% (I/O bound) | 🔲 TODO |
+| **Vectorized I/O** | write_vectored for multiple blocks | 2-5% | ✅ Done |
+| **Prefetching** | madvise(MADV_SEQUENTIAL) | 2-5% | 🔲 TODO |
 
-**Why:** Improves compression ratio without breaking parallelism.
+### 2. CPU Optimization
 
-**How:**
-```rust
-const DICT_SIZE: usize = 32768;  // 32KB window
+| Optimization | Description | Expected Gain | Status |
+|-------------|-------------|---------------|--------|
+| **SIMD header scan** | memchr for gzip magic | 10-50x (scan only) | ✅ Done |
+| **Hardware CRC32** | Via libdeflate | ✅ Built-in | ✅ Done |
+| **CPU detection** | AVX2/AVX-512/NEON | ✅ Routing | ✅ Done |
+| **Core pinning** | Avoid SMT, use P-cores | 5-15% | 🔲 TODO |
+| **NUMA awareness** | Allocate on local node | 10-20% (NUMA) | 🔲 TODO |
 
-fn compress_with_dict(block: &[u8], prev_block: Option<&[u8]>, level: u32) -> Vec<u8> {
-    let mut encoder = flate2::Compress::new(Compression::new(level), true);
-    
-    if let Some(prev) = prev_block {
-        let dict_start = prev.len().saturating_sub(DICT_SIZE);
-        encoder.set_dictionary(&prev[dict_start..])?;
-    }
-    
-    // Compress block
-    // ...
-}
-```
+### 3. Algorithmic
 
-**Parallelism approach:**
-1. Compress block 0 without dictionary (can start immediately)
-2. Blocks 1-N can start as soon as prev block's last 32KB is known
-3. Use pipelining: read → compress with dict → write
-
-**Expected gain:** 2-5% better compression ratio
-
----
-
-### 2.2 Parallel Decompression for Multi-Member Files
-
-**What:** Decompress multiple gzip members in parallel.
-
-**Challenge:** Finding member boundaries requires actually inflating (deflate can contain false headers).
-
-**Solution - Rapidgzip approach:**
-```rust
-/// Index-building phase: inflate each member sequentially to find boundaries
-fn build_member_index(data: &[u8]) -> Vec<MemberInfo> {
-    let mut members = Vec::new();
-    let mut pos = 0;
-    
-    while pos < data.len() {
-        let start = pos;
-        // Use flate2 to inflate and track consumed bytes
-        let (end, uncompressed_size) = inflate_member(&data[pos..]);
-        members.push(MemberInfo { start, end, uncompressed_size });
-        pos = end;
-    }
-    members
-}
-
-/// Parallel decompression using index
-fn decompress_parallel(data: &[u8], members: &[MemberInfo]) -> Vec<u8> {
-    members.par_iter()
-        .map(|m| decompress_member(&data[m.start..m.end]))
-        .flatten()
-        .collect()
-}
-```
-
-**Alternative - BGZF-style markers:**
-Add block size to gzip FEXTRA field during compression:
-```rust
-// During compression, add extra field with block size
-fn write_gzip_header_with_size(compressed_size: u32) -> Vec<u8> {
-    let mut header = vec![
-        0x1f, 0x8b,  // Magic
-        0x08,        // Deflate
-        0x04,        // FEXTRA flag
-        // ... timestamp, etc
-    ];
-    // Add XLEN and extra field
-    header.extend_from_slice(&6u16.to_le_bytes()); // XLEN
-    header.extend_from_slice(b"BC");  // Subfield ID
-    header.extend_from_slice(&2u16.to_le_bytes()); // Subfield len
-    header.extend_from_slice(&compressed_size.to_le_bytes()[..2]); // Block size
-    header
-}
-```
-
-**Expected gain:** 2-4x decompression speedup on multi-core
+| Optimization | Description | Expected Gain | Status |
+|-------------|-------------|---------------|--------|
+| **BGZF markers** | Block sizes in FEXTRA | Enables parallel decomp | ✅ Done |
+| **Level 1→2 mapping** | Fix zlib-ng L1 RLE issue | 2-5x smaller output | ✅ Done |
+| **Adaptive trials** | Run until statistically significant | Better benchmarks | ✅ Done |
+| **Content analysis** | Detect compressibility | Skip compression if incompressible | 🔲 TODO |
 
 ---
 
-### 2.3 Cache-Aware Block Sizing
+## Platform-Specific Optimizations
 
-**What:** Tune block size to CPU cache hierarchy.
+### Intel/AMD x86_64
 
-**Insight:** 128KB blocks may not fit in L2 cache on all CPUs.
+| Feature | How to use | Status |
+|---------|-----------|--------|
+| AVX2 | zlib-ng uses automatically | ✅ Active |
+| AVX-512 | ISA-L required | 🔲 TODO |
+| PCLMULQDQ | CRC32 acceleration | ✅ Active (libdeflate) |
+| SHA-NI | N/A for gzip | N/A |
 
-**Solution:**
-```rust
-fn optimal_block_size() -> usize {
-    // Detect cache sizes at runtime
-    #[cfg(target_arch = "x86_64")]
-    {
-        // Use CPUID to get L2 cache size
-        let l2_size = detect_l2_cache_size();
-        // Aim for blocks that fit in L2 with working memory
-        (l2_size / 4).max(64 * 1024).min(256 * 1024)
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        // Apple Silicon has large L2 (up to 32MB shared)
-        // ARM servers vary widely
-        128 * 1024
-    }
-}
-```
+### Apple Silicon (M1/M2/M3/M4)
 
----
+| Feature | How to use | Status |
+|---------|-----------|--------|
+| NEON | zlib-ng uses automatically | ✅ Active |
+| CRC32 instruction | libdeflate uses | ✅ Active |
+| 128-byte cache lines | Alignment adjusted | ✅ Done |
+| Large L2 cache | Larger blocks possible | 🔲 TODO |
+| Unified memory | No optimization needed | N/A |
 
-## Tier 3: Medium Impact, Higher Complexity
+### ARM Linux (Graviton, etc.)
 
-### 3.1 Custom DEFLATE Implementation with SIMD
-
-**What:** Write optimized DEFLATE with explicit SIMD for hot paths.
-
-**Key hot spots in DEFLATE:**
-1. **LZ77 hash chain lookup** - finding matches
-2. **Huffman encoding** - bit packing
-3. **Literal copying** - memcpy operations
-
-**Example - SIMD match finding:**
-```rust
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
-
-unsafe fn find_match_simd(haystack: &[u8], needle: &[u8; 4]) -> Option<usize> {
-    let pattern = _mm_set1_epi32(i32::from_le_bytes(*needle));
-    
-    for chunk in haystack.chunks(16) {
-        let data = _mm_loadu_si128(chunk.as_ptr() as *const __m128i);
-        let cmp = _mm_cmpeq_epi32(data, pattern);
-        let mask = _mm_movemask_epi8(cmp);
-        if mask != 0 {
-            return Some(mask.trailing_zeros() as usize);
-        }
-    }
-    None
-}
-```
-
-**Expected gain:** 20-40% for compression, less applicable to decompression
+| Feature | How to use | Status |
+|---------|-----------|--------|
+| NEON | zlib-ng | ✅ Active |
+| SVE/SVE2 | Not yet in zlib-ng | 🔲 Future |
+| CRC32 | Via libdeflate | ✅ Active |
 
 ---
 
-### 3.2 Zero-Copy Output with io_uring (Linux)
+## Implementation Priority
 
-**What:** Use Linux io_uring for async I/O with zero kernel copies.
+### Phase 1: Quick Wins (1-2 days)
 
-```rust
-#[cfg(target_os = "linux")]
-use io_uring::{IoUring, opcode, types};
+1. **Try libdeflate for compression** - Already have the crate, just need to benchmark
+2. **Increase block size at L9** - Simple config change
+3. **Add content pre-analysis** - Skip incompressible data
 
-fn write_compressed_uring(ring: &mut IoUring, data: &[u8], fd: i32) {
-    let write_e = opcode::Write::new(types::Fd(fd), data.as_ptr(), data.len() as u32)
-        .build();
-    
-    unsafe {
-        ring.submission().push(&write_e).unwrap();
-    }
-    ring.submit_and_wait(1).unwrap();
-}
-```
+### Phase 2: Architectural (3-5 days)
 
-**Expected gain:** 10-30% for I/O-bound workloads on Linux
+4. **Implement hybrid chain compression** - Get shared dictionary benefits while keeping some parallelism
+5. **Add prefetching hints** - madvise() for sequential access
+6. **Try huge pages** - For buffers > 2MB
 
----
+### Phase 3: Platform-Specific (1 week)
 
-### 3.3 Memory-Mapped Output
+7. **Intel ISA-L integration** - Needs build system work
+8. **io_uring for Linux** - Async I/O
+9. **Core pinning** - Avoid SMT contention
 
-**What:** mmap the output file and write directly to mapped memory.
+### Phase 4: Deep Optimization (ongoing)
 
-```rust
-use memmap2::MmapMut;
-
-fn compress_to_mmap(input: &[u8], output_path: &Path) -> io::Result<()> {
-    let estimated_size = input.len();  // or better estimate
-    
-    let file = OpenOptions::new()
-        .read(true).write(true).create(true)
-        .open(output_path)?;
-    file.set_len(estimated_size as u64)?;
-    
-    let mut mmap = unsafe { MmapMut::map_mut(&file)? };
-    
-    // Write directly to mmap - no kernel buffer copies
-    let actual_size = compress_to_slice(input, &mut mmap[..])?;
-    
-    file.set_len(actual_size as u64)?;
-    Ok(())
-}
-```
+10. **Custom SIMD DEFLATE** - Only if needed after above
+11. **Zopfli level 10** - For max compression option
 
 ---
 
-## Tier 4: Algorithmic Improvements
+## What Doesn't Work
 
-### 4.1 Optimal Huffman Tree Building
-
-**What:** Use faster Huffman construction algorithms.
-
-**Current:** zlib-ng uses package-merge algorithm.
-
-**Alternative - Two-pass frequency counting:**
-```rust
-/// Build Huffman tree with SIMD frequency counting
-fn build_huffman_fast(data: &[u8]) -> HuffmanTable {
-    // Count frequencies using SIMD
-    let freqs = count_frequencies_simd(data);
-    
-    // Use Moffat's in-place algorithm for code lengths
-    // O(n) instead of O(n log n) for package-merge
-    let lengths = moffat_code_lengths(&freqs);
-    
-    // Build canonical Huffman codes
-    canonical_huffman(&lengths)
-}
-```
-
-### 4.2 Lazy vs Greedy Match Selection
-
-**What:** Tune LZ77 match selection strategy per compression level.
-
-```rust
-enum MatchStrategy {
-    Greedy,      // Level 1-3: take first match
-    Lazy,        // Level 4-6: check if next position has better match  
-    Optimal,     // Level 7-9: consider multiple possibilities
-}
-
-fn select_match(strategy: MatchStrategy, pos: usize, data: &[u8]) -> Match {
-    match strategy {
-        MatchStrategy::Greedy => find_first_match(pos, data),
-        MatchStrategy::Lazy => {
-            let m1 = find_best_match(pos, data);
-            let m2 = find_best_match(pos + 1, data);
-            if m2.len > m1.len + 1 { m2 } else { m1 }
-        }
-        MatchStrategy::Optimal => optimal_parse(pos, data),
-    }
-}
-```
+1. **Manual deflate boundary detection** - Deflate streams contain false gzip headers
+2. **Dynamic block sizing (by entropy)** - Added complexity, 14% slower in tests
+3. **gzp crate** - Threading issues; custom rayon is better
+4. **Parallel libdeflate per-member (without markers)** - Boundary detection requires full inflate (2x overhead)
+5. **zlib-ng Level 1 directly** - Uses RLE strategy, produces 2-5x larger files on repetitive data
+6. **Parallel decompression without BGZF** - 2x overhead finding boundaries
+7. **Intel ISA-L integration** - Requires autotools/autoreconf (portability issues)
+8. **Full shared dictionary** - Breaks independent-block parallel decompression
 
 ---
 
-## Tier 5: Platform-Specific Optimizations
-
-### 5.1 Apple Silicon (M1/M2/M3/M4) Optimizations
-
-**What:** Leverage Apple's unified memory architecture.
-
-```rust
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod apple_optimizations {
-    // Apple Silicon specific: 
-    // - 128-byte cache lines (not 64)
-    // - Large L2 cache (up to 32MB)
-    // - High memory bandwidth
-    
-    const BLOCK_SIZE: usize = 256 * 1024;  // Larger blocks work well
-    
-    // Use NEON for SIMD operations
-    use std::arch::aarch64::*;
-    
-    pub fn compress_neon(data: &[u8]) -> Vec<u8> {
-        // NEON-optimized compression
-    }
-}
-```
-
-### 5.2 AMD EPYC/Ryzen Optimizations
-
-**What:** Tune for AMD's different cache hierarchy.
-
-```rust
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-fn detect_amd() -> bool {
-    // Check CPUID for AMD
-    let cpuid = core::arch::x86_64::__cpuid(0);
-    // AMD signature: "AuthenticAMD"
-    cpuid.ebx == 0x68747541 && cpuid.ecx == 0x444d4163
-}
-```
-
----
-
-## Implementation Priority Matrix
-
-| Optimization | Impact | Complexity | Compatibility | Priority | Status |
-|-------------|--------|------------|---------------|----------|--------|
-| Thread-local buffers | Medium | Low | ✅ Full | **P0** | ✅ Done |
-| SIMD multi-member detect | Medium | Low | ✅ Full | **P0** | ✅ Done |
-| Cache-aligned buffers | Low | Low | ✅ Full | **P0** | ✅ Done |
-| ISIZE buffer sizing | Low | Low | ✅ Full | **P0** | ✅ Done |
-| Thread-local decompressor | Low | Low | ✅ Full | **P0** | ✅ Done |
-| CPU feature detection | Low | Low | ✅ Full | **P0** | ✅ Done |
-| Intel ISA-L integration | High | Medium | ✅ Full | **P1** | 🔲 TODO |
-| Parallel decompression | High | Medium | ✅ Full | **P1** | ✅ Done |
-| Vectorized I/O | Medium | Low | ✅ Full | **P1** | ✅ Done |
-| Shared dictionaries | Medium | Medium | ⚠️ Breaks compat | **P2** | ❌ Skip |
-| io_uring async I/O | Medium | Medium | ✅ Full | **P3** | 🔲 TODO |
-| Custom SIMD DEFLATE | High | High | ✅ Full | **P4** | 🔲 TODO |
-
----
-
-## Benchmarking Methodology
-
-When implementing optimizations, measure:
-
-1. **Throughput** (MB/s) for various file sizes
-2. **Compression ratio** (compressed/original)
-3. **Memory usage** (peak RSS)
-4. **Latency** (time to first byte for streaming)
+## Benchmarking Commands
 
 ```bash
-# Suggested benchmark matrix
-for size in 1MB 10MB 100MB 1GB; do
-    for level in 1 6 9; do
-        for threads in 1 4 8; do
-            hyperfine "rigz -${level} -p${threads} ${size}.dat"
-        done
-    done
-done
+# Full validation with statistics
+make validate
+
+# Quick local benchmark
+make quick
+
+# Generate test data
+make test-data
+
+# Specific level/thread test
+python3 -c "
+import subprocess, time, statistics
+for i in range(10):
+    start = time.perf_counter()
+    subprocess.run(['./target/release/rigz', '-9', '-p2', '-c', '/tmp/test.dat'], 
+                   stdout=subprocess.DEVNULL)
+    print(f'{time.perf_counter() - start:.3f}s')
+"
 ```
 
 ---
@@ -476,5 +342,6 @@ done
 - [Intel ISA-L](https://github.com/intel/isa-l) - Hardware-accelerated compression
 - [rapidgzip](https://github.com/mxmlnkn/rapidgzip) - Parallel gzip decompression
 - [zlib-ng](https://github.com/zlib-ng/zlib-ng) - Modernized zlib
+- [pigz source](https://github.com/madler/pigz) - Reference for pipeline compression
 - [RFC 1952](https://tools.ietf.org/html/rfc1952) - GZIP file format
 - [RFC 1951](https://tools.ietf.org/html/rfc1951) - DEFLATE algorithm

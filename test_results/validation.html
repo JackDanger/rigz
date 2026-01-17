@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>rigz — Fast Parallel Gzip</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500&family=DM+Sans:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #FAF8F5;
+            --bg-warm: #F5F0E8;
+            --bg-card: #FFFFFF;
+            --border: #E8E2D9;
+            --text: #2C2825;
+            --text-secondary: #6B635A;
+            --text-muted: #9C948A;
+            --gzip: #2C2825;
+            --pigz: #7D8B74;
+            --rigz: #C4856A;
+            --rigz-light: #F5E6E0;
+        }
+        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            font-family: 'DM Sans', -apple-system, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.7;
+        }
+        
+        .container {
+            max-width: 720px;
+            margin: 0 auto;
+            padding: 3rem 1.5rem;
+        }
+        
+        /* Hero */
+        .hero {
+            text-align: center;
+            margin-bottom: 3rem;
+            padding-bottom: 2rem;
+            border-bottom: 1px solid var(--border);
+        }
+        
+        h1 {
+            font-family: 'Cormorant Garamond', serif;
+            font-size: 3.5rem;
+            font-weight: 400;
+            letter-spacing: -0.02em;
+            margin-bottom: 0.5rem;
+        }
+        
+        .tagline {
+            font-size: 1.25rem;
+            color: var(--text-secondary);
+            margin-bottom: 1.5rem;
+        }
+        
+        .hero-stat {
+            display: inline-block;
+            background: var(--rigz-light);
+            color: var(--rigz);
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 500;
+            padding: 0.5rem 1rem;
+            border-radius: 6px;
+            font-size: 1.1rem;
+        }
+        
+        /* Install */
+        section {
+            margin-bottom: 2.5rem;
+        }
+        
+        h2 {
+            font-family: 'Cormorant Garamond', serif;
+            font-size: 1.4rem;
+            font-weight: 400;
+            margin-bottom: 0.75rem;
+            color: var(--text);
+        }
+        
+        .code-block {
+            background: var(--text);
+            color: #F5F0E8;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9rem;
+            padding: 1rem 1.25rem;
+            border-radius: 8px;
+            overflow-x: auto;
+        }
+        
+        .code-block .comment {
+            color: #9C948A;
+        }
+        
+        .code-block .prompt {
+            color: var(--rigz);
+        }
+        
+        p {
+            color: var(--text-secondary);
+            margin-bottom: 1rem;
+        }
+        
+        p:last-child {
+            margin-bottom: 0;
+        }
+        
+        /* Usage examples */
+        .usage-grid {
+            display: grid;
+            gap: 0.75rem;
+        }
+        
+        .usage-item {
+            display: grid;
+            grid-template-columns: 1fr auto;
+            align-items: center;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 0.75rem 1rem;
+        }
+        
+        .usage-cmd {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+        }
+        
+        .usage-desc {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }
+        
+        /* Performance section */
+        .perf-intro {
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            margin-bottom: 1rem;
+        }
+        
+        .legend {
+            display: flex;
+            gap: 1.5rem;
+            margin-bottom: 1rem;
+            font-size: 0.85rem;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+            color: var(--text-secondary);
+        }
+        
+        .legend-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+        }
+        
+        .legend-dot.gzip { background: var(--gzip); }
+        .legend-dot.pigz { background: var(--pigz); }
+        .legend-dot.rigz { background: var(--rigz); }
+        
+        /* Dot plot */
+        .dot-plot {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        
+        .dot-row {
+            display: grid;
+            grid-template-columns: 70px 1fr 60px;
+            align-items: center;
+            padding: 0.6rem 1rem;
+            border-bottom: 1px solid var(--border);
+            font-size: 0.85rem;
+        }
+        
+        .dot-row:last-child { border-bottom: none; }
+        .dot-row:hover { background: var(--bg-warm); }
+        
+        .row-label {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-secondary);
+        }
+        
+        .row-label .hl { color: var(--rigz); font-weight: 500; }
+        
+        .dot-track {
+            position: relative;
+            height: 24px;
+            background: linear-gradient(to right, var(--rigz-light) 0%, var(--bg-warm) 100%);
+            border-radius: 12px;
+            margin: 0 0.5rem;
+        }
+        
+        .dot {
+            position: absolute;
+            top: 50%;
+            transform: translate(-50%, -50%);
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            border: 2px solid white;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+            cursor: default;
+        }
+        
+        .dot.gzip { background: var(--gzip); }
+        .dot.pigz { background: var(--pigz); }
+        .dot.rigz { background: var(--rigz); }
+        
+        .dot-label {
+            position: absolute;
+            top: -20px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.65rem;
+            white-space: nowrap;
+            opacity: 0;
+            background: white;
+            padding: 2px 5px;
+            border-radius: 3px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+            transition: opacity 0.15s;
+        }
+        
+        .dot:hover .dot-label { opacity: 1; }
+        
+        .speedup-col {
+            text-align: right;
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--rigz);
+            font-weight: 500;
+        }
+        
+        /* Links */
+        .links {
+            display: flex;
+            gap: 1.5rem;
+            flex-wrap: wrap;
+        }
+        
+        a {
+            color: var(--rigz);
+            text-decoration: none;
+        }
+        
+        a:hover {
+            text-decoration: underline;
+        }
+        
+        .links a {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9rem;
+        }
+        
+        /* Footer */
+        footer {
+            margin-top: 3rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid var(--border);
+            text-align: center;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+        
+        @media (max-width: 600px) {
+            h1 { font-size: 2.5rem; }
+            .dot-row { grid-template-columns: 60px 1fr 50px; }
+            .usage-item { grid-template-columns: 1fr; gap: 0.25rem; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header class="hero">
+            <h1>rigz</h1>
+            <p class="tagline">Drop-in gzip replacement. Parallel compression in Rust.</p>
+            <span class="hero-stat">3× faster than gzip</span>
+        </header>
+        
+        <section>
+            <h2>Install</h2>
+            <div class="code-block">
+<span class="comment"># Build from source</span>
+<span class="prompt">$</span> cargo install --path .
+
+<span class="comment"># Or download a release</span>
+<span class="prompt">$</span> curl -L https://github.com/jackdanger/rigz/releases/latest/download/rigz-$(uname -m) -o rigz
+</div>
+        </section>
+        
+        <section>
+            <h2>Usage</h2>
+            <p>Works exactly like gzip. Same flags, same behavior.</p>
+            <div class="usage-grid">
+                <div class="usage-item">
+                    <code class="usage-cmd">rigz file.txt</code>
+                    <span class="usage-desc">→ file.txt.gz</span>
+                </div>
+                <div class="usage-item">
+                    <code class="usage-cmd">rigz -d file.txt.gz</code>
+                    <span class="usage-desc">decompress</span>
+                </div>
+                <div class="usage-item">
+                    <code class="usage-cmd">tar cf - dir/ | rigz &gt; archive.tar.gz</code>
+                    <span class="usage-desc">pipe</span>
+                </div>
+                <div class="usage-item">
+                    <code class="usage-cmd">rigz -1</code> / <code class="usage-cmd">-9</code>
+                    <span class="usage-desc">fast / best</span>
+                </div>
+            </div>
+        </section>
+        
+        <section>
+            <h2>Performance</h2>
+            <p class="perf-intro">
+                Tested on 622.3MB. Right is faster. Hover for times.
+            </p>
+            <div class="legend">
+                <div class="legend-item"><div class="legend-dot rigz"></div> rigz</div>
+                <div class="legend-item"><div class="legend-dot pigz"></div> pigz</div>
+                <div class="legend-item"><div class="legend-dot gzip"></div> gzip</div>
+            </div>
+            <div class="dot-plot" id="dotPlot"></div>
+        </section>
+        
+        <section>
+            <h2>Links</h2>
+            <div class="links">
+                <a href="https://github.com/jackdanger/rigz">GitHub</a>
+                <a href="https://github.com/jackdanger/rigz/issues">Issues</a>
+                <a href="https://github.com/jackdanger/rigz/releases">Releases</a>
+                <a href="https://crates.io/crates/rigz">crates.io</a>
+            </div>
+        </section>
+        
+        <footer>
+            <p>Output is compatible with standard gzip. 55/55 validation tests passing.</p>
+        </footer>
+    </div>
+    
+    <script>
+        const configs = [{"level": 1, "threads": 1, "tools": {"gzip": {"time": 5.592621417017654, "throughput": 111.27018007940653}, "pigz": {"time": 4.866453667054884, "throughput": 127.87381423156613}, "rigz": {"time": 3.303495084051974, "throughput": 188.37382116646415}}, "gzip_speedup": 1.6929407414640076, "pigz_speedup": 1.4731227210079056}, {"level": 1, "threads": 4, "tools": {"gzip": {"time": 5.897564333979972, "throughput": 105.51677895263352}, "pigz": {"time": 1.2559427920496091, "throughput": 495.47797569024925}, "rigz": {"time": 0.9389589170459658, "throughput": 662.7467729315322}}, "gzip_speedup": 6.280960995113764, "pigz_speedup": 1.3375907819278166}, {"level": 6, "threads": 1, "tools": {"gzip": {"time": 14.884891042020172, "throughput": 41.806956492376365}, "pigz": {"time": 14.135718957986683, "throughput": 44.02266301679017}, "rigz": {"time": 5.250200417009182, "throughput": 118.52728329597625}}, "gzip_speedup": 2.8351091119869034, "pigz_speedup": 2.6924151147051267}, {"level": 6, "threads": 4, "tools": {"gzip": {"time": 14.288277459098026, "throughput": 43.55262514805499}, "pigz": {"time": 3.5954992909682915, "throughput": 173.0752648875958}, "rigz": {"time": 1.3733457078924403, "throughput": 453.12115413567636}}, "gzip_speedup": 10.403991782247648, "pigz_speedup": 2.6180584177060604}, {"level": 9, "threads": 1, "tools": {"gzip": {"time": 42.58789904101286, "throughput": 14.61194391365074}, "pigz": {"time": 40.500820707995445, "throughput": 15.364923014131676}, "rigz": {"time": 16.109615332912654, "throughput": 38.62860653886192}}, "gzip_speedup": 2.6436322755642654, "pigz_speedup": 2.5140774544287523}, {"level": 9, "threads": 4, "tools": {"gzip": {"time": 40.7566267499933, "throughput": 15.268486177836154}, "pigz": {"time": 11.180532125057653, "throughput": 55.6585308487087}, "rigz": {"time": 4.009552667033859, "throughput": 155.20234895626203}}, "gzip_speedup": 10.164881255979056, "pigz_speedup": 2.788473691088502}];
+        const globalMaxTime = 42.58789904101286;
+        
+        function formatTime(s) {
+            if (s < 1) return (s * 1000).toFixed(0) + 'ms';
+            if (s < 10) return s.toFixed(1) + 's';
+            return s.toFixed(0) + 's';
+        }
+        
+        function createDotRow(config) {
+            const tools = config.tools;
+            const maxTime = globalMaxTime;
+            
+            function getPosition(time) {
+                const minTime = Math.min(...Object.values(tools).map(t => t.time));
+                const normalized = (Math.sqrt(time) - Math.sqrt(minTime)) / (Math.sqrt(maxTime) - Math.sqrt(minTime));
+                return (1 - normalized) * 80 + 10;
+            }
+            
+            let dotsHTML = '';
+            for (const tool of ['gzip', 'pigz', 'rigz']) {
+                if (tools[tool]) {
+                    const pos = getPosition(tools[tool].time);
+                    const time = formatTime(tools[tool].time);
+                    dotsHTML += `<div class="dot ${tool}" style="left: ${pos}%"><span class="dot-label">${tool}: ${time}</span></div>`;
+                }
+            }
+            
+            const speedup = config.gzip_speedup;
+            const speedupStr = speedup >= 10 ? speedup.toFixed(0) + '×' : speedup.toFixed(1) + '×';
+            
+            return `
+                <div class="dot-row">
+                    <div class="row-label"><span class="hl">L${config.level}</span> ${config.threads}t</div>
+                    <div class="dot-track">${dotsHTML}</div>
+                    <div class="speedup-col">${speedupStr}</div>
+                </div>
+            `;
+        }
+        
+        document.getElementById('dotPlot').innerHTML = configs.map(createDotRow).join('');
+    </script>
+</body>
+</html>
+
