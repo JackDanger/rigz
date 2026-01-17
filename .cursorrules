@@ -80,6 +80,7 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 5. **zlib-ng Level 1 directly** - Uses RLE strategy, produces 2-5x larger files on repetitive data (we map L1→L2)
 6. **Parallel decompression without BGZF** - Requires finding member boundaries first, which means decompressing once to find them, then again in parallel. 2x overhead made it slower for files with many small members (like rigz's 128KB chunks). Sequential MultiGzDecoder is faster.
 7. **Intel ISA-L integration** - Requires autotools/autoreconf to build from source, complex build setup. The isal-rs crate fails on systems without autotools. Not worth the portability issues for marginal gains since libdeflate already uses SIMD.
+8. **Hybrid chain compression (dictionary sharing across blocks)** - DEFLATE preset dictionaries require the decompressor to have the same dictionary. Gzip format has no field to embed dictionaries. Output with preset dictionaries causes "data stream error" in gunzip/pigz. See `docs/HYBRID_CHAIN_COMPRESSION.md` for full analysis. This is why pigz beats rigz at L6/L9 max-threads: pigz uses pipeline parallelism with a shared sliding window, which is fundamentally incompatible with rigz's independent-block parallel approach.
 
 ## Architecture-Dependent Performance
 
