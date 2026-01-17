@@ -81,12 +81,28 @@ Each 128KB chunk becomes a complete gzip member. RFC 1952 allows concatenation.
 6. **Parallel decompression without BGZF** - Requires finding member boundaries first, which means decompressing once to find them, then again in parallel. 2x overhead made it slower for files with many small members (like rigz's 128KB chunks). Sequential MultiGzDecoder is faster.
 7. **Intel ISA-L integration** - Requires autotools/autoreconf to build from source, complex build setup. The isal-rs crate fails on systems without autotools. Not worth the portability issues for marginal gains since libdeflate already uses SIMD.
 
-## Benchmarking
+## Test Suite
 
-- 30 runs for 1MB (high variance)
-- 15 runs for 10MB  
+**Data Types** (realistic workloads, not just random):
+- **text**: Proust (Project Gutenberg) - highly compressible, seed checked into git
+- **random**: /dev/urandom - poorly compressible, stress test
+- **tarball**: repo archive - mixed content, real-world simulation
+
+**Key Commands:**
+- `make validate` - Quick validation (local)
+- `make validate-json` - Output JSON for visualization
+- `make validation-chart` - Generate HTML performance chart
+- `make test-data` - Generate 10MB + 100MB test files
+
+**CI Workflow:**
+- Tests all 3 data types × 3 levels × 2 thread counts = 54 compression configs
+- Cross-tool decompression matrix (gzip↔pigz↔rigz) = 162 tests per run
+- Generates PR comments with speedup summary
+- Uploads validation-results.json artifact
+
+**Benchmarking:**
+- 5+ trials per test for statistical significance
 - Use median, not min
-- pigz is built from submodule (./pigz/pigz)
-- Validation: `make validate` runs 55 cross-tool tests
+- pigz built from submodule (./pigz/pigz)
 
 See CONTRIBUTING.md for detailed architecture guide.
