@@ -100,6 +100,21 @@ test-data:
 validate: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
 	@python3 scripts/validate.py
 
+# Validation with JSON output
+validate-json: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
+	@python3 scripts/validate.py --json -o $(RESULTS_DIR)/validation.json
+	@echo "Results saved to $(RESULTS_DIR)/validation.json"
+
+# Generate performance chart from validation results
+validation-chart: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
+	@mkdir -p $(RESULTS_DIR)
+	@echo "Running validation suite..."
+	@python3 scripts/validate.py --json -o $(RESULTS_DIR)/validation.json
+	@echo ""
+	@python3 scripts/validation_chart.py $(RESULTS_DIR)/validation.json
+	@python3 scripts/validation_chart.py $(RESULTS_DIR)/validation.json --html > $(RESULTS_DIR)/validation.html
+	@echo "HTML chart saved to $(RESULTS_DIR)/validation.html"
+
 # =============================================================================
 # Install target
 # =============================================================================
@@ -132,7 +147,8 @@ help:
 	@echo "  make quick        Same as above"
 	@echo "  make build        Build rigz and unrigz"
 	@echo "  make deps         Build gzip and pigz from submodules"
-	@echo "  make validate     Run validation suite"
+	@echo "  make validate     Run validation suite (adaptive 3-10 trials)"
+	@echo "  make validation-chart  Run validation + generate charts"
 	@echo ""
 	@echo "Full testing (for humans at release time):"
 	@echo "  make perf-full    Comprehensive performance tests (10+ minutes)"
