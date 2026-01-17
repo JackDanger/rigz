@@ -35,12 +35,6 @@ TOOL_COLORS = {
     "rigz": Colors.GREEN,
 }
 
-TOOL_HTML_COLORS = {
-    "gzip": "#3b82f6",  # blue
-    "pigz": "#eab308",  # yellow
-    "rigz": "#22c55e",  # green
-}
-
 
 def format_time(seconds):
     """Format time with appropriate precision."""
@@ -169,198 +163,663 @@ def print_speedup_summary(results):
 
 
 def generate_html_chart(results):
-    """Generate an HTML page with interactive charts using Chart.js."""
+    """Generate a stunning HTML visualization."""
     
-    # Prepare compression data
-    comp_data = defaultdict(dict)
+    # Process compression data
+    comp_by_config = defaultdict(dict)
     for r in results["compression"]:
         if r["success"]:
-            key = f"L{r['level']} {r['threads']}t"
-            comp_data[key][r["tool"]] = r["median_seconds"]
+            key = (r["level"], r["threads"])
+            comp_by_config[key][r["tool"]] = r
     
-    # Prepare decompression data (rigz-compressed only)
-    decomp_data = defaultdict(dict)
+    # Process decompression data (rigz-compressed only for hero section)
+    decomp_by_config = defaultdict(dict)
     for r in results["decompression"]:
         if r["success"] and r["correct"] and r["compressor"] == "rigz":
-            key = f"L{r['level']} {r['threads']}t"
-            decomp_data[key][r["decompressor"]] = r["median_seconds"]
+            key = (r["level"], r["threads"])
+            decomp_by_config[key][r["decompressor"]] = r
     
-    configs = sorted(comp_data.keys())
+    # Calculate speedups and throughputs
+    test_size_mb = results.get("test_size_bytes", 0) / (1024 * 1024)
     
-    # Pre-compute all data as JSON strings to avoid f-string issues
-    configs_json = json.dumps(configs)
+    # Build race data for each config
+    race_data = []
+    for (level, threads), tools in sorted(comp_by_config.items()):
+        config = {"level": level, "threads": threads, "tools": {}}
+        for tool, data in tools.items():
+            time_s = data["median_seconds"]
+            throughput = test_size_mb / time_s if time_s > 0 else 0
+            output_mb = data["output_size_bytes"] / (1024 * 1024)
+            config["tools"][tool] = {
+                "time": time_s,
+                "throughput": throughput,
+                "output_mb": output_mb,
+                "ratio": data["output_size_bytes"] / data["input_size_bytes"] * 100
+            }
+        # Calculate speedups
+        if "rigz" in config["tools"]:
+            rigz_time = config["tools"]["rigz"]["time"]
+            for tool in config["tools"]:
+                config["tools"][tool]["speedup_vs_rigz"] = config["tools"][tool]["time"] / rigz_time if rigz_time > 0 else 1
+        race_data.append(config)
     
-    # Build arrays for each tool directly (avoids the map lookup issue)
-    comp_gzip_data = [comp_data[c].get("gzip", 0) for c in configs]
-    comp_pigz_data = [comp_data[c].get("pigz", 0) for c in configs]
-    comp_rigz_data = [comp_data[c].get("rigz", 0) for c in configs]
+    # Calculate best speedups for hero stats
+    max_gzip_speedup = max(
+        (c["tools"]["gzip"]["time"] / c["tools"]["rigz"]["time"] 
+         for c in race_data if "gzip" in c["tools"] and "rigz" in c["tools"]),
+        default=1
+    )
+    max_pigz_speedup = max(
+        (c["tools"]["pigz"]["time"] / c["tools"]["rigz"]["time"] 
+         for c in race_data if "pigz" in c["tools"] and "rigz" in c["tools"]),
+        default=1
+    )
+    max_throughput = max(
+        (c["tools"]["rigz"]["throughput"] for c in race_data if "rigz" in c["tools"]),
+        default=0
+    )
     
-    decomp_gzip_data = [decomp_data[c].get("gzip", 0) for c in configs]
-    decomp_pigz_data = [decomp_data[c].get("pigz", 0) for c in configs]
-    decomp_rigz_data = [decomp_data[c].get("rigz", 0) for c in configs]
-    
-    # Convert to JSON
-    comp_gzip_json = json.dumps(comp_gzip_data)
-    comp_pigz_json = json.dumps(comp_pigz_data)
-    comp_rigz_json = json.dumps(comp_rigz_data)
-    decomp_gzip_json = json.dumps(decomp_gzip_data)
-    decomp_pigz_json = json.dumps(decomp_pigz_data)
-    decomp_rigz_json = json.dumps(decomp_rigz_data)
-    
-    # Summary stats
+    # Summary
     passed = results['summary']['passed']
     failed = results['summary']['failed']
     total = passed + failed
-    test_size = format_size(results.get('test_size_bytes', 0))
+    test_size_str = format_size(results.get('test_size_bytes', 0))
     
-    # Colors
-    gzip_color = TOOL_HTML_COLORS["gzip"]
-    pigz_color = TOOL_HTML_COLORS["pigz"]
-    rigz_color = TOOL_HTML_COLORS["rigz"]
+    # Convert race_data to JSON
+    race_data_json = json.dumps(race_data)
     
-    html = f"""<!DOCTYPE html>
-<html>
+    html = f'''<!DOCTYPE html>
+<html lang="en">
 <head>
-    <title>rigz Validation Results</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>rigz — Performance Benchmarks</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
+        :root {{
+            --bg-deep: #0a0a0f;
+            --bg-card: #12121a;
+            --bg-card-hover: #1a1a25;
+            --border: #2a2a3a;
+            --text: #e4e4e7;
+            --text-muted: #71717a;
+            --text-dim: #52525b;
+            
+            /* Tool colors */
+            --gzip: #f43f5e;
+            --gzip-glow: rgba(244, 63, 94, 0.3);
+            --pigz: #f59e0b;
+            --pigz-glow: rgba(245, 158, 11, 0.3);
+            --rigz: #10b981;
+            --rigz-glow: rgba(16, 185, 129, 0.4);
+            
+            /* Accent */
+            --accent: #8b5cf6;
+            --accent-glow: rgba(139, 92, 246, 0.3);
+        }}
+        
+        * {{
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }}
+        
         body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            max-width: 1200px;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+            background: var(--bg-deep);
+            color: var(--text);
+            min-height: 100vh;
+            line-height: 1.6;
+        }}
+        
+        /* Animated gradient background */
+        .bg-gradient {{
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: 
+                radial-gradient(ellipse 80% 50% at 50% -20%, rgba(16, 185, 129, 0.15), transparent),
+                radial-gradient(ellipse 60% 40% at 100% 50%, rgba(139, 92, 246, 0.1), transparent),
+                radial-gradient(ellipse 60% 40% at 0% 80%, rgba(244, 63, 94, 0.08), transparent);
+            pointer-events: none;
+            z-index: 0;
+        }}
+        
+        .container {{
+            max-width: 1400px;
             margin: 0 auto;
-            padding: 20px;
-            background: #1a1a2e;
-            color: #eee;
+            padding: 3rem 2rem;
+            position: relative;
+            z-index: 1;
         }}
-        h1, h2 {{ color: #22c55e; }}
-        .chart-container {{
-            background: #16213e;
-            border-radius: 8px;
-            padding: 20px;
-            margin: 20px 0;
+        
+        /* Hero Section */
+        .hero {{
+            text-align: center;
+            margin-bottom: 4rem;
         }}
-        .summary {{
+        
+        .hero-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.5rem 1rem;
+            background: linear-gradient(135deg, rgba(16, 185, 129, 0.15), rgba(16, 185, 129, 0.05));
+            border: 1px solid rgba(16, 185, 129, 0.3);
+            border-radius: 100px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            color: var(--rigz);
+            margin-bottom: 1.5rem;
+        }}
+        
+        .hero h1 {{
+            font-family: 'JetBrains Mono', monospace;
+            font-size: clamp(3rem, 8vw, 5rem);
+            font-weight: 700;
+            background: linear-gradient(135deg, #fff 0%, #10b981 50%, #8b5cf6 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            margin-bottom: 1rem;
+            letter-spacing: -0.02em;
+        }}
+        
+        .hero-subtitle {{
+            font-size: 1.25rem;
+            color: var(--text-muted);
+            max-width: 600px;
+            margin: 0 auto 2rem;
+        }}
+        
+        /* Stats Grid */
+        .stats-grid {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 16px;
-            margin: 20px 0;
+            gap: 1.5rem;
+            margin-bottom: 4rem;
         }}
+        
         .stat-card {{
-            background: #16213e;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 1.5rem;
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+            transition: all 0.3s ease;
+        }}
+        
+        .stat-card:hover {{
+            transform: translateY(-4px);
+            border-color: var(--rigz);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3), 0 0 40px var(--rigz-glow);
+        }}
+        
+        .stat-card::before {{
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 3px;
+            background: linear-gradient(90deg, var(--rigz), var(--accent));
+        }}
+        
+        .stat-value {{
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: var(--rigz);
+            margin-bottom: 0.25rem;
+        }}
+        
+        .stat-label {{
+            font-size: 0.9rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }}
+        
+        /* Section Headers */
+        .section-header {{
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }}
+        
+        .section-header h2 {{
+            font-size: 1.75rem;
+            font-weight: 600;
+        }}
+        
+        .section-header .line {{
+            flex: 1;
+            height: 1px;
+            background: linear-gradient(90deg, var(--border), transparent);
+        }}
+        
+        /* Race Track Visualization */
+        .race-section {{
+            margin-bottom: 4rem;
+        }}
+        
+        .race-track {{
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 2rem;
+            margin-bottom: 1.5rem;
+        }}
+        
+        .race-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.5rem;
+            padding-bottom: 1rem;
+            border-bottom: 1px solid var(--border);
+        }}
+        
+        .race-config {{
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.1rem;
+            font-weight: 600;
+        }}
+        
+        .race-config .level {{
+            color: var(--accent);
+        }}
+        
+        .race-config .threads {{
+            color: var(--text-muted);
+            font-weight: 400;
+        }}
+        
+        .winner-badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            padding: 0.4rem 0.8rem;
+            background: linear-gradient(135deg, var(--rigz), rgba(16, 185, 129, 0.6));
+            border-radius: 100px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #000;
+        }}
+        
+        .race-lanes {{
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }}
+        
+        .lane {{
+            display: grid;
+            grid-template-columns: 80px 1fr 140px;
+            align-items: center;
+            gap: 1rem;
+        }}
+        
+        .lane-tool {{
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 600;
+            font-size: 0.95rem;
+        }}
+        
+        .lane-tool.gzip {{ color: var(--gzip); }}
+        .lane-tool.pigz {{ color: var(--pigz); }}
+        .lane-tool.rigz {{ color: var(--rigz); }}
+        
+        .lane-bar-container {{
+            height: 40px;
+            background: rgba(255, 255, 255, 0.03);
             border-radius: 8px;
-            padding: 16px;
+            position: relative;
+            overflow: hidden;
+        }}
+        
+        .lane-bar {{
+            height: 100%;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            padding-right: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: rgba(0, 0, 0, 0.8);
+            transition: width 1s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+        }}
+        
+        .lane-bar.gzip {{
+            background: linear-gradient(90deg, var(--gzip), #fb7185);
+            box-shadow: 0 0 20px var(--gzip-glow);
+        }}
+        
+        .lane-bar.pigz {{
+            background: linear-gradient(90deg, var(--pigz), #fbbf24);
+            box-shadow: 0 0 20px var(--pigz-glow);
+        }}
+        
+        .lane-bar.rigz {{
+            background: linear-gradient(90deg, var(--rigz), #34d399);
+            box-shadow: 0 0 30px var(--rigz-glow);
+        }}
+        
+        .lane-stats {{
+            text-align: right;
+            font-family: 'JetBrains Mono', monospace;
+        }}
+        
+        .lane-throughput {{
+            font-size: 1rem;
+            font-weight: 600;
+            color: var(--text);
+        }}
+        
+        .lane-time {{
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }}
+        
+        /* Speedup callout */
+        .speedup-callout {{
+            display: flex;
+            justify-content: center;
+            gap: 2rem;
+            margin-top: 1.5rem;
+            padding-top: 1.5rem;
+            border-top: 1px dashed var(--border);
+        }}
+        
+        .speedup-item {{
             text-align: center;
         }}
-        .stat-value {{
-            font-size: 2em;
-            font-weight: bold;
-            color: #22c55e;
+        
+        .speedup-value {{
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--rigz);
         }}
-        .stat-label {{
-            color: #888;
-            font-size: 0.9em;
+        
+        .speedup-label {{
+            font-size: 0.8rem;
+            color: var(--text-muted);
+        }}
+        
+        /* Legend */
+        .legend {{
+            display: flex;
+            justify-content: center;
+            gap: 2rem;
+            margin-bottom: 2rem;
+            padding: 1rem;
+            background: var(--bg-card);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+        }}
+        
+        .legend-item {{
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }}
+        
+        .legend-dot {{
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+        }}
+        
+        .legend-dot.gzip {{ background: var(--gzip); box-shadow: 0 0 10px var(--gzip-glow); }}
+        .legend-dot.pigz {{ background: var(--pigz); box-shadow: 0 0 10px var(--pigz-glow); }}
+        .legend-dot.rigz {{ background: var(--rigz); box-shadow: 0 0 10px var(--rigz-glow); }}
+        
+        .legend-text {{
+            font-size: 0.9rem;
+            color: var(--text-muted);
+        }}
+        
+        /* Footer */
+        .footer {{
+            text-align: center;
+            margin-top: 4rem;
+            padding-top: 2rem;
+            border-top: 1px solid var(--border);
+            color: var(--text-dim);
+            font-size: 0.9rem;
+        }}
+        
+        .footer a {{
+            color: var(--rigz);
+            text-decoration: none;
+        }}
+        
+        .footer a:hover {{
+            text-decoration: underline;
+        }}
+        
+        /* Animations */
+        @keyframes fadeInUp {{
+            from {{
+                opacity: 0;
+                transform: translateY(20px);
+            }}
+            to {{
+                opacity: 1;
+                transform: translateY(0);
+            }}
+        }}
+        
+        .animate-in {{
+            animation: fadeInUp 0.6s ease-out forwards;
+        }}
+        
+        .race-track {{
+            opacity: 0;
+            animation: fadeInUp 0.6s ease-out forwards;
+        }}
+        
+        .race-track:nth-child(1) {{ animation-delay: 0.1s; }}
+        .race-track:nth-child(2) {{ animation-delay: 0.2s; }}
+        .race-track:nth-child(3) {{ animation-delay: 0.3s; }}
+        .race-track:nth-child(4) {{ animation-delay: 0.4s; }}
+        .race-track:nth-child(5) {{ animation-delay: 0.5s; }}
+        .race-track:nth-child(6) {{ animation-delay: 0.6s; }}
+        
+        /* Responsive */
+        @media (max-width: 768px) {{
+            .container {{
+                padding: 2rem 1rem;
+            }}
+            
+            .lane {{
+                grid-template-columns: 60px 1fr;
+                gap: 0.5rem;
+            }}
+            
+            .lane-stats {{
+                display: none;
+            }}
+            
+            .speedup-callout {{
+                flex-direction: column;
+                gap: 1rem;
+            }}
         }}
     </style>
 </head>
 <body>
-    <h1>🚀 rigz Validation Results</h1>
+    <div class="bg-gradient"></div>
     
-    <div class="summary">
-        <div class="stat-card">
-            <div class="stat-value">{passed}/{total}</div>
-            <div class="stat-label">Tests Passed</div>
-        </div>
-        <div class="stat-card">
-            <div class="stat-value">{test_size}</div>
-            <div class="stat-label">Test File Size</div>
-        </div>
-    </div>
-
-    <h2>Compression Time (lower is better)</h2>
-    <div class="chart-container">
-        <canvas id="compChart"></canvas>
-    </div>
-
-    <h2>Decompression Time (rigz-compressed files)</h2>
-    <div class="chart-container">
-        <canvas id="decompChart"></canvas>
-    </div>
-
-    <script>
-        const configs = {configs_json};
+    <div class="container">
+        <header class="hero animate-in">
+            <div class="hero-badge">
+                <span>✓</span>
+                <span>{passed}/{total} tests passed</span>
+            </div>
+            <h1>rigz</h1>
+            <p class="hero-subtitle">
+                Rust parallel gzip. Dramatically faster compression without sacrificing compatibility.
+            </p>
+        </header>
         
-        const compData = {{
-            labels: configs,
-            datasets: [
-                {{
-                    label: 'gzip',
-                    data: {comp_gzip_json},
-                    backgroundColor: '{gzip_color}',
-                }},
-                {{
-                    label: 'pigz',
-                    data: {comp_pigz_json},
-                    backgroundColor: '{pigz_color}',
-                }},
-                {{
-                    label: 'rigz',
-                    data: {comp_rigz_json},
-                    backgroundColor: '{rigz_color}',
-                }},
-            ]
-        }};
-
-        const decompData = {{
-            labels: configs,
-            datasets: [
-                {{
-                    label: 'gzip',
-                    data: {decomp_gzip_json},
-                    backgroundColor: '{gzip_color}',
-                }},
-                {{
-                    label: 'pigz',
-                    data: {decomp_pigz_json},
-                    backgroundColor: '{pigz_color}',
-                }},
-                {{
-                    label: 'rigz',
-                    data: {decomp_rigz_json},
-                    backgroundColor: '{rigz_color}',
-                }},
-            ]
-        }};
-
-        const chartOptions = {{
-            responsive: true,
-            plugins: {{
-                legend: {{ labels: {{ color: '#eee' }} }}
-            }},
-            scales: {{
-                x: {{ ticks: {{ color: '#eee' }}, grid: {{ color: '#333' }} }},
-                y: {{ 
-                    ticks: {{ color: '#eee' }}, 
-                    grid: {{ color: '#333' }},
-                    title: {{ display: true, text: 'Seconds', color: '#eee' }}
+        <div class="stats-grid animate-in" style="animation-delay: 0.1s">
+            <div class="stat-card">
+                <div class="stat-value">{max_gzip_speedup:.1f}×</div>
+                <div class="stat-label">faster than gzip</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{max_pigz_speedup:.1f}×</div>
+                <div class="stat-label">faster than pigz</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{max_throughput:.0f}</div>
+                <div class="stat-label">MB/s peak throughput</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-value">{test_size_str}</div>
+                <div class="stat-label">test tarball size</div>
+            </div>
+        </div>
+        
+        <section class="race-section">
+            <div class="section-header animate-in" style="animation-delay: 0.2s">
+                <h2>Compression Performance</h2>
+                <div class="line"></div>
+            </div>
+            
+            <div class="legend animate-in" style="animation-delay: 0.25s">
+                <div class="legend-item">
+                    <div class="legend-dot gzip"></div>
+                    <span class="legend-text">gzip (standard)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-dot pigz"></div>
+                    <span class="legend-text">pigz (parallel)</span>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-dot rigz"></div>
+                    <span class="legend-text">rigz (this project)</span>
+                </div>
+            </div>
+            
+            <div id="race-tracks"></div>
+        </section>
+        
+        <footer class="footer">
+            <p>
+                Generated by <a href="https://github.com/jackdanger/rigz">rigz</a> validation suite.
+                Bars show time (shorter = faster). All output is gzip-compatible.
+            </p>
+        </footer>
+    </div>
+    
+    <script>
+        const raceData = {race_data_json};
+        const testSizeMB = {test_size_mb:.1f};
+        
+        function formatTime(seconds) {{
+            if (seconds < 1) return (seconds * 1000).toFixed(0) + 'ms';
+            if (seconds < 10) return seconds.toFixed(2) + 's';
+            return seconds.toFixed(1) + 's';
+        }}
+        
+        function formatThroughput(mbps) {{
+            return mbps.toFixed(0) + ' MB/s';
+        }}
+        
+        function createRaceTrack(config) {{
+            const tools = config.tools;
+            const maxTime = Math.max(...Object.values(tools).map(t => t.time));
+            
+            // Find winner (lowest time)
+            let winner = null;
+            let winnerTime = Infinity;
+            for (const [tool, data] of Object.entries(tools)) {{
+                if (data.time < winnerTime) {{
+                    winnerTime = data.time;
+                    winner = tool;
                 }}
             }}
-        }};
-
-        new Chart(document.getElementById('compChart'), {{
-            type: 'bar',
-            data: compData,
-            options: chartOptions
-        }});
-
-        new Chart(document.getElementById('decompChart'), {{
-            type: 'bar',
-            data: decompData,
-            options: chartOptions
-        }});
+            
+            const gzipSpeedup = tools.gzip ? (tools.gzip.time / tools.rigz.time).toFixed(1) : '-';
+            const pigzSpeedup = tools.pigz ? (tools.pigz.time / tools.rigz.time).toFixed(1) : '-';
+            
+            let lanesHTML = '';
+            for (const tool of ['gzip', 'pigz', 'rigz']) {{
+                if (!tools[tool]) continue;
+                const data = tools[tool];
+                const widthPercent = (data.time / maxTime) * 100;
+                
+                lanesHTML += `
+                    <div class="lane">
+                        <div class="lane-tool ${{tool}}">${{tool}}</div>
+                        <div class="lane-bar-container">
+                            <div class="lane-bar ${{tool}}" style="width: ${{widthPercent}}%">
+                                ${{formatTime(data.time)}}
+                            </div>
+                        </div>
+                        <div class="lane-stats">
+                            <div class="lane-throughput">${{formatThroughput(data.throughput)}}</div>
+                            <div class="lane-time">${{data.ratio.toFixed(1)}}% ratio</div>
+                        </div>
+                    </div>
+                `;
+            }}
+            
+            return `
+                <div class="race-track">
+                    <div class="race-header">
+                        <div class="race-config">
+                            <span class="level">Level ${{config.level}}</span>
+                            <span class="threads">• ${{config.threads}} thread${{config.threads > 1 ? 's' : ''}}</span>
+                        </div>
+                        ${{winner === 'rigz' ? '<div class="winner-badge">🏆 rigz wins</div>' : ''}}
+                    </div>
+                    <div class="race-lanes">
+                        ${{lanesHTML}}
+                    </div>
+                    <div class="speedup-callout">
+                        <div class="speedup-item">
+                            <div class="speedup-value">${{gzipSpeedup}}×</div>
+                            <div class="speedup-label">faster than gzip</div>
+                        </div>
+                        <div class="speedup-item">
+                            <div class="speedup-value">${{pigzSpeedup}}×</div>
+                            <div class="speedup-label">faster than pigz</div>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }}
+        
+        // Render all race tracks
+        const container = document.getElementById('race-tracks');
+        container.innerHTML = raceData.map(createRaceTrack).join('');
+        
+        // Animate bars on load
+        setTimeout(() => {{
+            document.querySelectorAll('.lane-bar').forEach(bar => {{
+                bar.style.width = bar.style.width; // Trigger reflow
+            }});
+        }}, 100);
     </script>
 </body>
 </html>
-"""
+'''
     return html
 
 
