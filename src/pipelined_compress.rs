@@ -23,7 +23,9 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 /// Block size for pipelined compression
-const BLOCK_SIZE: usize = 128 * 1024; // 128KB for better compression at high levels
+/// 128KB is the default for pigz. Larger blocks reduce sync overhead
+/// but don't significantly improve compression.
+const BLOCK_SIZE: usize = 128 * 1024;
 
 /// Dictionary size (DEFLATE maximum is 32KB)
 const DICT_SIZE: usize = 32 * 1024;

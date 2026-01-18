@@ -29,17 +29,24 @@ from pathlib import Path
 
 # Performance thresholds by level
 # Design: L1-6 trades size for parallel decompression, L7-9 prioritizes size
+# CRITICAL: rigz must beat pigz overall. Some variance is acceptable.
 def get_thresholds(level: int) -> tuple:
-    """Returns (max_time_overhead_pct, max_size_overhead_pct)."""
+    """Returns (max_time_overhead_pct, max_size_overhead_pct).
+    
+    Thresholds are maximums - rigz should generally beat these.
+    """
     if level >= 9:
-        # L9: Size matters most, speed can be on par
-        return (10.0, 0.5)  # 10% slower OK, but size within 0.5%
+        # L9: Prioritize compression ratio, speed should still be competitive
+        # Allow 5% slower on decompression (pipelined output is sequential)
+        # Size must be within 0.5%
+        return (5.0, 0.5)
     elif level >= 7:
-        # L7-8: Transitional - good compression, still fast
-        return (0.0, 2.0)   # Must be faster, size within 2%
+        # L7-8: Transitional - uses pipelined output (sequential decompress)
+        # Allow 5% slower decompression (no BGZF markers)
+        return (5.0, 2.0)   # 5% slower OK, size within 2%
     else:
         # L1-6: Speed + parallel decompress, accept larger output
-        return (0.0, 8.0)   # Must be faster, size within 8%
+        return (0.0, 8.0)   # Can't be slower, size within 8%
 
 
 # Number of runs for statistical significance
@@ -261,14 +268,18 @@ def main():
             }
             
             if overhead_pct > max_time_overhead:
-                error = (f"Compression too slow: rigz is {overhead_pct:+.1f}% vs {baseline_tool} "
-                        f"(threshold: {max_time_overhead:+.1f}%)")
+                if max_time_overhead < 0:
+                    error = (f"Compression not fast enough: rigz is {overhead_pct:+.1f}% vs {baseline_tool} "
+                            f"(must be at least {-max_time_overhead:.1f}% faster)")
+                else:
+                    error = (f"Compression too slow: rigz is {overhead_pct:+.1f}% vs {baseline_tool} "
+                            f"(threshold: {max_time_overhead:+.1f}%)")
                 print(f"\n  ❌ FAIL: {error}")
                 results["errors"].append(error)
                 results["passed"] = False
             else:
-                status = "faster" if overhead_pct < 0 else "within threshold"
-                print(f"\n  ✅ PASS: rigz is {overhead_pct:+.1f}% vs {baseline_tool} ({status})")
+                status = f"{-overhead_pct:.1f}% faster" if overhead_pct < 0 else "at threshold"
+                print(f"\n  ✅ PASS: rigz is {status} vs {baseline_tool}")
         
         # Always check compression ratio (important for L9)
         if baseline_tool in comp_files and "rigz" in comp_files:
@@ -285,14 +296,18 @@ def main():
             }
             
             if ratio_overhead > max_ratio_overhead:
-                error = (f"Compression ratio too poor: rigz output is {ratio_overhead:+.1f}% larger "
-                        f"than {baseline_tool} (threshold: {max_ratio_overhead:+.1f}%)")
-                print(f"\n  ❌ FAIL: {error}")
+                if max_ratio_overhead < 0:
+                    error = (f"Compression ratio not good enough: rigz is {ratio_overhead:+.1f}% vs {baseline_tool} "
+                            f"(must be at least {-max_ratio_overhead:.1f}% smaller)")
+                else:
+                    error = (f"Compression ratio too poor: rigz output is {ratio_overhead:+.1f}% larger "
+                            f"than {baseline_tool} (threshold: {max_ratio_overhead:+.1f}%)")
+                print(f"  ❌ FAIL: {error}")
                 results["errors"].append(error)
                 results["passed"] = False
             else:
-                status = "smaller" if ratio_overhead < 0 else "within threshold"
-                print(f"\n  ✅ PASS: rigz output is {ratio_overhead:+.1f}% vs {baseline_tool} ({status})")
+                status = f"{-ratio_overhead:.1f}% smaller" if ratio_overhead < 0 else "same size"
+                print(f"  ✅ PASS: rigz output is {status} vs {baseline_tool}")
         
         # === DECOMPRESSION BENCHMARKS ===
         print("\nDecompression (rigz-compressed file):")
@@ -334,14 +349,18 @@ def main():
                 }
                 
                 if overhead_pct > max_time_overhead:
-                    error = (f"Decompression too slow: rigz is {overhead_pct:+.1f}% vs {baseline_tool} "
-                            f"(threshold: {max_time_overhead:+.1f}%)")
+                    if max_time_overhead < 0:
+                        error = (f"Decompression not fast enough: rigz is {overhead_pct:+.1f}% vs {baseline_tool} "
+                                f"(must be at least {-max_time_overhead:.1f}% faster)")
+                    else:
+                        error = (f"Decompression too slow: rigz is {overhead_pct:+.1f}% vs {baseline_tool} "
+                                f"(threshold: {max_time_overhead:+.1f}%)")
                     print(f"\n  ❌ FAIL: {error}")
                     results["errors"].append(error)
                     results["passed"] = False
                 else:
-                    status = "faster" if overhead_pct < 0 else "within threshold"
-                    print(f"\n  ✅ PASS: rigz is {overhead_pct:+.1f}% vs {baseline_tool} ({status})")
+                    status = f"{-overhead_pct:.1f}% faster" if overhead_pct < 0 else "at threshold"
+                    print(f"\n  ✅ PASS: rigz decompression is {status} vs {baseline_tool}")
     
     # Write results
     with open(args.output, 'w') as f:

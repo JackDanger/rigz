@@ -148,6 +148,10 @@ This matches user expectations:
 - L7-8: Speed must beat pigz, size within 2% (transitional)
 - L9: Size must match pigz (within 0.5%), speed can be within 10%
 
+**Design Philosophy:**
+- L1-6: Speed + parallel decompress (independent blocks)
+- L7-9: Maximum compression (dictionary sharing, sequential decompress)
+
 If a configuration regresses vs pigz:
 1. Create a different code path for that specific case
 2. Every (level, thread_count) combination may need its own strategy
@@ -157,5 +161,7 @@ When measuring:
 - Speed matters (compression AND decompression)
 - Size matters (especially at high levels)
 - If we can't win both, prioritize what the user expects at that level
+
+See CONTRIBUTING.md for detailed architecture guide.
 
 See CONTRIBUTING.md for detailed architecture guide.
