@@ -40,25 +40,20 @@ const DICT_SIZE: usize = 32 * 1024;
 
 /// Get optimal block size for pipelined compression
 ///
-/// For L9, we dynamically size blocks based on file size:
-/// - Small files (<10MB): 64KB blocks for more parallelism
-/// - Medium files (10-50MB): 128KB blocks
-/// - Large files (50MB+): 256KB blocks to reduce overhead
+/// For L9, we minimize block count to reduce coordination overhead.
+/// On 4-core GHA VMs, too many blocks = too much synchronization overhead.
 ///
-/// This reduces the 7% overhead seen on 100MB files in GHA.
+/// New strategy: ~8 blocks total (2 per thread) for minimal coordination.
 #[inline]
-fn get_block_size_for_file(level: u32, file_size: usize) -> usize {
+fn get_block_size_for_file(level: u32, file_size: usize, num_threads: usize) -> usize {
     if level >= 9 {
         // CRITICAL: For L9, minimize block count to reduce coordination overhead
         // 
         // On 4-core GHA VMs, our parallel pipelined compression was 8% slower than pigz.
         // Root cause: too many small blocks = too much synchronization overhead.
         //
-        // New strategy: ~8 blocks total regardless of file size.
-        // This gives enough parallelism for 4 cores while minimizing overhead.
-        //
         // For 4 threads: 8 blocks = 2 blocks per thread = minimal coordination
-        let num_threads = rayon::current_num_threads();
+        // For 14 threads: 28 blocks = still manageable
         let target_blocks = (num_threads * 2).max(4); // At least 4 blocks
         let block_size = file_size / target_blocks;
         
@@ -171,7 +166,7 @@ impl PipelinedGzEncoder {
     /// - Parallel CRC computation (combined at end)
     fn compress_parallel_pipeline<W: Write>(&self, data: &[u8], mut writer: W) -> io::Result<()> {
         let level = adjust_compression_level(self.compression_level);
-        let block_size = get_block_size_for_file(self.compression_level, data.len());
+        let block_size = get_block_size_for_file(self.compression_level, data.len(), self.num_threads);
 
         // Write gzip header
         let header = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
