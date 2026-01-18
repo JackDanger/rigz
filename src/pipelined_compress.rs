@@ -49,19 +49,23 @@ const DICT_SIZE: usize = 32 * 1024;
 #[inline]
 fn get_block_size_for_file(level: u32, file_size: usize) -> usize {
     if level >= 9 {
-        // Dynamic sizing for L9 based on file size
-        // Larger blocks reduce coordination overhead, especially important on
-        // resource-constrained systems like GHA VMs (4 cores)
+        // CRITICAL: For L9, minimize block count to reduce coordination overhead
+        // 
+        // On 4-core GHA VMs, our parallel pipelined compression was 8% slower than pigz.
+        // Root cause: too many small blocks = too much synchronization overhead.
         //
-        // Key insight: pigz is highly optimized for its block pipeline.
-        // On 4-core VMs, we need larger blocks to reduce relative overhead.
-        if file_size < 5 * 1024 * 1024 {
-            256 * 1024 // 256KB for very small files
-        } else if file_size < 20 * 1024 * 1024 {
-            512 * 1024 // 512KB for small/medium files (10MB → ~20 blocks)
-        } else {
-            1024 * 1024 // 1MB for large files (100MB → ~100 blocks)
-        }
+        // New strategy: ~8 blocks total regardless of file size.
+        // This gives enough parallelism for 4 cores while minimizing overhead.
+        //
+        // For 4 threads: 8 blocks = 2 blocks per thread = minimal coordination
+        let num_threads = rayon::current_num_threads();
+        let target_blocks = (num_threads * 2).max(4); // At least 4 blocks
+        let block_size = file_size / target_blocks;
+        
+        // Clamp to reasonable bounds
+        // Min 256KB (enough data per block for efficient compression)
+        // Max 4MB (reasonable memory per thread)
+        block_size.max(256 * 1024).min(4 * 1024 * 1024)
     } else {
         BLOCK_SIZE_DEFAULT
     }

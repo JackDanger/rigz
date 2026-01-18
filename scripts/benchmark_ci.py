@@ -42,11 +42,9 @@ def get_thresholds(level: int) -> tuple:
     """
     if level >= 9:
         # L9: Prioritize compression ratio, speed should still be competitive
-        # On 4-core GHA VMs, zlib-ng L9 is ~8% slower than pigz at compression
-        # but 48% faster at decompression. We accept a 10% tolerance here
-        # because on real hardware (Apple Silicon, Intel x86), rigz wins.
+        # We must beat pigz even on 4-core GHA VMs
         # Size must be within 0.5%
-        return (10.0, 0.5)
+        return (5.0, 0.5)
     elif level >= 7:
         # L7-8: Transitional - uses pipelined output (sequential decompress)
         # Allow 5% slower decompression (no BGZF markers)
