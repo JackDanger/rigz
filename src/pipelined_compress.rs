@@ -121,6 +121,12 @@ impl PipelinedGzEncoder {
         // Memory-map the file for zero-copy access
         let mmap = unsafe { Mmap::map(&file)? };
 
+        // Hint to kernel that we'll access the data sequentially
+        #[cfg(unix)]
+        {
+            let _ = mmap.advise(memmap2::Advice::Sequential);
+        }
+
         if self.num_threads > 1 {
             if file_len <= POOL_MAX_INPUT {
                 let data = mmap.to_vec();
