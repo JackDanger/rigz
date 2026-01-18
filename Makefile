@@ -1,4 +1,4 @@
-# Rigz - Rust Parallel Gzip Replacement
+# gzippy - The Fastest Parallel Gzip
 # Build and test infrastructure
 #
 # Quick tests (<30s) run with 'make' or 'make quick' - for AI tools and iteration
@@ -7,13 +7,13 @@
 # Build configuration - submodules are in ./gzip and ./pigz
 GZIP_DIR := ./gzip
 PIGZ_DIR := ./pigz
-RIGZ_DIR := .
+GZIPPY_DIR := .
 TEST_DATA_DIR := test_data
 RESULTS_DIR := test_results
 
 # Build targets
-RIGZ_BIN := $(RIGZ_DIR)/target/release/rigz
-UNRIGZ_BIN := $(RIGZ_DIR)/target/release/unrigz
+GZIPPY_BIN := $(GZIPPY_DIR)/target/release/gzippy
+UNGZIPPY_BIN := $(GZIPPY_DIR)/target/release/ungzippy
 PIGZ_BIN := $(PIGZ_DIR)/pigz
 
 # Prefer local gzip build, fall back to system gzip
@@ -31,7 +31,7 @@ all: quick
 # Build targets
 # =============================================================================
 
-build: $(RIGZ_BIN) $(UNRIGZ_BIN)
+build: $(GZIPPY_BIN) $(UNGZIPPY_BIN)
 
 deps: $(PIGZ_BIN)
 	@# Try to build gzip, but don't fail if it doesn't work
@@ -55,28 +55,28 @@ $(PIGZ_BIN):
 	@$(MAKE) -C $(PIGZ_DIR) pigz 2>&1 || (echo "  Cleaning and rebuilding..." && $(MAKE) -C $(PIGZ_DIR) clean >/dev/null 2>&1 && $(MAKE) -C $(PIGZ_DIR) pigz)
 	@echo "✓ Built pigz"
 
-$(RIGZ_BIN): FORCE
-	@echo "Building rigz..."
-	@cd $(RIGZ_DIR) && cargo build --release 2>&1 | grep -E "(Compiling rigz|Finished|error)" || true
-	@echo "✓ Built rigz"
+$(GZIPPY_BIN): FORCE
+	@echo "Building gzippy..."
+	@cd $(GZIPPY_DIR) && cargo build --release 2>&1 | grep -E "(Compiling gzippy|Finished|error)" || true
+	@echo "✓ Built gzippy"
 
-# Create unrigz symlink (like unpigz)
-$(UNRIGZ_BIN): $(RIGZ_BIN)
-	@ln -sf rigz $(UNRIGZ_BIN)
-	@echo "✓ Created unrigz symlink"
+# Create ungzippy symlink (like unpigz)
+$(UNGZIPPY_BIN): $(GZIPPY_BIN)
+	@ln -sf gzippy $(UNGZIPPY_BIN)
+	@echo "✓ Created ungzippy symlink"
 
 FORCE:
 
 # =============================================================================
 # Quick benchmark (~30 seconds) - for AI tools and fast iteration
 # =============================================================================
-quick: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
+quick: $(GZIPPY_BIN) $(UNGZIPPY_BIN) $(PIGZ_BIN) deps
 	@python3 scripts/perf.py --sizes 1,10 --levels 6 --threads 1,4
 
 # =============================================================================
 # Full performance tests (10+ minutes) - for humans at release time
 # =============================================================================
-perf-full: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
+perf-full: $(GZIPPY_BIN) $(UNGZIPPY_BIN) $(PIGZ_BIN) deps
 	@mkdir -p $(RESULTS_DIR)
 	@python3 scripts/perf.py --full 2>&1 | tee $(RESULTS_DIR)/perf_full_$$(date +%Y%m%d_%H%M%S).log
 
@@ -93,11 +93,11 @@ test-data-quick:
 # =============================================================================
 # Validation target - cross-tool compression/decompression matrix
 # =============================================================================
-validate: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
+validate: $(GZIPPY_BIN) $(UNGZIPPY_BIN) $(PIGZ_BIN) deps
 	@python3 scripts/validate.py
 
 # Validation with JSON output (run tests, save results)
-validate-json: $(RIGZ_BIN) $(UNRIGZ_BIN) $(PIGZ_BIN) deps
+validate-json: $(GZIPPY_BIN) $(UNGZIPPY_BIN) $(PIGZ_BIN) deps
 	@mkdir -p $(RESULTS_DIR)
 	@python3 scripts/validate.py --json -o $(RESULTS_DIR)/validation.json
 	@echo "✓ Results saved to $(RESULTS_DIR)/validation.json"
@@ -136,11 +136,11 @@ lint-check:
 # =============================================================================
 # Install target
 # =============================================================================
-install: $(RIGZ_BIN) $(UNRIGZ_BIN)
+install: $(GZIPPY_BIN) $(UNGZIPPY_BIN)
 	@echo "Installing to /usr/local/bin..."
-	@install -m 755 $(RIGZ_BIN) /usr/local/bin/rigz
-	@ln -sf rigz /usr/local/bin/unrigz
-	@echo "✓ Installed rigz and unrigz"
+	@install -m 755 $(GZIPPY_BIN) /usr/local/bin/gzippy
+	@ln -sf gzippy /usr/local/bin/ungzippy
+	@echo "✓ Installed gzippy and ungzippy"
 
 # =============================================================================
 # Cleanup
@@ -150,20 +150,20 @@ clean:
 	@rm -rf $(TEST_DATA_DIR) $(RESULTS_DIR)
 	@$(MAKE) -C $(PIGZ_DIR) clean >/dev/null 2>&1 || true
 	@$(MAKE) -C $(GZIP_DIR) clean >/dev/null 2>&1 || true
-	@cd $(RIGZ_DIR) && cargo clean >/dev/null 2>&1
+	@cd $(GZIPPY_DIR) && cargo clean >/dev/null 2>&1
 	@echo "✓ Cleaned"
 
 # =============================================================================
 # Help
 # =============================================================================
 help:
-	@echo "Rigz - Rust Parallel Gzip Replacement"
+	@echo "gzippy - The Fastest Parallel Gzip"
 	@echo "======================================"
 	@echo ""
 	@echo "Quick commands (for AI tools and iteration):"
 	@echo "  make              Build and run quick benchmark (< 30 seconds)"
 	@echo "  make quick        Same as above"
-	@echo "  make build        Build rigz and unrigz"
+	@echo "  make build        Build gzippy and ungzippy"
 	@echo "  make deps         Build gzip and pigz from submodules"
 	@echo "  make validate     Run validation suite (adaptive 3-17 trials)"
 	@echo "  make lint         Run rustfmt and clippy (auto-fix)"
@@ -179,12 +179,12 @@ help:
 	@echo "  make test-data    			Generate all test data files"
 	@echo ""
 	@echo "Installation:"
-	@echo "  make install      			Install rigz and unrigz to /usr/local/bin"
+	@echo "  make install      			Install gzippy and ungzippy to /usr/local/bin"
 	@echo ""
 	@echo "Maintenance:"
 	@echo "  make clean        			Remove all build artifacts and test data"
 	@echo "  make help         			Show this message"
 	@echo ""
 	@echo "Binaries:"
-	@echo "  rigz              			Compress (default) or decompress with -d"
-	@echo "  unrigz            			Decompress (like gunzip/unpigz)"
+	@echo "  gzippy              			Compress (default) or decompress with -d"
+	@echo "  ungzippy            			Decompress (like gunzip/unpigz)"
