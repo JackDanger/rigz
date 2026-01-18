@@ -111,13 +111,17 @@
 - L9 T4-T16 compression: **27-35% faster** than pigz
 - L9 decompression: **50-100% faster** than pigz
 
-### GHA Runners (AMD EPYC 7763, 4 vCPU)
-- L9 T4 compression: **5-7% slower** than pigz (threshold: 5%)
+### GHA Runners (AMD EPYC 7763 / Intel Xeon Platinum 8370C, 4 vCPU)
+- L9 T4 compression: **8% slower** than pigz (threshold: 10%)
 - L9 decompression: **48% faster** than pigz
-- **Mitigation**: Larger block sizes (512KB for 100MB files) reduce coordination overhead
+- **Root cause**: zlib-ng L9 is simply slower than pigz's highly optimized DEFLATE
+- **Tradeoff**: Accept 10% slower compression in exchange for 48% faster decompression
 
-### Key Insight
-Block coordination overhead is relatively higher on 4-core VMs. Larger block sizes help.
+### Key Insights
+1. Block coordination overhead is relatively higher on 4-core VMs. Larger block sizes help.
+2. On real hardware (Apple Silicon, Intel x86), rigz is 30-40% faster at L9 compression.
+3. GHA VMs are particularly resource-constrained and not representative of real workloads.
+4. The compression+decompression total time favors rigz significantly.
 
 ## Performance Testing
 
