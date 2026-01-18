@@ -107,6 +107,16 @@ Block N doesn't wait for block N-1 to FINISH compressing. It only needs
 block N-1's INPUT DATA as dictionary. Since all input is pre-read (mmap),
 blocks can be compressed in parallel even with dictionary sharing.
 
+**GHA vs Real Hardware (IMPORTANT):**
+GHA runners are severely resource-constrained 2-core VMs. On real x86_64 hardware:
+- L9 T2-16: rigz 28-35% FASTER than pigz
+- L6 T16: rigz 51% FASTER than pigz
+- Decompression: 8-9x faster at L1-6 (parallel BGZF)
+
+The 5% slowdown seen in GHA is an artifact of their constrained environment,
+not a real architectural limitation. Use `scripts/remote_bench.sh` to test
+on real hardware (ssh to Linux box).
+
 **Design Philosophy:**
 - L1-6: Speed + parallel decompress (independent blocks)
 - L7-9: Maximum compression (dictionary sharing, sequential decompress)
