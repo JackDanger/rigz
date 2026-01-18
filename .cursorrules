@@ -35,44 +35,22 @@
 - **Speed**: At least match pigz (sequential output)
 - **Use libdeflate**: Already fastest for single-stream
 
-## Optimization Techniques (Exhaustive)
+## Implemented Optimizations
 
-### Tier 1: Already Implemented
-- [x] libdeflate for L1-L6 compression
-- [x] libdeflate for all decompression
-- [x] Parallel block compression with rayon
-- [x] BGZF markers for parallel decompression (L1-L6)
-- [x] Pipelined compression for L7-L9
-- [x] Thread-local buffer reuse
-- [x] Memory-mapped I/O
-- [x] Dynamic block sizing based on file size
-- [x] Parallel CRC32 calculation
-- [x] Hardware CRC32 detection
+- libdeflate for L1-L6 compression and all decompression
+- Custom scheduler with dedicated writer thread (pigz model)
+- BGZF markers for parallel decompression (L1-L6)
+- Pipelined compression with dictionary sharing for L7-L9
+- Thread-local buffer reuse (Compress objects, output Vecs)
+- Memory-mapped I/O for large files
+- Dynamic block sizing by file size
+- Parallel CRC32 calculation
 
-### Tier 2: Implemented
-- [x] Thread-local Compress objects (zlib-ng for L7-L9)
-- [x] Thread-local libdeflate Compressor (L1-L6)
-- [x] Pre-allocated output buffers (thread-local Vec reuse)
-- [x] Thread-local Decompressor and buffers
-- [x] Dynamic block sizing by file size (larger for 4-core systems)
-- [ ] Memory prefetching (madvise MADV_SEQUENTIAL)
-- [ ] Write combining for output
+## Future Optimizations
 
-### Tier 3: Aggressive Optimizations
-- [ ] Intel ISA-L for L9 compression (if available)
-- [ ] AVX-512 optimized match finding
-- [ ] Huge pages for large allocations (>2MB)
-- [ ] Core pinning (NUMA-aware thread placement)
-- [ ] Lock-free work stealing for better load balance
-- [ ] Batch syscalls (io_uring on Linux)
-
-### Tier 4: Extreme Optimizations
-- [ ] Custom allocator (arena per thread)
-- [ ] Profile-guided optimization (PGO build)
-- [ ] Link-time optimization (LTO)
-- [ ] CPU-specific builds (x86-64-v3, x86-64-v4)
-- [ ] Inline assembly for hot paths
-- [ ] Branch prediction hints (__builtin_expect)
+- Intel ISA-L for L9 compression (if available)
+- Profile-guided optimization (PGO build)
+- io_uring on Linux
 
 ## Architecture Decisions
 
@@ -115,21 +93,6 @@
 - L9 T4 compression: **35-40% faster** than pigz (after optimization)
 - L9 decompression: **48% faster** than pigz
 - **Key fix**: Minimize block count to ~8 blocks (2 per thread) to reduce coordination overhead
-
-### Key Insights
-1. Too many small blocks = too much synchronization overhead on 4-core systems.
-2. Block size = file_size / (threads * 2), clamped to 256KB-4MB.
-3. On real hardware (Apple Silicon, Intel x86), rigz is 30-40% faster at L9 compression.
-4. The compression+decompression total time strongly favors rigz.
-
-## What Doesn't Work
-
-1. **Independent blocks at L9**: 4% larger output (violates 0.5% threshold)
-2. **Hybrid chain compression**: Gzip format can't embed dictionaries
-3. **Forward-refs-only**: Hash priming provides 0% compression benefit
-4. **Overlapping blocks**: Standard tools output redundant data
-5. **libdeflate L12**: 4x slower than L9 for marginal gain
-6. **Small block sizes on 4-core systems**: More coordination overhead than benefit
 
 ## Performance Testing
 
@@ -182,33 +145,10 @@ To skip (emergency only): `git commit --no-verify`
 |------|---------|
 | `parallel_compress.rs` | L1-L6: libdeflate parallel blocks |
 | `pipelined_compress.rs` | L7-L9: zlib-ng with dictionary sharing |
+| `scheduler.rs` | Pigz-style parallel scheduler with dedicated writer thread |
 | `decompression.rs` | libdeflate for all paths |
 | `libdeflate_ext.rs` | Direct libdeflate-sys bindings |
 | `optimization.rs` | CPU detection, buffer sizing |
-
-## The Path to Absolute Maximum
-
-1. **Tier 2 optimizations** will get us 10-20% faster
-2. **Tier 3 optimizations** will get us another 10-15%
-3. **Tier 4 optimizations** will squeeze out the last 5-10%
-4. **Total expected gain**: 25-45% faster than current
-
-After all optimizations, rigz should be:
-- **L9 single-thread**: 50-60% faster than pigz
-- **L9 multi-thread**: 30-40% faster than pigz
-- **L9 decompression**: Equal to pigz (both use sequential libdeflate)
-
-This represents the theoretical maximum without:
-- Custom DEFLATE implementation
-- Hardware acceleration beyond CPU SIMD
-- New compression algorithms
-
-## Notes From Recent Work
-
-- L9 pipelined path uses `PipelinedGzEncoder` with a fixed 128KB block size and
-  32KB dictionaries (last input bytes), writing a single gzip stream.
-- Parallel pipeline uses a custom scheduler with spin-waited ordered writes;
-  per-block CRCs are computed in workers then combined in-order after all blocks.
 
 ## GHA-Specific Optimizations (4 vCPU)
 
