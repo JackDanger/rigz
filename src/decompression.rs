@@ -414,11 +414,11 @@ fn decompress_bgzf_parallel<W: Write>(data: &[u8], writer: &mut W) -> RigzResult
         }
 
         // Main thread: stream output in order
-        for i in 0..num_blocks {
-            while !slots[i].ready.load(Ordering::Acquire) {
+        for slot in slots.iter() {
+            while !slot.ready.load(Ordering::Acquire) {
                 std::hint::spin_loop();
             }
-            let output = unsafe { &*slots[i].data.get() };
+            let output = unsafe { &*slot.data.get() };
             if !output.is_empty() {
                 writer.write_all(output).unwrap();
                 total_bytes += output.len() as u64;

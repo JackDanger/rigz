@@ -79,7 +79,7 @@ pub fn get_optimal_block_size(level: u32, file_size: usize, num_threads: usize) 
         let target_blocks = num_threads * 8;
         let dynamic_size = file_size / target_blocks;
         // Clamp between 64KB (minimum for efficiency) and 256KB (maximum for L1-L2)
-        let clamped = dynamic_size.max(64 * 1024).min(256 * 1024);
+        let clamped = dynamic_size.clamp(64 * 1024, 256 * 1024);
         // Round up to 64KB boundary for alignment
         (clamped + 65535) & !65535
     } else {
@@ -89,10 +89,10 @@ pub fn get_optimal_block_size(level: u32, file_size: usize, num_threads: usize) 
 
 // Thread-local compression buffer to avoid per-block allocation
 thread_local! {
-    static COMPRESS_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256 * 1024));
+    static COMPRESS_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     // Cache libdeflate Compressor by level to avoid per-block allocation
     // Tuple is (level, compressor) - we only cache one level per thread
-    static LIBDEFLATE_COMPRESSOR: RefCell<Option<(i32, libdeflater::Compressor)>> = RefCell::new(None);
+    static LIBDEFLATE_COMPRESSOR: RefCell<Option<(i32, libdeflater::Compressor)>> = const { RefCell::new(None) };
 }
 
 /// Default block size for parallel compression
@@ -263,7 +263,7 @@ fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compressio
         let compressor = match cache.as_mut() {
             Some((cached_level, comp)) if *cached_level == level => comp,
             _ => {
-                let lvl = CompressionLvl::new(level).unwrap_or(CompressionLvl::default());
+                let lvl = CompressionLvl::new(level).unwrap_or_default();
                 *cache = Some((level, Compressor::new(lvl)));
                 &mut cache.as_mut().unwrap().1
             }
