@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Generate test data for rigz validation.
+Generate test data for gzippy validation.
 
 Creates test files of various types and sizes:
 - text: Highly compressible (Project Gutenberg repeated)
@@ -111,7 +111,7 @@ def generate_tarball(output_path: Path, size_mb: int) -> bool:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate test data for rigz")
+    parser = argparse.ArgumentParser(description="Generate test data for gzippy")
     parser.add_argument("--output-dir", type=str, default="test_data",
                        help="Output directory for test files")
     parser.add_argument("--size", type=int, default=10,

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Rigz Performance Suite
+Gzippy Performance Suite
 
 Benchmarks compression AND decompression against gzip and pigz.
-Tests that rigz beats or matches both tools.
+Tests that gzippy beats or matches both tools.
 
 Usage:
     python3 scripts/perf.py                    # Quick test (1MB, 10MB)
@@ -35,7 +35,7 @@ def find_gzip():
 
 GZIP = find_gzip()
 PIGZ = "./pigz/pigz"
-RIGZ = "./target/release/rigz"
+GZIPPY = "./target/release/gzippy"
 
 # Defaults
 DEFAULT_LEVELS = [1, 6, 9]
@@ -46,7 +46,7 @@ DEFAULT_SIZES_FULL = [1, 10, 100]  # MB
 # Statistical config - more runs for shorter tests to reduce noise
 RUNS_BY_SIZE = {1: 30, 10: 15, 100: 7}
 
-# Acceptable overhead (rigz can be up to 5% slower and still "pass")
+# Acceptable overhead (gzippy can be up to 5% slower and still "pass")
 MAX_OVERHEAD_PCT = 5.0
 
 
@@ -110,10 +110,10 @@ def run_timed(cmd: List[str], stdin_file: str = None, stdout_file: str = None) -
 def benchmark_compress(tool: str, level: int, threads: int, 
                        input_file: str, output_file: str, runs: int) -> Tuple[float, float, int]:
     """Benchmark compression. Returns (median_time, stdev, output_size)."""
-    bin_path = {"gzip": GZIP, "pigz": PIGZ, "rigz": RIGZ}[tool]
+    bin_path = {"gzip": GZIP, "pigz": PIGZ, "gzippy": GZIPPY}[tool]
     
     cmd = [bin_path, f"-{level}"]
-    if tool in ("pigz", "rigz"):
+    if tool in ("pigz", "gzippy"):
         cmd.append(f"-p{threads}")
     cmd.extend(["-c", input_file])
     
@@ -133,7 +133,7 @@ def benchmark_compress(tool: str, level: int, threads: int,
 
 def benchmark_decompress(tool: str, input_file: str, output_file: str, runs: int) -> Tuple[float, float]:
     """Benchmark decompression. Returns (median_time, stdev)."""
-    bin_path = {"gzip": GZIP, "pigz": PIGZ, "rigz": RIGZ}[tool]
+    bin_path = {"gzip": GZIP, "pigz": PIGZ, "gzippy": GZIPPY}[tool]
     
     cmd = [bin_path, "-d", "-c", input_file]
     
@@ -152,7 +152,7 @@ def benchmark_decompress(tool: str, input_file: str, output_file: str, runs: int
 
 def check_tools() -> bool:
     """Verify all tools exist."""
-    missing = [t for t in [GZIP, PIGZ, RIGZ] if not os.path.isfile(t)]
+    missing = [t for t in [GZIP, PIGZ, GZIPPY] if not os.path.isfile(t)]
     if missing:
         print("Missing tools:")
         for t in missing:
@@ -198,7 +198,7 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                     comp_results = {}
                     comp_files = {}
                     
-                    for tool in ["gzip", "pigz", "rigz"]:
+                    for tool in ["gzip", "pigz", "gzippy"]:
                         out_file = tmpdir / f"test.{tool}.l{level}.t{thread_count}.gz"
                         median, stdev, out_size = benchmark_compress(
                             tool, level, thread_count, str(test_file), str(out_file), runs
@@ -208,12 +208,12 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                         
                         print(f"  {tool:5}: {format_time(median):>8} ±{format_time(stdev):>6}  {format_size(out_size):>10}")
                     
-                    # Check rigz compression performance
-                    rigz_time = comp_results["rigz"][0]
+                    # Check gzippy compression performance
+                    gzippy_time = comp_results["gzippy"][0]
                     baseline_tool = "gzip" if thread_count == 1 else "pigz"
                     baseline_time = comp_results[baseline_tool][0]
                     
-                    diff_pct = (rigz_time / baseline_time - 1) * 100
+                    diff_pct = (gzippy_time / baseline_time - 1) * 100
                     if diff_pct <= MAX_OVERHEAD_PCT:
                         status = "✓ WIN" if diff_pct < 0 else "✓ OK"
                         results["wins"] += 1
@@ -221,25 +221,25 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                         status = "✗ SLOW"
                         results["losses"] += 1
                     
-                    print(f"\n  rigz vs {baseline_tool}: {diff_pct:+.1f}% {status}")
+                    print(f"\n  gzippy vs {baseline_tool}: {diff_pct:+.1f}% {status}")
                     results["details"].append(f"Compress {size_mb}MB L{level} T{thread_count}: {diff_pct:+.1f}%")
                     
                     # === DECOMPRESSION ===
                     print()
-                    print("Decompression (using rigz-compressed file):")
+                    print("Decompression (using gzippy-compressed file):")
                     
-                    rigz_compressed = comp_files["rigz"]
+                    gzippy_compressed = comp_files["gzippy"]
                     decomp_results = {}
                     
-                    for tool in ["gzip", "pigz", "rigz"]:
+                    for tool in ["gzip", "pigz", "gzippy"]:
                         out_file = tmpdir / f"test.decomp.{tool}.tar"
-                        median, stdev = benchmark_decompress(tool, str(rigz_compressed), str(out_file), runs)
+                        median, stdev = benchmark_decompress(tool, str(gzippy_compressed), str(out_file), runs)
                         decomp_results[tool] = (median, stdev)
                         print(f"  {tool:5}: {format_time(median):>8} ±{format_time(stdev):>6}")
                         out_file.unlink()
                     
-                    # Check rigz decompression performance
-                    rigz_time = decomp_results["rigz"][0]
+                    # Check gzippy decompression performance
+                    gzippy_time = decomp_results["gzippy"][0]
                     # For decompression, compare against gzip (pigz decompression isn't parallelized much)
                     baseline_time = decomp_results["gzip"][0]
                     pigz_time = decomp_results["pigz"][0]
@@ -248,7 +248,7 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                     best_baseline = min(baseline_time, pigz_time)
                     best_name = "gzip" if baseline_time <= pigz_time else "pigz"
                     
-                    diff_pct = (rigz_time / best_baseline - 1) * 100
+                    diff_pct = (gzippy_time / best_baseline - 1) * 100
                     if diff_pct <= MAX_OVERHEAD_PCT:
                         status = "✓ WIN" if diff_pct < 0 else "✓ OK"
                         results["wins"] += 1
@@ -256,7 +256,7 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                         status = "✗ SLOW"
                         results["losses"] += 1
                     
-                    print(f"\n  rigz vs {best_name}: {diff_pct:+.1f}% {status}")
+                    print(f"\n  gzippy vs {best_name}: {diff_pct:+.1f}% {status}")
                     results["details"].append(f"Decompress {size_mb}MB L{level} T{thread_count}: {diff_pct:+.1f}%")
                     
                     # Clean up compressed files
@@ -269,7 +269,7 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Rigz Performance Suite - benchmark compression and decompression"
+        description="Gzippy Performance Suite - benchmark compression and decompression"
     )
     parser.add_argument("--full", action="store_true", 
                        help="Run full suite including 100MB files")
@@ -296,13 +296,13 @@ def main():
             sizes = DEFAULT_SIZES_QUICK
     
     print("=" * 60)
-    print("  Rigz Performance Suite")
+    print("  Gzippy Performance Suite")
     print("=" * 60)
     print()
     print(f"Levels:  {levels}")
     print(f"Threads: {threads}")
     print(f"Sizes:   {sizes} MB")
-    print(f"Target:  rigz within {MAX_OVERHEAD_PCT}% of gzip/pigz")
+    print(f"Target:  gzippy within {MAX_OVERHEAD_PCT}% of gzip/pigz")
     print()
     
     if not check_tools():
@@ -329,7 +329,7 @@ def main():
         print()
         return 1
     else:
-        print("✓ rigz beats or matches gzip/pigz in all tests!")
+        print("✓ gzippy beats or matches gzip/pigz in all tests!")
         return 0
 
 

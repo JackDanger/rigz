@@ -32,7 +32,7 @@ class Colors:
 TOOL_COLORS = {
     "gzip": Colors.BLUE,
     "pigz": Colors.YELLOW,
-    "rigz": Colors.GREEN,
+    "gzippy": Colors.GREEN,
 }
 
 
@@ -82,7 +82,7 @@ def print_compression_chart(results, threads_filter=None):
         max_time = max(t["median_seconds"] for t in tools.values())
         test_size_mb = results.get("test_size_bytes", 0) / (1024 * 1024)
         
-        for tool in ["gzip", "pigz", "rigz"]:
+        for tool in ["gzip", "pigz", "gzippy"]:
             if tool in tools:
                 r = tools[tool]
                 time_s = r["median_seconds"]
@@ -106,11 +106,11 @@ def print_decompression_chart(results, threads_filter=None):
                 by_config[key][r["decompressor"]] = r
     
     for (level, threads, compressor), decomps in sorted(by_config.items()):
-        if compressor != "rigz":
+        if compressor != "gzippy":
             continue
-        print(f"{Colors.BOLD}rigz L{level}@{threads}t → decompressor{Colors.RESET}")
+        print(f"{Colors.BOLD}gzippy L{level}@{threads}t → decompressor{Colors.RESET}")
         max_time = max(d["median_seconds"] for d in decomps.values())
-        for tool in ["gzip", "pigz", "rigz"]:
+        for tool in ["gzip", "pigz", "gzippy"]:
             if tool in decomps:
                 r = decomps[tool]
                 color = TOOL_COLORS.get(tool, "")
@@ -119,8 +119,8 @@ def print_decompression_chart(results, threads_filter=None):
 
 
 def print_speedup_summary(results):
-    """Print speedup summary comparing rigz to others."""
-    print(f"\n{Colors.BOLD}═══ Speedup Summary (rigz vs others) ═══{Colors.RESET}\n")
+    """Print speedup summary comparing gzippy to others."""
+    print(f"\n{Colors.BOLD}═══ Speedup Summary (gzippy vs others) ═══{Colors.RESET}\n")
     
     by_config = defaultdict(dict)
     for r in results["compression"]:
@@ -132,11 +132,11 @@ def print_speedup_summary(results):
     print(f"  {'-'*15} {'-'*12} {'-'*12}")
     
     for (level, threads), tools in sorted(by_config.items()):
-        if "rigz" not in tools:
+        if "gzippy" not in tools:
             continue
-        rigz_time = tools["rigz"]
-        gzip_speedup = tools.get("gzip", rigz_time) / rigz_time if rigz_time > 0 else 0
-        pigz_speedup = tools.get("pigz", rigz_time) / rigz_time if rigz_time > 0 else 0
+        gzippy_time = tools["gzippy"]
+        gzip_speedup = tools.get("gzip", gzippy_time) / gzippy_time if gzippy_time > 0 else 0
+        pigz_speedup = tools.get("pigz", gzippy_time) / gzippy_time if gzippy_time > 0 else 0
         config = f"L{level} {threads}t"
         gzip_color = Colors.GREEN if gzip_speedup > 1 else Colors.RED
         pigz_color = Colors.GREEN if pigz_speedup > 1 else Colors.RED
@@ -167,12 +167,12 @@ def generate_html_chart(results):
             config["tools"][tool] = {"time": time_s, "throughput": throughput}
             all_times.append(time_s)
         
-        if "rigz" in config["tools"] and "gzip" in config["tools"]:
-            config["gzip_speedup"] = config["tools"]["gzip"]["time"] / config["tools"]["rigz"]["time"]
+        if "gzippy" in config["tools"] and "gzip" in config["tools"]:
+            config["gzip_speedup"] = config["tools"]["gzip"]["time"] / config["tools"]["gzippy"]["time"]
         else:
             config["gzip_speedup"] = 1
-        if "rigz" in config["tools"] and "pigz" in config["tools"]:
-            config["pigz_speedup"] = config["tools"]["pigz"]["time"] / config["tools"]["rigz"]["time"]
+        if "gzippy" in config["tools"] and "pigz" in config["tools"]:
+            config["pigz_speedup"] = config["tools"]["pigz"]["time"] / config["tools"]["gzippy"]["time"]
         else:
             config["pigz_speedup"] = 1
         configs.append(config)
@@ -182,7 +182,7 @@ def generate_html_chart(results):
     max_gzip_speedup = max((c["gzip_speedup"] for c in configs if c["threads"] == 1), default=1)
     max_pigz_speedup = max((c["pigz_speedup"] for c in configs), default=1)
     max_throughput = max(
-        (c["tools"]["rigz"]["throughput"] for c in configs if "rigz" in c["tools"]),
+        (c["tools"]["gzippy"]["throughput"] for c in configs if "gzippy" in c["tools"]),
         default=0
     )
     
@@ -197,7 +197,7 @@ def generate_html_chart(results):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>rigz — Fast Parallel Gzip</title>
+    <title>gzippy — Fast Parallel Gzip</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500&family=DM+Sans:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -212,8 +212,8 @@ def generate_html_chart(results):
             --text-muted: #9C948A;
             --gzip: #2C2825;
             --pigz: #7D8B74;
-            --rigz: #C4856A;
-            --rigz-light: #F5E6E0;
+            --gzippy: #C4856A;
+            --gzippy-light: #F5E6E0;
         }}
         
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -255,8 +255,8 @@ def generate_html_chart(results):
         
         .hero-stat {{
             display: inline-block;
-            background: var(--rigz-light);
-            color: var(--rigz);
+            background: var(--gzippy-light);
+            color: var(--gzippy);
             font-family: 'JetBrains Mono', monospace;
             font-weight: 500;
             padding: 0.5rem 1rem;
@@ -292,7 +292,7 @@ def generate_html_chart(results):
         }}
         
         .code-block .prompt {{
-            color: var(--rigz);
+            color: var(--gzippy);
         }}
         
         p {{
@@ -359,7 +359,7 @@ def generate_html_chart(results):
         
         .legend-dot.gzip {{ background: var(--gzip); }}
         .legend-dot.pigz {{ background: var(--pigz); }}
-        .legend-dot.rigz {{ background: var(--rigz); }}
+        .legend-dot.gzippy {{ background: var(--gzippy); }}
         
         /* Dot plot */
         .dot-plot {{
@@ -386,12 +386,12 @@ def generate_html_chart(results):
             color: var(--text-secondary);
         }}
         
-        .row-label .hl {{ color: var(--rigz); font-weight: 500; }}
+        .row-label .hl {{ color: var(--gzippy); font-weight: 500; }}
         
         .dot-track {{
             position: relative;
             height: 24px;
-            background: linear-gradient(to right, var(--rigz-light) 0%, var(--bg-warm) 100%);
+            background: linear-gradient(to right, var(--gzippy-light) 0%, var(--bg-warm) 100%);
             border-radius: 12px;
             margin: 0 0.5rem;
         }}
@@ -410,7 +410,7 @@ def generate_html_chart(results):
         
         .dot.gzip {{ background: var(--gzip); }}
         .dot.pigz {{ background: var(--pigz); }}
-        .dot.rigz {{ background: var(--rigz); }}
+        .dot.gzippy {{ background: var(--gzippy); }}
         
         .dot-label {{
             position: absolute;
@@ -433,7 +433,7 @@ def generate_html_chart(results):
         .speedup-col {{
             text-align: right;
             font-family: 'JetBrains Mono', monospace;
-            color: var(--rigz);
+            color: var(--gzippy);
             font-weight: 500;
         }}
         
@@ -445,7 +445,7 @@ def generate_html_chart(results):
         }}
         
         a {{
-            color: var(--rigz);
+            color: var(--gzippy);
             text-decoration: none;
         }}
         
@@ -478,7 +478,7 @@ def generate_html_chart(results):
 <body>
     <div class="container">
         <header class="hero">
-            <h1>rigz</h1>
+            <h1>gzippy</h1>
             <p class="tagline">Drop-in gzip replacement. Parallel compression in Rust.</p>
             <span class="hero-stat">{max_gzip_speedup:.0f}× faster than gzip</span>
         </header>
@@ -490,7 +490,7 @@ def generate_html_chart(results):
 <span class="prompt">$</span> cargo install --path .
 
 <span class="comment"># Or download a release</span>
-<span class="prompt">$</span> curl -L https://github.com/jackdanger/rigz/releases/latest/download/rigz-$(uname -m) -o rigz
+<span class="prompt">$</span> curl -L https://github.com/jackdanger/gzippy/releases/latest/download/gzippy-$(uname -m) -o gzippy
 </div>
         </section>
         
@@ -499,19 +499,19 @@ def generate_html_chart(results):
             <p>Works exactly like gzip. Same flags, same behavior.</p>
             <div class="usage-grid">
                 <div class="usage-item">
-                    <code class="usage-cmd">rigz file.txt</code>
+                    <code class="usage-cmd">gzippy file.txt</code>
                     <span class="usage-desc">→ file.txt.gz</span>
                 </div>
                 <div class="usage-item">
-                    <code class="usage-cmd">rigz -d file.txt.gz</code>
+                    <code class="usage-cmd">gzippy -d file.txt.gz</code>
                     <span class="usage-desc">decompress</span>
                 </div>
                 <div class="usage-item">
-                    <code class="usage-cmd">tar cf - dir/ | rigz &gt; archive.tar.gz</code>
+                    <code class="usage-cmd">tar cf - dir/ | gzippy &gt; archive.tar.gz</code>
                     <span class="usage-desc">pipe</span>
                 </div>
                 <div class="usage-item">
-                    <code class="usage-cmd">rigz -1</code> / <code class="usage-cmd">-9</code>
+                    <code class="usage-cmd">gzippy -1</code> / <code class="usage-cmd">-9</code>
                     <span class="usage-desc">fast / best</span>
                 </div>
             </div>
@@ -523,7 +523,7 @@ def generate_html_chart(results):
                 Tested on {test_size_str}. Right is faster. Hover for times.
             </p>
             <div class="legend">
-                <div class="legend-item"><div class="legend-dot rigz"></div> rigz</div>
+                <div class="legend-item"><div class="legend-dot gzippy"></div> gzippy</div>
                 <div class="legend-item"><div class="legend-dot pigz"></div> pigz</div>
                 <div class="legend-item"><div class="legend-dot gzip"></div> gzip</div>
             </div>
@@ -533,10 +533,10 @@ def generate_html_chart(results):
         <section>
             <h2>Links</h2>
             <div class="links">
-                <a href="https://github.com/jackdanger/rigz">GitHub</a>
-                <a href="https://github.com/jackdanger/rigz/issues">Issues</a>
-                <a href="https://github.com/jackdanger/rigz/releases">Releases</a>
-                <a href="https://crates.io/crates/rigz">crates.io</a>
+                <a href="https://github.com/jackdanger/gzippy">GitHub</a>
+                <a href="https://github.com/jackdanger/gzippy/issues">Issues</a>
+                <a href="https://github.com/jackdanger/gzippy/releases">Releases</a>
+                <a href="https://crates.io/crates/gzippy">crates.io</a>
             </div>
         </section>
         
@@ -566,7 +566,7 @@ def generate_html_chart(results):
             }}
             
             let dotsHTML = '';
-            for (const tool of ['gzip', 'pigz', 'rigz']) {{
+            for (const tool of ['gzip', 'pigz', 'gzippy']) {{
                 if (tools[tool]) {{
                     const pos = getPosition(tools[tool].time);
                     const time = formatTime(tools[tool].time);

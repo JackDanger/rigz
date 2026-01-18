@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-CI-friendly benchmark script for rigz.
+CI-friendly benchmark script for gzippy.
 
 Runs a single benchmark configuration and outputs JSON results.
 Exits with non-zero code if performance thresholds are not met.
 
 REQUIREMENTS (from .cursorrules):
-- rigz must beat pigz in EVERY configuration. No exceptions.
+- gzippy must beat pigz in EVERY configuration. No exceptions.
 - L1-8: Speed must beat pigz, size within 5%
 - L9: Size must match pigz (within 0.5%), speed can be within 10%
 
@@ -30,14 +30,14 @@ from pathlib import Path
 
 # Performance thresholds by level
 # Design: L1-6 trades size for parallel decompression, L7-9 prioritizes size
-# CRITICAL: rigz must beat pigz overall. Some variance is acceptable.
+# CRITICAL: gzippy must beat pigz overall. Some variance is acceptable.
 #
 # Note: Thresholds account for CI variance (~2% noise on shared runners).
 # A 0% threshold means "no worse than pigz within measurement error".
 def get_thresholds(level: int) -> tuple:
     """Returns (max_time_overhead_pct, max_size_overhead_pct).
     
-    Thresholds are maximums - rigz should generally beat these.
+    Thresholds are maximums - gzippy should generally beat these.
     A small positive threshold (2%) accounts for CI measurement noise.
     """
     if level >= 9:
@@ -69,7 +69,7 @@ def find_tool(name: str) -> str:
     paths = {
         "gzip": ["./gzip/gzip", shutil.which("gzip") or "gzip"],
         "pigz": ["./pigz/pigz"],
-        "rigz": ["./target/release/rigz"],
+        "gzippy": ["./target/release/gzippy"],
     }
     for path in paths.get(name, []):
         if path and os.path.isfile(path) and os.access(path, os.X_OK):
@@ -186,21 +186,21 @@ def benchmark_compress(tool: str, level: int, threads: int,
     bin_path = find_tool(tool)
     
     cmd = [bin_path, f"-{level}"]
-    if tool in ("pigz", "rigz"):
+    if tool in ("pigz", "gzippy"):
         cmd.append(f"-p{threads}")
     cmd.extend(["-c", input_file])
     
-    # Set up environment for rigz debug mode
+    # Set up environment for gzippy debug mode
     env = os.environ.copy()
-    if tool == "rigz" and debug:
-        env["RIGZ_DEBUG"] = "1"
+    if tool == "gzippy" and debug:
+        env["GZIPPY_DEBUG"] = "1"
     
     times = []
     for i in range(runs):
         start = time.perf_counter()
         with open(output_file, 'wb') as f:
             # For debug mode, capture stderr on first run
-            stderr_dest = None if (tool == "rigz" and debug and i == 0) else subprocess.DEVNULL
+            stderr_dest = None if (tool == "gzippy" and debug and i == 0) else subprocess.DEVNULL
             result = subprocess.run(cmd, stdout=f, stderr=stderr_dest, env=env)
         if result.returncode != 0:
             raise RuntimeError(f"{tool} compression failed")
@@ -292,7 +292,7 @@ def get_cpu_info() -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CI benchmark for rigz")
+    parser = argparse.ArgumentParser(description="CI benchmark for gzippy")
     parser.add_argument("--size", type=int, required=True, help="Test file size in MB")
     parser.add_argument("--level", type=int, required=True, help="Compression level (1-9)")
     parser.add_argument("--threads", type=int, required=True, help="Thread count")
@@ -310,7 +310,7 @@ def main():
     parser.add_argument("--show-cpu-info", action="store_true",
                        help="Show CPU info for debugging")
     parser.add_argument("--debug", action="store_true",
-                       help="Enable RIGZ_DEBUG to show timing breakdown")
+                       help="Enable GZIPPY_DEBUG to show timing breakdown")
     
     args = parser.parse_args()
     
@@ -368,7 +368,7 @@ def main():
         # Always benchmark all three tools for complete comparison
         comp_files = {}
         
-        for tool in ["gzip", "pigz", "rigz"]:
+        for tool in ["gzip", "pigz", "gzippy"]:
             out_file = tmpdir / f"test.{tool}.gz"
             try:
                 stats = benchmark_compress(tool, args.level, args.threads,
@@ -388,12 +388,12 @@ def main():
         primary_baseline = "gzip" if args.threads == 1 else "pigz"
         
         # Check compression time vs primary baseline using statistical testing
-        if primary_baseline in results["compression"] and "rigz" in results["compression"]:
+        if primary_baseline in results["compression"] and "gzippy" in results["compression"]:
             baseline_times = results["compression"][primary_baseline]["times"]
-            rigz_times = results["compression"]["rigz"]["times"]
+            gzippy_times = results["compression"]["gzippy"]["times"]
             
             is_ok, overhead_pct, t_stat, df = is_statistically_faster(
-                rigz_times, baseline_times, max_time_overhead
+                gzippy_times, baseline_times, max_time_overhead
             )
             
             results["compression"]["comparison"] = {
@@ -405,23 +405,23 @@ def main():
             }
             
             if not is_ok:
-                error = (f"Compression too slow: rigz is {overhead_pct:+.1f}% vs {primary_baseline} "
+                error = (f"Compression too slow: gzippy is {overhead_pct:+.1f}% vs {primary_baseline} "
                         f"(threshold: {max_time_overhead:+.1f}%, t={t_stat:.2f})")
                 print(f"\n  ❌ FAIL: {error}")
                 results["errors"].append(error)
                 results["passed"] = False
             else:
                 status = f"{-overhead_pct:.1f}% faster" if overhead_pct < 0 else "within threshold"
-                print(f"\n  ✅ PASS: rigz is {status} vs {primary_baseline}")
+                print(f"\n  ✅ PASS: gzippy is {status} vs {primary_baseline}")
         
         # Secondary comparison: always check against pigz too (even in single-thread mode)
-        if args.threads == 1 and "pigz" in results["compression"] and "rigz" in results["compression"]:
+        if args.threads == 1 and "pigz" in results["compression"] and "gzippy" in results["compression"]:
             pigz_times = results["compression"]["pigz"]["times"]
-            rigz_times = results["compression"]["rigz"]["times"]
+            gzippy_times = results["compression"]["gzippy"]["times"]
             pigz_time = results["compression"]["pigz"]["median"]
-            rigz_time = results["compression"]["rigz"]["median"]
+            gzippy_time = results["compression"]["gzippy"]["median"]
             
-            overhead_vs_pigz = (rigz_time / pigz_time - 1) * 100
+            overhead_vs_pigz = (gzippy_time / pigz_time - 1) * 100
             
             results["compression"]["pigz_comparison"] = {
                 "baseline": "pigz",
@@ -430,46 +430,46 @@ def main():
             
             # Info only - don't fail, but report
             status = f"{-overhead_vs_pigz:.1f}% faster" if overhead_vs_pigz < 0 else f"{overhead_vs_pigz:+.1f}% slower"
-            print(f"  (vs pigz: rigz is {status})")
+            print(f"  (vs pigz: gzippy is {status})")
         
         # Always check compression ratio (important for L9)
-        if primary_baseline in comp_files and "rigz" in comp_files:
+        if primary_baseline in comp_files and "gzippy" in comp_files:
             baseline_size = results["compression"][primary_baseline]["output_size"]
-            rigz_size = results["compression"]["rigz"]["output_size"]
-            ratio_overhead = (rigz_size / baseline_size - 1) * 100
+            gzippy_size = results["compression"]["gzippy"]["output_size"]
+            ratio_overhead = (gzippy_size / baseline_size - 1) * 100
             
             results["compression"]["ratio_comparison"] = {
                 "baseline": primary_baseline,
                 "baseline_size": baseline_size,
-                "rigz_size": rigz_size,
+                "gzippy_size": gzippy_size,
                 "overhead_pct": ratio_overhead,
                 "threshold_pct": max_ratio_overhead,
             }
             
             if ratio_overhead > max_ratio_overhead:
                 if max_ratio_overhead < 0:
-                    error = (f"Compression ratio not good enough: rigz is {ratio_overhead:+.1f}% vs {primary_baseline} "
+                    error = (f"Compression ratio not good enough: gzippy is {ratio_overhead:+.1f}% vs {primary_baseline} "
                             f"(must be at least {-max_ratio_overhead:.1f}% smaller)")
                 else:
-                    error = (f"Compression ratio too poor: rigz output is {ratio_overhead:+.1f}% larger "
+                    error = (f"Compression ratio too poor: gzippy output is {ratio_overhead:+.1f}% larger "
                             f"than {primary_baseline} (threshold: {max_ratio_overhead:+.1f}%)")
                 print(f"  ❌ FAIL: {error}")
                 results["errors"].append(error)
                 results["passed"] = False
             else:
                 status = f"{-ratio_overhead:.1f}% smaller" if ratio_overhead < 0 else "same size"
-                print(f"  ✅ PASS: rigz output is {status} vs {primary_baseline}")
+                print(f"  ✅ PASS: gzippy output is {status} vs {primary_baseline}")
         
         # === DECOMPRESSION BENCHMARKS ===
-        print("\nDecompression (rigz-compressed file):")
+        print("\nDecompression (gzippy-compressed file):")
         
-        if "rigz" in comp_files:
-            rigz_compressed = comp_files["rigz"]
+        if "gzippy" in comp_files:
+            gzippy_compressed = comp_files["gzippy"]
             decomp_out = tmpdir / "decompressed.txt"
             
-            for tool in ["gzip", "pigz", "rigz"]:
+            for tool in ["gzip", "pigz", "gzippy"]:
                 try:
-                    stats = benchmark_decompress(tool, str(rigz_compressed),
+                    stats = benchmark_decompress(tool, str(gzippy_compressed),
                                                 str(decomp_out), runs)
                     results["decompression"][tool] = stats
                     print(f"  {tool:5}: {stats['median']:.3f}s (±{stats['stdev']:.3f}s)")
@@ -481,7 +481,7 @@ def main():
             
             # Check decompression time using statistical testing
             decomp_tools = results["decompression"]
-            if "gzip" in decomp_tools and "pigz" in decomp_tools and "rigz" in decomp_tools:
+            if "gzip" in decomp_tools and "pigz" in decomp_tools and "gzippy" in decomp_tools:
                 gzip_time = decomp_tools["gzip"]["median"]
                 pigz_time = decomp_tools["pigz"]["median"]
                 
@@ -492,10 +492,10 @@ def main():
                     baseline_tool = "pigz"
                     baseline_times = decomp_tools["pigz"]["times"]
                 
-                rigz_times = decomp_tools["rigz"]["times"]
+                gzippy_times = decomp_tools["gzippy"]["times"]
                 
                 is_ok, overhead_pct, t_stat, df = is_statistically_faster(
-                    rigz_times, baseline_times, max_time_overhead
+                    gzippy_times, baseline_times, max_time_overhead
                 )
                 
                 results["decompression"]["comparison"] = {
@@ -507,14 +507,14 @@ def main():
                 }
                 
                 if not is_ok:
-                    error = (f"Decompression too slow: rigz is {overhead_pct:+.1f}% vs {baseline_tool} "
+                    error = (f"Decompression too slow: gzippy is {overhead_pct:+.1f}% vs {baseline_tool} "
                             f"(threshold: {max_time_overhead:+.1f}%, t={t_stat:.2f})")
                     print(f"\n  ❌ FAIL: {error}")
                     results["errors"].append(error)
                     results["passed"] = False
                 else:
                     status = f"{-overhead_pct:.1f}% faster" if overhead_pct < 0 else "at threshold"
-                    print(f"\n  ✅ PASS: rigz decompression is {status} vs {baseline_tool}")
+                    print(f"\n  ✅ PASS: gzippy decompression is {status} vs {baseline_tool}")
     
     # Write results
     with open(args.output, 'w') as f:

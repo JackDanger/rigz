@@ -1,10 +1,10 @@
 #!/bin/bash
 #
-# Build Debian packages for rigz
+# Build Debian packages for gzippy
 #
 # This script builds two packages:
-#   - rigz: The main package with rigz and unrigz commands
-#   - rigz-replace-gzip: Optional package that replaces system gzip
+#   - gzippy: The main package with gzippy and ungzippy commands
+#   - gzippy-replace-gzip: Optional package that replaces system gzip
 #
 # Prerequisites:
 #   sudo apt install debhelper cargo rustc devscripts
@@ -13,14 +13,14 @@
 #   ./scripts/build-deb.sh
 #
 # Output:
-#   ../rigz_0.1.0-1_amd64.deb
-#   ../rigz-replace-gzip_0.1.0-1_all.deb
+#   ../gzippy_0.1.0-1_amd64.deb
+#   ../gzippy-replace-gzip_0.1.0-1_all.deb
 
 set -e
 
 cd "$(dirname "$0")/.."
 
-echo "=== Building rigz Debian packages ==="
+echo "=== Building gzippy Debian packages ==="
 echo ""
 
 # Check for required tools
@@ -35,7 +35,7 @@ done
 # Clean previous builds
 echo "Cleaning previous builds..."
 cargo clean 2>/dev/null || true
-rm -rf debian/.debhelper debian/rigz debian/rigz-replace-gzip
+rm -rf debian/.debhelper debian/gzippy debian/gzippy-replace-gzip
 rm -f debian/files debian/*.substvars debian/*.debhelper.log
 
 # Build the packages
@@ -46,13 +46,13 @@ echo ""
 echo "=== Build complete ==="
 echo ""
 echo "Packages created in parent directory:"
-ls -la ../rigz*.deb 2>/dev/null || echo "  (no .deb files found)"
+ls -la ../gzippy*.deb 2>/dev/null || echo "  (no .deb files found)"
 echo ""
-echo "To install rigz only:"
-echo "  sudo dpkg -i ../rigz_*.deb"
+echo "To install gzippy only:"
+echo "  sudo dpkg -i ../gzippy_*.deb"
 echo ""
 echo "To also replace system gzip:"
-echo "  sudo dpkg -i ../rigz_*.deb ../rigz-replace-gzip_*.deb"
+echo "  sudo dpkg -i ../gzippy_*.deb ../gzippy-replace-gzip_*.deb"
 echo ""
 echo "To uninstall:"
-echo "  sudo apt remove rigz-replace-gzip rigz"
+echo "  sudo apt remove gzippy-replace-gzip gzippy"

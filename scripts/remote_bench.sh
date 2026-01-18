@@ -1,5 +1,5 @@
 #!/bin/bash
-# Remote benchmark script for rigz on x86_64 Linux
+# Remote benchmark script for gzippy on x86_64 Linux
 #
 # Usage:
 #   ./scripts/remote_bench.sh                    # Run benchmark on current HEAD
@@ -11,7 +11,7 @@ set -e
 
 REMOTE="root@10.30.0.199"
 JUMP="-J neurotic"
-REPO_DIR="/root/rigz"
+REPO_DIR="/root/gzippy"
 
 # Colors for output
 RED='\033[0;31m'
@@ -55,7 +55,7 @@ if [[ -n "$CUSTOM_CMD" ]]; then
 fi
 
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}  rigz Remote Benchmark (x86_64 Linux)${NC}"
+echo -e "${BLUE}  gzippy Remote Benchmark (x86_64 Linux)${NC}"
 echo -e "${BLUE}========================================${NC}"
 
 # Show machine info
@@ -78,7 +78,7 @@ remote "cargo build --release 2>&1 | tail -3"
 
 # Verify binary works
 echo -e "\n${YELLOW}Verifying binary:${NC}"
-remote "./target/release/rigz --version"
+remote "./target/release/gzippy --version"
 
 # Generate test data if needed
 echo -e "\n${YELLOW}Preparing test data...${NC}"
@@ -116,31 +116,31 @@ def bench(cmd, runs=$RUNS):
 
 # Compression benchmark
 pigz_med, pigz_std = bench('./pigz/pigz -${level} -p${threads} -c test_data/${file} > /tmp/pigz.gz')
-rigz_med, rigz_std = bench('./target/release/rigz -${level} -p${threads} -c test_data/${file} > /tmp/rigz.gz')
+gzippy_med, gzippy_std = bench('./target/release/gzippy -${level} -p${threads} -c test_data/${file} > /tmp/gzippy.gz')
 
-overhead = (rigz_med / pigz_med - 1) * 100
+overhead = (gzippy_med / pigz_med - 1) * 100
 status = '✅' if overhead <= 5.0 else '❌'
 
 print(f'Compression:')
 print(f'  pigz: {pigz_med:.3f}s (±{pigz_std:.3f}s)')
-print(f'  rigz: {rigz_med:.3f}s (±{rigz_std:.3f}s)')
+print(f'  gzippy: {gzippy_med:.3f}s (±{gzippy_std:.3f}s)')
 print(f'  {status} overhead: {overhead:+.1f}%')
 
 # Size comparison
 pigz_size = os.path.getsize('/tmp/pigz.gz')
-rigz_size = os.path.getsize('/tmp/rigz.gz')
-size_diff = (rigz_size / pigz_size - 1) * 100
-print(f'Size: pigz={pigz_size:,} rigz={rigz_size:,} ({size_diff:+.2f}%)')
+gzippy_size = os.path.getsize('/tmp/gzippy.gz')
+size_diff = (gzippy_size / pigz_size - 1) * 100
+print(f'Size: pigz={pigz_size:,} gzippy={gzippy_size:,} ({size_diff:+.2f}%)')
 
 # Decompression benchmark
-gzip_med, _ = bench('gzip -dc /tmp/rigz.gz > /dev/null')
-pigz_dec, _ = bench('./pigz/pigz -dc /tmp/rigz.gz > /dev/null')
-rigz_dec, _ = bench('./target/release/rigz -d /tmp/rigz.gz -c > /dev/null')
+gzip_med, _ = bench('gzip -dc /tmp/gzippy.gz > /dev/null')
+pigz_dec, _ = bench('./pigz/pigz -dc /tmp/gzippy.gz > /dev/null')
+gzippy_dec, _ = bench('./target/release/gzippy -d /tmp/gzippy.gz -c > /dev/null')
 
-print(f'Decompression (rigz file):')
-print(f'  gzip: {gzip_med:.3f}s, pigz: {pigz_dec:.3f}s, rigz: {rigz_dec:.3f}s')
-speedup = (pigz_dec / rigz_dec - 1) * 100 if rigz_dec > 0 else 0
-print(f'  rigz vs pigz: {speedup:+.1f}%')
+print(f'Decompression (gzippy file):')
+print(f'  gzip: {gzip_med:.3f}s, pigz: {pigz_dec:.3f}s, gzippy: {gzippy_dec:.3f}s')
+speedup = (pigz_dec / gzippy_dec - 1) * 100 if gzippy_dec > 0 else 0
+print(f'  gzippy vs pigz: {speedup:+.1f}%')
 \""
 }
 

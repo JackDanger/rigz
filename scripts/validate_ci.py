@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Comprehensive CI validation for rigz.
+Comprehensive CI validation for gzippy.
 
-Tests rigz against gzip and pigz across:
+Tests gzippy against gzip and pigz across:
 - Multiple data types (text, random, tarball)
 - Multiple compression levels (1, 6, 9)
 - Multiple thread counts (1, max)
@@ -40,8 +40,8 @@ def find_tool(name: str) -> str:
     paths = {
         "gzip": ["./gzip/gzip", shutil.which("gzip") or "gzip"],
         "pigz": ["./pigz/pigz"],
-        "rigz": ["./target/release/rigz"],
-        "unrigz": ["./target/release/unrigz"],
+        "gzippy": ["./target/release/gzippy"],
+        "ungzippy": ["./target/release/ungzippy"],
     }
     for path in paths.get(name, []):
         if path and os.path.isfile(path) and os.access(path, os.X_OK):
@@ -175,7 +175,7 @@ def compress_once(tool: str, level: int, threads: int, input_file: str, output_f
     """Compress once, return (success, elapsed)."""
     bin_path = find_tool(tool)
     cmd = [bin_path, f"-{level}"]
-    if tool in ("pigz", "rigz"):
+    if tool in ("pigz", "gzippy"):
         cmd.append(f"-p{threads}")
     cmd.extend(["-c", input_file])
     
@@ -351,26 +351,26 @@ def run_validation(
     return results
 
 
-def test_unrigz(tmpdir: Path, test_file: Path, trials: int) -> Dict:
-    """Test unrigz symlink."""
+def test_ungzippy(tmpdir: Path, test_file: Path, trials: int) -> Dict:
+    """Test ungzippy symlink."""
     try:
-        unrigz = find_tool("unrigz")
+        ungzippy = find_tool("ungzippy")
     except FileNotFoundError:
-        return {"passed": False, "error": "unrigz not found"}
+        return {"passed": False, "error": "ungzippy not found"}
     
-    # Compress with rigz
-    compressed = tmpdir / "unrigz_test.gz"
-    ok, _ = compress_once("rigz", 6, 1, str(test_file), str(compressed))
+    # Compress with gzippy
+    compressed = tmpdir / "ungzippy_test.gz"
+    ok, _ = compress_once("gzippy", 6, 1, str(test_file), str(compressed))
     if not ok:
         return {"passed": False, "error": "compression failed"}
     
-    # Decompress with unrigz
-    output = tmpdir / "unrigz_test.bin"
+    # Decompress with ungzippy
+    output = tmpdir / "ungzippy_test.bin"
     times = []
     for _ in range(trials):
         start = time.perf_counter()
         with open(output, "wb") as f:
-            result = subprocess.run([unrigz, "-c", str(compressed)], stdout=f, stderr=subprocess.DEVNULL)
+            result = subprocess.run([ungzippy, "-c", str(compressed)], stdout=f, stderr=subprocess.DEVNULL)
         times.append(time.perf_counter() - start)
         
         if result.returncode != 0:
@@ -386,7 +386,7 @@ def test_unrigz(tmpdir: Path, test_file: Path, trials: int) -> Dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Comprehensive rigz validation")
+    parser = argparse.ArgumentParser(description="Comprehensive gzippy validation")
     parser.add_argument("--size", type=int, default=DEFAULT_SIZE_MB,
                        help=f"Test file size in MB (default: {DEFAULT_SIZE_MB})")
     parser.add_argument("--trials", type=int, default=DEFAULT_TRIALS,
@@ -401,10 +401,10 @@ def main():
     levels = [int(x) for x in args.levels.split(",")]
     max_threads = os.cpu_count() or 2
     thread_counts = [1, max_threads] if max_threads > 1 else [1]
-    tools = ["gzip", "pigz", "rigz"]
+    tools = ["gzip", "pigz", "gzippy"]
     
     print("=" * 60)
-    print("  rigz Comprehensive Validation Suite")
+    print("  gzippy Comprehensive Validation Suite")
     print("=" * 60)
     print(f"  Size:    {args.size}MB per data type")
     print(f"  Trials:  {args.trials} per test")
@@ -430,25 +430,25 @@ def main():
         # Add metadata
         results["config"]["size_mb"] = args.size
         
-        # Test unrigz
+        # Test ungzippy
         print(f"\n{'='*60}")
-        print("  Testing unrigz symlink...")
+        print("  Testing ungzippy symlink...")
         print(f"{'='*60}")
         
-        # Use the text file for unrigz test
+        # Use the text file for ungzippy test
         if "text" in test_files:
-            unrigz_result = test_unrigz(tmpdir, test_files["text"], args.trials)
-            if unrigz_result["passed"]:
-                print(f"  ✅ unrigz: OK ({format_time(unrigz_result.get('median_time', 0))})")
+            ungzippy_result = test_ungzippy(tmpdir, test_files["text"], args.trials)
+            if ungzippy_result["passed"]:
+                print(f"  ✅ ungzippy: OK ({format_time(ungzippy_result.get('median_time', 0))})")
                 results["passed"] += 1
             else:
-                print(f"  ❌ unrigz: {unrigz_result.get('error', 'unknown error')}")
+                print(f"  ❌ ungzippy: {ungzippy_result.get('error', 'unknown error')}")
                 results["failed"] += 1
-                results["errors"].append(f"unrigz: {unrigz_result.get('error')}")
+                results["errors"].append(f"ungzippy: {ungzippy_result.get('error')}")
             
             results["tests"].append({
-                "tool": "unrigz",
-                **unrigz_result
+                "tool": "ungzippy",
+                **ungzippy_result
             })
     
     # Summary

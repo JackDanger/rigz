@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Cross-tool validation matrix for rigz.
+Cross-tool validation matrix for gzippy.
 
-Tests that rigz produces gzip-compatible output by:
+Tests that gzippy produces gzip-compatible output by:
 1. Creating a tarball from the repo
 2. Compressing at multiple levels with multiple thread counts
-3. Decompressing with gzip, pigz, and rigz
+3. Decompressing with gzip, pigz, and gzippy
 4. Verifying all outputs are byte-identical
 
 Uses adaptive trial count (3-10) with statistical convergence detection.
@@ -27,7 +27,7 @@ import shutil
 
 # Adaptive trial configuration
 MIN_TRIALS = 3
-MAX_TRIALS = 15
+MAX_TRIALS = 17
 # Coefficient of variation threshold for "stable" results (5%)
 CV_THRESHOLD = 0.05
 
@@ -40,13 +40,13 @@ def find_gzip():
 
 GZIP = find_gzip()
 PIGZ = "./pigz/pigz"
-RIGZ = "./target/release/rigz"
-UNRIGZ = "./target/release/unrigz"
+GZIPPY = "./target/release/gzippy"
+UNGZIPPY = "./target/release/ungzippy"
 
 # Test matrix
 LEVELS = [1, 6, 9]
 THREADS = [1, 4]
-TOOLS = ["gzip", "pigz", "rigz"]
+TOOLS = ["gzip", "pigz", "gzippy"]
 
 
 def run(cmd, capture=False):
@@ -61,7 +61,7 @@ def run(cmd, capture=False):
 
 def get_tool_path(tool):
     """Get the binary path for a tool."""
-    return {"gzip": GZIP, "pigz": PIGZ, "rigz": RIGZ}[tool]
+    return {"gzip": GZIP, "pigz": PIGZ, "gzippy": GZIPPY}[tool]
 
 
 def robust_stats(times):
@@ -131,7 +131,7 @@ def compress_once(tool, level, threads, input_file, output_file):
     """Compress a file once. Returns (success, elapsed_time)."""
     bin_path = get_tool_path(tool)
     cmd = [bin_path, f"-{level}"]
-    if tool in ("pigz", "rigz"):
+    if tool in ("pigz", "gzippy"):
         cmd.append(f"-p{threads}")
     cmd.extend(["-c", input_file])
     
@@ -209,7 +209,7 @@ def format_stats(times):
 
 def check_tools():
     """Verify all tools exist and are executable."""
-    tools = [GZIP, PIGZ, RIGZ, UNRIGZ]
+    tools = [GZIP, PIGZ, GZIPPY, UNGZIPPY]
     missing = [t for t in tools if not os.path.isfile(t)]
     if missing:
         print("Missing tools:")
@@ -357,27 +357,27 @@ def run_validation(output_json=False):
                 if not output_json:
                     print()
         
-        # Test unrigz symlink
+        # Test ungzippy symlink
         if not output_json:
-            print("Testing unrigz symlink...")
-        rigz_file = tmpdir / "test.rigz.gz"
-        success, _, _ = compress("rigz", 6, 4, str(tarball), str(rigz_file))
+            print("Testing ungzippy symlink...")
+        gzippy_file = tmpdir / "test.gzippy.gz"
+        success, _, _ = compress("gzippy", 6, 4, str(tarball), str(gzippy_file))
         if success:
-            unrigz_out = tmpdir / "test.unrigz.tar"
+            ungzippy_out = tmpdir / "test.ungzippy.tar"
             success, median_time, times = run_adaptive(
-                lambda: decompress_once_unrigz(str(rigz_file), str(unrigz_out))
+                lambda: decompress_once_ungzippy(str(gzippy_file), str(ungzippy_out))
             )
             
-            correct = success and files_identical(str(tarball), str(unrigz_out))
+            correct = success and files_identical(str(tarball), str(ungzippy_out))
             if correct:
                 if not output_json:
                     stats_str = format_stats(times)
-                    print(f"  ✓ unrigz             {stats_str}")
+                    print(f"  ✓ ungzippy             {stats_str}")
                 passed += 1
             else:
                 if not output_json:
                     stats_str = format_stats(times)
-                    print(f"  ✗ unrigz             {stats_str}  FAILED")
+                    print(f"  ✗ ungzippy             {stats_str}  FAILED")
                 failed += 1
     
     if not output_json:
@@ -390,9 +390,9 @@ def run_validation(output_json=False):
     return results, passed, failed
 
 
-def decompress_once_unrigz(input_file, output_file):
-    """Decompress using unrigz."""
-    cmd = [UNRIGZ, "-c", input_file]
+def decompress_once_ungzippy(input_file, output_file):
+    """Decompress using ungzippy."""
+    cmd = [UNGZIPPY, "-c", input_file]
     start = time.perf_counter()
     with open(output_file, "wb") as f:
         result = subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
@@ -401,7 +401,7 @@ def decompress_once_unrigz(input_file, output_file):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Cross-tool validation for rigz")
+    parser = argparse.ArgumentParser(description="Cross-tool validation for gzippy")
     parser.add_argument("--json", action="store_true", help="Output results as JSON")
     parser.add_argument("--output", "-o", help="Output file for JSON results")
     args = parser.parse_args()
