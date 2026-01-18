@@ -184,16 +184,18 @@ fn decompress_gzip_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> RigzResu
         return Ok(0);
     }
 
+    // Check for BGZF-style markers FIRST (rigz output with embedded block sizes)
+    // This check is fast (only looks at first header) and must come before
+    // is_multi_member_quick which only scans 256KB - not enough for random data
+    // where the first block can be >256KB
+    if has_bgzf_markers(data) {
+        return decompress_bgzf_parallel(data, writer);
+    }
+
     // Fast path: check if this is likely multi-member (from parallel compression)
     // Only scan first 256KB - if no second header found, use direct single-member path
     if !is_multi_member_quick(data) {
         return decompress_single_member_libdeflate(data, writer);
-    }
-
-    // Check for BGZF-style markers (rigz output with embedded block sizes)
-    // These allow parallel decompression without scanning for boundaries
-    if has_bgzf_markers(data) {
-        return decompress_bgzf_parallel(data, writer);
     }
 
     // Multi-member file without markers: use zlib-ng sequential
