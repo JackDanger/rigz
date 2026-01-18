@@ -161,6 +161,21 @@ panic = "abort"
 strip = true
 ```
 
+## Pre-commit Checks
+
+A pre-commit hook at `.git/hooks/pre-commit` runs:
+1. `cargo fmt --check` - fails if code isn't formatted
+2. `cargo clippy --all-targets --all-features -- -D warnings` - fails on any warning
+
+To skip (emergency only): `git commit --no-verify`
+
+### Common Clippy Issues to Avoid
+- Use `.clamp(min, max)` instead of `.max(min).min(max)`
+- Use `const { }` for thread_local initializers
+- Use `.unwrap_or_default()` instead of `.unwrap_or(T::default())`
+- Use `.iter()` instead of `for i in 0..len { vec[i] }`
+- Use `io::Error::other()` instead of `io::Error::new(Other, ...)`
+
 ## File Organization
 
 | File | Purpose |
