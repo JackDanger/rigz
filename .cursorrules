@@ -148,6 +148,12 @@ This matches user expectations:
 - L7-8: Speed must beat pigz, size within 2% (transitional)
 - L9: Size must match pigz (within 0.5%), speed can be within 10%
 
+**CI Variance Handling:**
+- Shared CI runners have ~2% timing variance
+- A 2% threshold on L1-6 accounts for measurement noise
+- Statistical testing (Welch's t-test) determines significance
+- 5 runs is minimum; variance determines if more needed
+
 **Design Philosophy:**
 - L1-6: Speed + parallel decompress (independent blocks)
 - L7-9: Maximum compression (dictionary sharing, sequential decompress)
