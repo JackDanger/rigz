@@ -20,8 +20,8 @@ use flate2::write::GzEncoder;
 use flate2::{Compress, Compression, FlushCompress, Status};
 use std::cell::{RefCell, UnsafeCell};
 use std::io::{self, Read, Write};
-use std::path::Path;
 use std::mem::MaybeUninit;
+use std::path::Path;
 
 // Thread-local Compress object to avoid reinitializing zlib state (~300KB) per block
 // Note: We store Option<(level, Compress)> to cache by level
@@ -160,7 +160,7 @@ impl PipelinedGzEncoder {
             |block_idx, block, dict, is_last, output| {
                 // Compress this block with dictionary
                 compress_block_with_dict(block, dict, level, block_size, is_last, output);
-                
+
                 // Compute CRC for this block
                 let mut hasher = crc32fast::Hasher::new();
                 hasher.update(block);

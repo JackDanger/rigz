@@ -370,21 +370,19 @@ where
     thread::scope(|scope| {
         // Spawn workers
         for _ in 0..num_threads {
-            scope.spawn(|| {
-                loop {
-                    let block_idx = next_block.fetch_add(1, Ordering::Relaxed);
-                    if block_idx >= num_blocks {
-                        break;
-                    }
-
-                    let start = block_idx * block_size;
-                    let end = (start + block_size).min(input.len());
-                    let block = &input[start..end];
-
-                    let output = unsafe { slots[block_idx].data_mut() };
-                    compress_fn(block, output);
-                    slots[block_idx].mark_ready();
+            scope.spawn(|| loop {
+                let block_idx = next_block.fetch_add(1, Ordering::Relaxed);
+                if block_idx >= num_blocks {
+                    break;
                 }
+
+                let start = block_idx * block_size;
+                let end = (start + block_size).min(input.len());
+                let block = &input[start..end];
+
+                let output = unsafe { slots[block_idx].data_mut() };
+                compress_fn(block, output);
+                slots[block_idx].mark_ready();
             });
         }
 
@@ -431,8 +429,8 @@ mod tests {
 
         compress_parallel(
             &input,
-            10,   // 10-byte blocks
-            4,    // 4 threads
+            10, // 10-byte blocks
+            4,  // 4 threads
             &mut output,
             |_idx, block, _dict, _is_last, out| {
                 // Add artificial delay for odd blocks to scramble completion order

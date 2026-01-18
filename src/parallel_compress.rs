@@ -241,7 +241,7 @@ fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compressio
         0x1f, 0x8b, // Magic
         0x08, // Compression method (deflate)
         0x04, // Flags: FEXTRA
-        0, 0, 0, 0, // MTIME (zero)
+        0, 0, 0, 0,    // MTIME (zero)
         0x00, // XFL (no extra flags)
         0xff, // OS (unknown)
     ]);
