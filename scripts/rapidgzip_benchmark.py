@@ -74,28 +74,40 @@ def check_rapidgzip() -> bool:
 def download_silesia(work_dir: Path) -> Path:
     """Download and extract the Silesia corpus."""
     silesia_zip = work_dir / "silesia.zip"
-    silesia_dir = work_dir / "silesia"
     silesia_tar = work_dir / "silesia.tar"
     
-    if silesia_tar.exists():
+    # The silesia files (not in a subdirectory)
+    silesia_files = ["dickens", "mozilla", "mr", "nci", "ooffice", "osdb", 
+                     "reymont", "samba", "sao", "webster", "x-ray", "xml"]
+    
+    if silesia_tar.exists() and silesia_tar.stat().st_size > 0:
         print(f"Using existing {silesia_tar}")
         return silesia_tar
+    
+    # Remove empty tar file if it exists
+    if silesia_tar.exists() and silesia_tar.stat().st_size == 0:
+        silesia_tar.unlink()
     
     if not silesia_zip.exists():
         print(f"Downloading Silesia corpus from {SILESIA_URL}...")
         urllib.request.urlretrieve(SILESIA_URL, silesia_zip)
         print(f"Downloaded to {silesia_zip}")
     
-    if not silesia_dir.exists():
+    # Check if files are already extracted (silesia zip extracts to current dir)
+    first_file = work_dir / silesia_files[0]
+    if not first_file.exists():
         print(f"Extracting {silesia_zip}...")
         with zipfile.ZipFile(silesia_zip, 'r') as zf:
             zf.extractall(work_dir)
-        print(f"Extracted to {silesia_dir}")
+        print(f"Extracted {len(silesia_files)} files to {work_dir}")
     
-    # Create a tarball
+    # Create a tarball of all silesia files
     print(f"Creating {silesia_tar}...")
     with tarfile.open(silesia_tar, 'w') as tf:
-        tf.add(silesia_dir, arcname="silesia")
+        for fname in silesia_files:
+            fpath = work_dir / fname
+            if fpath.exists():
+                tf.add(fpath, arcname=f"silesia/{fname}")
     print(f"Created {silesia_tar}: {silesia_tar.stat().st_size / 1024 / 1024:.1f} MB")
     
     return silesia_tar
