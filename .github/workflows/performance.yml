@@ -58,19 +58,13 @@ jobs:
           echo "Running with $THREADS threads"
           # Strict thresholds: rigz must beat pigz everywhere
           # L1-8: Speed must beat pigz (0% overhead), size within 5%
-          # L9: Size must match pigz (0.5%), speed within 10%
-          # Enable debug for L9 to diagnose GHA slowdown
-          DEBUG_FLAG=""
-          if [ "${{ matrix.level }}" = "9" ]; then
-            DEBUG_FLAG="--debug"
-          fi
+          # L9: Size must match pigz (0.5%), speed within 5%
           python3 scripts/benchmark_ci.py \
             --size ${{ matrix.size }} \
             --level ${{ matrix.level }} \
             --threads $THREADS \
             --data-type text \
-            --output benchmark-results.json \
-            $DEBUG_FLAG
+            --output benchmark-results.json
 
       - name: Upload results
         uses: actions/upload-artifact@v4
@@ -117,18 +111,12 @@ jobs:
           
           # Strict thresholds based on level
           # L9 gets special treatment (size priority)
-          # Enable debug for L9 to diagnose GHA slowdown
-          DEBUG_FLAG=""
-          if [ "${{ matrix.level }}" = "9" ]; then
-            DEBUG_FLAG="--debug"
-          fi
           python3 scripts/benchmark_ci.py \
             --size 10 \
             --level ${{ matrix.level }} \
             --threads $THREADS \
             --data-type text \
-            --output ratio-results.json \
-            $DEBUG_FLAG
+            --output ratio-results.json
 
   # Test random (incompressible) data to catch edge cases
   # This is critical - random data with L1 multi-thread previously had a bug
@@ -177,7 +165,7 @@ jobs:
   summary:
     name: Performance Summary
     runs-on: ubuntu-latest
-    needs: [benchmark, compression-ratio]
+    needs: [benchmark, compression-ratio, random-data]
     if: always()
 
     steps:
