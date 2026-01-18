@@ -18,9 +18,15 @@ use crate::parallel_compress::adjust_compression_level;
 use flate2::write::GzEncoder;
 use flate2::{Compress, Compression, FlushCompress, Status};
 use rayon::prelude::*;
+use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::OnceLock;
+
+// Thread-local output buffer to avoid per-block allocation
+thread_local! {
+    static PIPELINED_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(512 * 1024));
+}
 
 /// Block size for pipelined compression
 /// 128KB is the default for pigz at lower levels.
@@ -289,9 +295,8 @@ impl PipelinedGzEncoder {
 
 /// Compress a single block with optional dictionary
 ///
-/// Pre-allocates output buffer based on block_size to avoid resizing.
-/// For highly compressible data, the output is typically 40-60% of input.
-/// We allocate generously to avoid any resizing during compression.
+/// Uses thread-local buffer to avoid per-block allocation.
+/// The buffer is reused across blocks within the same thread.
 fn compress_block_with_dict(
     block: &[u8],
     dict: Option<&[u8]>,
@@ -299,53 +304,63 @@ fn compress_block_with_dict(
     is_last: bool,
     block_size: usize,
 ) -> Vec<u8> {
-    let mut compress = Compress::new(Compression::new(level), false);
+    PIPELINED_BUF.with(|buf_cell| {
+        let mut output = buf_cell.borrow_mut();
+        output.clear();
 
-    // Set dictionary if provided
-    if let Some(d) = dict {
-        let _ = compress.set_dictionary(d);
-    }
-
-    let flush = if is_last {
-        FlushCompress::Finish
-    } else {
-        FlushCompress::Sync
-    };
-
-    // Pre-allocate based on block size (worst case: uncompressible data grows ~0.1%)
-    // Using block_size + 10% + 1KB for headers/sync markers
-    let initial_capacity = block_size + (block_size / 10) + 1024;
-    let mut output = vec![0u8; initial_capacity];
-    let mut total_out = 0;
-    let mut input = block;
-
-    loop {
-        let before_in = compress.total_in();
-        let before_out = compress.total_out();
-
-        let status = compress
-            .compress(input, &mut output[total_out..], flush)
-            .expect("compression failed");
-
-        let consumed = (compress.total_in() - before_in) as usize;
-        let produced = (compress.total_out() - before_out) as usize;
-
-        total_out += produced;
-        input = &input[consumed..];
-
-        match status {
-            Status::Ok if input.is_empty() && flush != FlushCompress::Finish => break,
-            Status::BufError => {
-                // Need more output space (rare case for incompressible data)
-                output.resize(output.len() * 2, 0);
-            }
-            Status::StreamEnd => break,
-            _ => {}
+        // Ensure buffer is large enough (block_size + 10% + 1KB for headers)
+        let initial_capacity = block_size + (block_size / 10) + 1024;
+        let current_capacity = output.capacity();
+        if current_capacity < initial_capacity {
+            output.reserve(initial_capacity - current_capacity);
         }
-    }
+        output.resize(initial_capacity, 0);
 
-    output.truncate(total_out);
-    output
+        let mut compress = Compress::new(Compression::new(level), false);
+
+        // Set dictionary if provided
+        if let Some(d) = dict {
+            let _ = compress.set_dictionary(d);
+        }
+
+        let flush = if is_last {
+            FlushCompress::Finish
+        } else {
+            FlushCompress::Sync
+        };
+
+        let mut total_out = 0;
+        let mut input = block;
+
+        loop {
+            let before_in = compress.total_in();
+            let before_out = compress.total_out();
+
+            let status = compress
+                .compress(input, &mut output[total_out..], flush)
+                .expect("compression failed");
+
+            let consumed = (compress.total_in() - before_in) as usize;
+            let produced = (compress.total_out() - before_out) as usize;
+
+            total_out += produced;
+            input = &input[consumed..];
+
+            match status {
+                Status::Ok if input.is_empty() && flush != FlushCompress::Finish => break,
+                Status::BufError => {
+                    // Need more output space (rare case for incompressible data)
+                    let new_len = output.len() * 2;
+                    output.resize(new_len, 0);
+                }
+                Status::StreamEnd => break,
+                _ => {}
+            }
+        }
+
+        // Return a copy; the buffer stays allocated for the next block
+        output[..total_out].to_vec()
+    })
 }
 
 #[cfg(test)]
