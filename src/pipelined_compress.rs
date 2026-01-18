@@ -18,9 +18,10 @@ use crate::parallel_compress::adjust_compression_level;
 use crate::scheduler::compress_parallel;
 use flate2::write::GzEncoder;
 use flate2::{Compress, Compression, FlushCompress, Status};
-use std::cell::RefCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::mem::MaybeUninit;
 
 // Thread-local Compress object to avoid reinitializing zlib state (~300KB) per block
 // Note: We store Option<(level, Compress)> to cache by level
@@ -131,9 +132,12 @@ impl PipelinedGzEncoder {
 
         // Use a CRC combiner to compute final CRC
         // Each block's CRC is computed in parallel, then combined
-        use std::sync::Mutex;
-        let crc_parts: Vec<Mutex<Option<(crc32fast::Hasher, usize)>>> = 
-            (0..num_blocks).map(|_| Mutex::new(None)).collect();
+        struct CrcSlot(UnsafeCell<MaybeUninit<crc32fast::Hasher>>);
+        // Safety: each slot is written by exactly one worker before all threads join.
+        unsafe impl Sync for CrcSlot {}
+        let crc_parts: Vec<CrcSlot> = (0..num_blocks)
+            .map(|_| CrcSlot(UnsafeCell::new(MaybeUninit::uninit())))
+            .collect();
 
         // Compress all blocks using custom scheduler
         compress_parallel(
@@ -148,16 +152,17 @@ impl PipelinedGzEncoder {
                 // Compute CRC for this block
                 let mut hasher = crc32fast::Hasher::new();
                 hasher.update(block);
-                *crc_parts[block_idx].lock().unwrap() = Some((hasher, block.len()));
+                unsafe {
+                    *crc_parts[block_idx].0.get() = MaybeUninit::new(hasher);
+                }
             },
         )?;
 
         // Combine CRCs in order
         let mut combined_hasher = crc32fast::Hasher::new();
         for part in &crc_parts {
-            if let Some((hasher, _)) = part.lock().unwrap().take() {
-                combined_hasher.combine(&hasher);
-            }
+            let hasher = unsafe { (*part.0.get()).assume_init_read() };
+            combined_hasher.combine(&hasher);
         }
         let combined_crc = combined_hasher.finalize();
 
