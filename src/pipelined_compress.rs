@@ -40,27 +40,15 @@ const DICT_SIZE: usize = 32 * 1024;
 
 /// Get optimal block size for pipelined compression
 ///
-/// For L9, we minimize block count to reduce coordination overhead.
-/// On 4-core GHA VMs, too many blocks = too much synchronization overhead.
-///
-/// New strategy: ~8 blocks total (2 per thread) for minimal coordination.
+/// Key insight from pigz: it uses 128KB blocks consistently.
+/// This provides good dictionary overlap without too much overhead.
 #[inline]
-fn get_block_size_for_file(level: u32, file_size: usize, num_threads: usize) -> usize {
+fn get_block_size_for_file(level: u32, _file_size: usize, _num_threads: usize) -> usize {
     if level >= 9 {
-        // CRITICAL: For L9, minimize block count to reduce coordination overhead
-        // 
-        // On 4-core GHA VMs, our parallel pipelined compression was 8% slower than pigz.
-        // Root cause: too many small blocks = too much synchronization overhead.
-        //
-        // For 4 threads: 8 blocks = 2 blocks per thread = minimal coordination
-        // For 14 threads: 28 blocks = still manageable
-        let target_blocks = (num_threads * 2).max(4); // At least 4 blocks
-        let block_size = file_size / target_blocks;
-        
-        // Clamp to reasonable bounds
-        // Min 256KB (enough data per block for efficient compression)
-        // Max 4MB (reasonable memory per thread)
-        block_size.max(256 * 1024).min(4 * 1024 * 1024)
+        // Match pigz exactly: 128KB blocks for L9
+        // pigz uses g.block = 131072 (128KB) as default
+        // This balances dictionary effectiveness with parallelism
+        128 * 1024
     } else {
         BLOCK_SIZE_DEFAULT
     }

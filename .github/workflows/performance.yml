@@ -9,6 +9,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_HOME: /home/runner/.cargo
+  CARGO_INCREMENTAL: 0
+  # Enable native CPU optimizations for maximum performance
+  RUSTFLAGS: -C target-cpu=native
 
 jobs:
   benchmark:

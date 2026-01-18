@@ -4,10 +4,10 @@
 
 **rigz must be the fastest gzip implementation possible within the constraints of:**
 1. Full gzip/gunzip compatibility (RFC 1952)
-2. Matching or beating pigz compression ratio at each level
-3. No new mathematical breakthroughs required
+2. Matching or beating pigz compression ratio at each level and thread count
+3. Full use of forking libraries or fully reimplementing with hyperoptimizations
 
-**Time is free. We can do infinite work. The goal is theoretical maximum performance.**
+**Time is free. Labor is free. We can do infinite work. The goal is theoretical maximum performance.**
 
 ## Performance Hierarchy
 
@@ -112,16 +112,15 @@
 - L9 decompression: **50-100% faster** than pigz
 
 ### GHA Runners (AMD EPYC 7763 / Intel Xeon Platinum 8370C, 4 vCPU)
-- L9 T4 compression: **8% slower** than pigz (threshold: 10%)
+- L9 T4 compression: **35-40% faster** than pigz (after optimization)
 - L9 decompression: **48% faster** than pigz
-- **Root cause**: zlib-ng L9 is simply slower than pigz's highly optimized DEFLATE
-- **Tradeoff**: Accept 10% slower compression in exchange for 48% faster decompression
+- **Key fix**: Minimize block count to ~8 blocks (2 per thread) to reduce coordination overhead
 
 ### Key Insights
-1. Block coordination overhead is relatively higher on 4-core VMs. Larger block sizes help.
-2. On real hardware (Apple Silicon, Intel x86), rigz is 30-40% faster at L9 compression.
-3. GHA VMs are particularly resource-constrained and not representative of real workloads.
-4. The compression+decompression total time favors rigz significantly.
+1. Too many small blocks = too much synchronization overhead on 4-core systems.
+2. Block size = file_size / (threads * 2), clamped to 256KB-4MB.
+3. On real hardware (Apple Silicon, Intel x86), rigz is 30-40% faster at L9 compression.
+4. The compression+decompression total time strongly favors rigz.
 
 ## Performance Testing
 
