@@ -1,26 +1,27 @@
 //! High-performance parallel gzip compression
 //!
-//! This module implements parallel compression using rayon and memory-mapped I/O.
+//! This module implements parallel compression using memory-mapped I/O and
+//! our custom zero-overhead scheduler (no rayon).
+//!
 //! For large files, we use block-based parallel compression where each block
 //! is a complete gzip member that can be concatenated.
 //!
 //! Key optimizations:
 //! - Memory-mapped files for zero-copy access (no read_to_end latency)
-//! - Global thread pool to avoid per-call initialization
+//! - Custom scheduler with streaming output (no bulk collection)
 //! - Thread-local buffer reuse to minimize allocations
 //! - 128KB fixed blocks (matches pigz default)
-//! - Level adjustment for zlib-ng (L1→L2 for better compression ratio)
+//! - libdeflate for L1-L6 (30-50% faster than zlib-ng)
 //! - BGZF-style block size markers in FEXTRA for fast parallel decompression
 
+use crate::scheduler::compress_parallel_independent;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use memmap2::Mmap;
-use rayon::prelude::*;
 use std::cell::RefCell;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::sync::OnceLock;
 
 /// BGZF-style subfield ID for block size markers
 /// Using "RZ" to identify rigz-compressed blocks
@@ -71,7 +72,7 @@ pub fn get_block_size_for_level(level: u32) -> usize {
 #[inline]
 pub fn get_optimal_block_size(level: u32, file_size: usize, num_threads: usize) -> usize {
     let base_block_size = get_block_size_for_level(level);
-    
+
     // For L1-L2, dynamically size blocks based on file size
     // Goal: ~8 blocks per thread for good load balancing, max 256KB blocks
     if level <= 2 {
@@ -94,25 +95,12 @@ thread_local! {
     static LIBDEFLATE_COMPRESSOR: RefCell<Option<(i32, libdeflater::Compressor)>> = RefCell::new(None);
 }
 
-/// Default block size for parallel compression (128KB like pigz)
-/// Block size for parallel compression
+/// Default block size for parallel compression
 /// BGZF format stores block size as u16, so max is 65535 bytes
 /// We use 64KB to stay within this limit while maximizing parallelism
 const DEFAULT_BLOCK_SIZE: usize = 64 * 1024;
 
-/// Global thread pool to avoid per-call initialization overhead
-static THREAD_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-
-fn get_thread_pool(num_threads: usize) -> &'static rayon::ThreadPool {
-    THREAD_POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .build()
-            .expect("Failed to create thread pool")
-    })
-}
-
-/// Parallel gzip compression using rayon
+/// Parallel gzip compression using custom scheduler
 pub struct ParallelGzEncoder {
     compression_level: u32,
     num_threads: usize,
@@ -142,10 +130,7 @@ impl ParallelGzEncoder {
             return Ok(0);
         }
 
-        // Calculate optimal block size:
-        // - Larger blocks = better compression ratio, less overhead
-        // - Smaller blocks = better parallelization for small files
-        // - Target: each thread gets at least 2-4 blocks for good load balancing
+        // Calculate optimal block size
         let block_size = self.calculate_block_size(input_data.len());
 
         // For small files or single thread, use simple streaming compression
@@ -160,41 +145,17 @@ impl ParallelGzEncoder {
         }
 
         // Large file with multiple threads: compress blocks in parallel
-        // Each block becomes a complete gzip member (gzip allows concatenation)
-        let blocks: Vec<&[u8]> = input_data.chunks(block_size).collect();
-
-        // Use global thread pool to avoid per-call initialization
-        let pool = get_thread_pool(self.num_threads);
-        // Don't adjust level here - libdeflate (L1-L6) handles L1 correctly
-        // The adjust_compression_level is only for zlib-ng paths (single-threaded, empty)
-        let compression_level = self.compression_level;
-
-        // Compress blocks in parallel using thread-local buffers
-        let compressed_blocks: Vec<Vec<u8>> = pool.install(|| {
-            blocks
-                .par_iter()
-                .map(|block| compress_block_with_reuse(block, compression_level))
-                .collect()
-        });
-
-        // Concatenate all gzip members (valid per RFC 1952)
-        for block in &compressed_blocks {
-            writer.write_all(block)?;
-        }
+        self.compress_parallel(&input_data, block_size, &mut writer)?;
 
         Ok(bytes_read)
     }
 
     /// Calculate optimal block size based on file size and thread count
     fn calculate_block_size(&self, file_size: usize) -> usize {
-        // Use level and file-size aware block sizing:
-        // - L1-L2: Dynamic (64KB-256KB based on file size)
-        // - L3-L6: 64KB (fits BGZF, enables parallel decompression)
         get_optimal_block_size(self.compression_level, file_size, self.num_threads)
     }
 
     /// Compress a file using memory-mapped I/O for zero-copy access
-    /// This eliminates the latency of reading the file into memory before compression
     pub fn compress_file<P: AsRef<Path>, W: Write>(
         &self,
         path: P,
@@ -214,7 +175,6 @@ impl ParallelGzEncoder {
         }
 
         // Memory-map the file for zero-copy access
-        // This is safe because we only read the file, and it's opened with read-only access
         let mmap = unsafe { Mmap::map(&file)? };
 
         // For small files or single thread, use simple streaming compression
@@ -230,107 +190,31 @@ impl ParallelGzEncoder {
         }
 
         // Large file with multiple threads: compress blocks in parallel
-        // Each block becomes a complete gzip member (gzip allows concatenation)
-        let blocks: Vec<&[u8]> = mmap.chunks(block_size).collect();
-
-        // Use global thread pool to avoid per-call initialization
-        let pool = get_thread_pool(self.num_threads);
-        // Don't adjust level here - libdeflate (L1-L6) handles L1 correctly
-        // The adjust_compression_level is only for zlib-ng paths (single-threaded, empty)
-        let compression_level = self.compression_level;
-
-        // Compress blocks in parallel using thread-local buffers
-        let compressed_blocks: Vec<Vec<u8>> = pool.install(|| {
-            blocks
-                .par_iter()
-                .map(|block| compress_block_with_reuse(block, compression_level))
-                .collect()
-        });
-
-        // Write all gzip members using vectorized I/O when possible
-        // This reduces system calls by writing multiple blocks at once
-        write_compressed_blocks(&compressed_blocks, &mut writer)?;
+        self.compress_parallel(&mmap, block_size, &mut writer)?;
 
         Ok(file_len as u64)
     }
-}
 
-/// Write compressed blocks efficiently
-/// Uses vectorized I/O (write_all_vectored) when available to reduce syscalls
-#[inline]
-fn write_compressed_blocks<W: Write>(blocks: &[Vec<u8>], writer: &mut W) -> io::Result<()> {
-    use std::io::IoSlice;
+    /// Parallel compression using custom scheduler with streaming output
+    fn compress_parallel<W: Write>(
+        &self,
+        data: &[u8],
+        block_size: usize,
+        writer: &mut W,
+    ) -> io::Result<()> {
+        let compression_level = self.compression_level;
 
-    // For small number of blocks, just write sequentially
-    if blocks.len() <= 4 {
-        for block in blocks {
-            writer.write_all(block)?;
-        }
-        return Ok(());
+        // Use custom scheduler - no rayon overhead, streaming output
+        compress_parallel_independent(
+            data,
+            block_size,
+            self.num_threads,
+            writer,
+            |block, output| {
+                compress_block_bgzf_libdeflate(output, block, compression_level);
+            },
+        )
     }
-
-    // Use vectorized write for many blocks (reduces syscalls)
-    // Process in batches of up to 64 IoSlices (typical OS limit)
-    const MAX_IOVECS: usize = 64;
-
-    for chunk in blocks.chunks(MAX_IOVECS) {
-        let slices: Vec<IoSlice<'_>> = chunk.iter().map(|b| IoSlice::new(b)).collect();
-
-        // write_all_vectored handles partial writes
-        let mut remaining = &slices[..];
-        while !remaining.is_empty() {
-            let written = writer.write_vectored(remaining)?;
-            if written == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "failed to write compressed data",
-                ));
-            }
-
-            // Advance past written data
-            let mut bytes_left = written;
-            let mut consumed = 0;
-            for slice in remaining.iter() {
-                if bytes_left >= slice.len() {
-                    bytes_left -= slice.len();
-                    consumed += 1;
-                } else {
-                    break;
-                }
-            }
-            remaining = &remaining[consumed..];
-
-            // If we didn't consume complete slices, fall back to sequential
-            if bytes_left > 0 && !remaining.is_empty() {
-                // Partial write - finish the rest of this slice
-                writer.write_all(&remaining[0][bytes_left..])?;
-                remaining = &remaining[1..];
-                // Continue with remaining complete slices
-                for slice in remaining {
-                    writer.write_all(slice)?;
-                }
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Compress a single block using thread-local buffer to minimize allocations
-/// Writes BGZF-style header with block size in FEXTRA for fast parallel decompression
-#[inline]
-fn compress_block_with_reuse(block: &[u8], compression_level: u32) -> Vec<u8> {
-    COMPRESS_BUF.with(|buf| {
-        let mut buf = buf.borrow_mut();
-        buf.clear();
-
-        // Compress with BGZF-style header (includes block size marker)
-        compress_block_bgzf(&mut buf, block, compression_level);
-
-        // Return a copy (buffer stays allocated for next use)
-        buf.clone()
-    })
 }
 
 /// Compress a block with BGZF-style gzip header containing block size
@@ -344,17 +228,10 @@ fn compress_block_with_reuse(block: &[u8], compression_level: u32) -> Vec<u8> {
 /// but enables rigz to find block boundaries without inflating.
 ///
 /// Uses libdeflate for L1-L6 (faster, no dictionary needed).
-/// L7-L9 use pipelined compression (separate module) with zlib-ng for dictionary support.
-fn compress_block_bgzf(output: &mut Vec<u8>, block: &[u8], compression_level: u32) {
-    // libdeflate is faster than zlib-ng for L1-L6
-    // L7-L9 shouldn't reach here - they use pipelined compression
-    compress_block_bgzf_libdeflate(output, block, compression_level);
-}
-
-/// Compress using libdeflate (faster for L1-L6)
-/// Uses thread-local Compressor cache to avoid per-block allocation.
 fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compression_level: u32) {
     use libdeflater::{CompressionLvl, Compressor};
+
+    output.clear();
 
     // Reserve space for header (we'll write block size later)
     let header_start = output.len();
@@ -364,7 +241,7 @@ fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compressio
         0x1f, 0x8b, // Magic
         0x08, // Compression method (deflate)
         0x04, // Flags: FEXTRA
-        0, 0, 0, 0,    // MTIME (zero)
+        0, 0, 0, 0, // MTIME (zero)
         0x00, // XFL (no extra flags)
         0xff, // OS (unknown)
     ]);
@@ -380,29 +257,26 @@ fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compressio
 
     // Get or create compressor from thread-local cache
     let level = compression_level as i32;
-    let (max_compressed_size, compressed_len) = LIBDEFLATE_COMPRESSOR.with(|cache| {
+    let max_compressed_size = LIBDEFLATE_COMPRESSOR.with(|cache| {
         let mut cache = cache.borrow_mut();
-        
-        // Check if cached compressor matches our level
+
         let compressor = match cache.as_mut() {
             Some((cached_level, comp)) if *cached_level == level => comp,
             _ => {
-                // Create new compressor for this level
                 let lvl = CompressionLvl::new(level).unwrap_or(CompressionLvl::default());
                 *cache = Some((level, Compressor::new(lvl)));
                 &mut cache.as_mut().unwrap().1
             }
         };
-        
-        let max_size = compressor.deflate_compress_bound(block.len());
-        (max_size, max_size) // Return max_size twice to use outside closure
+
+        compressor.deflate_compress_bound(block.len())
     });
-    
+
     // Resize output buffer
     let deflate_start = output.len();
     output.resize(deflate_start + max_compressed_size, 0);
-    
-    // Do the actual compression (need to access compressor again)
+
+    // Do the actual compression
     let actual_len = LIBDEFLATE_COMPRESSOR.with(|cache| {
         let mut cache = cache.borrow_mut();
         let compressor = &mut cache.as_mut().unwrap().1;
@@ -412,73 +286,6 @@ fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compressio
     });
 
     output.truncate(deflate_start + actual_len);
-
-    // Compute CRC32 of uncompressed data
-    let crc32 = crc32fast::hash(block);
-
-    // Write gzip trailer: CRC32 + ISIZE (uncompressed size mod 2^32)
-    output.extend_from_slice(&crc32.to_le_bytes());
-    output.extend_from_slice(&(block.len() as u32).to_le_bytes());
-
-    // Now write the total block size (including header and trailer)
-    let total_block_size = output.len() - header_start;
-
-    // Block size is stored as (size - 1) to match BGZF convention
-    let block_size_minus_1 = if total_block_size <= 65536 {
-        (total_block_size - 1) as u16
-    } else {
-        0 // Overflow marker - decompressor will fall back to sequential
-    };
-    output[block_size_offset..block_size_offset + 2]
-        .copy_from_slice(&block_size_minus_1.to_le_bytes());
-}
-
-/// Compress using flate2/zlib-ng (better for L7+)
-fn compress_block_bgzf_flate2(output: &mut Vec<u8>, block: &[u8], compression_level: u32) {
-    use flate2::Compress;
-    use flate2::FlushCompress;
-    use flate2::Status;
-
-    // Reserve space for header (we'll write block size later)
-    let header_start = output.len();
-
-    // Write gzip header with FEXTRA flag
-    output.extend_from_slice(&[
-        0x1f, 0x8b, // Magic
-        0x08, // Compression method (deflate)
-        0x04, // Flags: FEXTRA
-        0, 0, 0, 0,    // MTIME (zero)
-        0x00, // XFL (no extra flags)
-        0xff, // OS (unknown)
-    ]);
-
-    // XLEN: 6 bytes (2 byte ID + 2 byte len + 2 byte block size)
-    output.extend_from_slice(&[6, 0]);
-
-    // Subfield: "RZ" + 2 bytes len + 2 bytes block size (placeholder)
-    output.extend_from_slice(&RIGZ_SUBFIELD_ID);
-    output.extend_from_slice(&[2, 0]); // Subfield data length
-    let block_size_offset = output.len();
-    output.extend_from_slice(&[0, 0]); // Placeholder for block size
-
-    // Compress the data
-    let mut compress = Compress::new(Compression::new(compression_level), false);
-    let deflate_start = output.len();
-
-    // Reserve space for compressed data (worst case: slightly larger than input)
-    let max_compressed_size = block.len() + (block.len() >> 12) + (block.len() >> 14) + 11 + 1024;
-    output.resize(deflate_start + max_compressed_size, 0);
-
-    let status = compress
-        .compress(block, &mut output[deflate_start..], FlushCompress::Finish)
-        .expect("compression failed");
-
-    if status != Status::StreamEnd {
-        panic!("Unexpected compression status: {:?}", status);
-    }
-
-    let compressed_len = compress.total_out() as usize;
-    output.truncate(deflate_start + compressed_len);
 
     // Compute CRC32 of uncompressed data
     let crc32 = crc32fast::hash(block);
