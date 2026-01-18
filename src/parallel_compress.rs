@@ -89,6 +89,9 @@ pub fn get_optimal_block_size(level: u32, file_size: usize, num_threads: usize) 
 // Thread-local compression buffer to avoid per-block allocation
 thread_local! {
     static COMPRESS_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256 * 1024));
+    // Cache libdeflate Compressor by level to avoid per-block allocation
+    // Tuple is (level, compressor) - we only cache one level per thread
+    static LIBDEFLATE_COMPRESSOR: RefCell<Option<(i32, libdeflater::Compressor)>> = RefCell::new(None);
 }
 
 /// Default block size for parallel compression (128KB like pigz)
@@ -349,6 +352,7 @@ fn compress_block_bgzf(output: &mut Vec<u8>, block: &[u8], compression_level: u3
 }
 
 /// Compress using libdeflate (faster for L1-L6)
+/// Uses thread-local Compressor cache to avoid per-block allocation.
 fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compression_level: u32) {
     use libdeflater::{CompressionLvl, Compressor};
 
@@ -374,20 +378,40 @@ fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compressio
     let block_size_offset = output.len();
     output.extend_from_slice(&[0, 0]); // Placeholder for block size
 
-    // Compress the data using libdeflate
-    // libdeflate levels go from 1-12, map our 1-6 to libdeflate 1-6
-    let lvl = CompressionLvl::new(compression_level as i32).unwrap_or(CompressionLvl::default());
-    let mut compressor = Compressor::new(lvl);
-
+    // Get or create compressor from thread-local cache
+    let level = compression_level as i32;
+    let (max_compressed_size, compressed_len) = LIBDEFLATE_COMPRESSOR.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        
+        // Check if cached compressor matches our level
+        let compressor = match cache.as_mut() {
+            Some((cached_level, comp)) if *cached_level == level => comp,
+            _ => {
+                // Create new compressor for this level
+                let lvl = CompressionLvl::new(level).unwrap_or(CompressionLvl::default());
+                *cache = Some((level, Compressor::new(lvl)));
+                &mut cache.as_mut().unwrap().1
+            }
+        };
+        
+        let max_size = compressor.deflate_compress_bound(block.len());
+        (max_size, max_size) // Return max_size twice to use outside closure
+    });
+    
+    // Resize output buffer
     let deflate_start = output.len();
-    let max_compressed_size = compressor.deflate_compress_bound(block.len());
     output.resize(deflate_start + max_compressed_size, 0);
+    
+    // Do the actual compression (need to access compressor again)
+    let actual_len = LIBDEFLATE_COMPRESSOR.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let compressor = &mut cache.as_mut().unwrap().1;
+        compressor
+            .deflate_compress(block, &mut output[deflate_start..])
+            .expect("libdeflate compression failed")
+    });
 
-    let compressed_len = compressor
-        .deflate_compress(block, &mut output[deflate_start..])
-        .expect("libdeflate compression failed");
-
-    output.truncate(deflate_start + compressed_len);
+    output.truncate(deflate_start + actual_len);
 
     // Compute CRC32 of uncompressed data
     let crc32 = crc32fast::hash(block);
