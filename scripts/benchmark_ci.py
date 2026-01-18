@@ -41,9 +41,11 @@ def get_thresholds(level: int) -> tuple:
     A small positive threshold (2%) accounts for CI measurement noise.
     """
     if level >= 10:
-        # L10-L12: Ultra compression - slower but much smaller
-        # Don't enforce speed (expected to be slower than pigz)
-        # Size should be at least 3% smaller than pigz (negative overhead)
+        # L10-L12: Ultra compression using libdeflate L10-L12
+        # Speed: Expected to be slower than pigz -9 (but still 20-50x faster than zopfli)
+        # Size: Must be at least 3% smaller than pigz -9 (typically achieves 4-5% smaller)
+        # Note: Other tools are capped at L9 for comparison since gzippy L10+ should
+        #       beat everyone's best standard compression level
         return (500.0, -3.0)  # Speed doesn't matter, size must be 3%+ smaller
     elif level >= 9:
         # L9: Prioritize compression ratio, speed should still be competitive
