@@ -34,6 +34,8 @@ from typing import Dict, List, Tuple, Optional
 GZIPPY = "./target/release/gzippy"
 PIGZ = "./pigz/pigz"
 IGZIP = "./isa-l/build/igzip"
+RAPIDGZIP = "./rapidgzip/librapidarchive/build/src/tools/rapidgzip"
+ZOPFLI = "./zopfli/zopfli"
 GZIP = "gzip"
 
 # Silesia corpus URL
@@ -65,12 +67,8 @@ def check_tool(path: str, name: str) -> bool:
 
 
 def check_rapidgzip() -> bool:
-    """Check if rapidgzip is available."""
-    try:
-        import rapidgzip
-        return True
-    except ImportError:
-        return False
+    """Check if rapidgzip CLI is available."""
+    return check_tool(RAPIDGZIP, "rapidgzip")
 
 
 def download_silesia(work_dir: Path) -> Path:
@@ -162,12 +160,10 @@ def benchmark_decompress(tool: str, threads: int, input_file: Path,
             subprocess.run([bin_path, "-d", "-T", str(threads), "-c", str(input_file)],
                           stdout=subprocess.DEVNULL, check=True, stderr=subprocess.DEVNULL)
         elif tool == "rapidgzip":
-            import rapidgzip
-            with rapidgzip.open(str(input_file), parallelization=threads) as f:
-                while True:
-                    chunk = f.read(1024 * 1024)
-                    if not chunk:
-                        break
+            # rapidgzip CLI: -d decompress, -P parallelism, -c stdout
+            bin_path = str(repo_root / "rapidgzip/librapidarchive/build/src/tools/rapidgzip")
+            subprocess.run([bin_path, "-d", f"-P{threads}", "-c", str(input_file)],
+                          stdout=subprocess.DEVNULL, check=True, stderr=subprocess.DEVNULL)
         elif tool == "gzip":
             subprocess.run(["gzip", "-d", "-c", str(input_file)],
                           stdout=subprocess.DEVNULL, check=True, stderr=subprocess.DEVNULL)
@@ -218,10 +214,13 @@ def run_benchmarks():
     
     if check_rapidgzip():
         available_decompress.append("rapidgzip")
-        import rapidgzip
-        print(f"✓ rapidgzip ({rapidgzip.__version__})")
+        # Get version from CLI
+        result = subprocess.run([str(find_repo_root() / RAPIDGZIP[2:]), "--version"],
+                               capture_output=True, text=True)
+        version = result.stdout.strip().split()[-1] if result.returncode == 0 else "unknown"
+        print(f"✓ rapidgzip ({version})")
     else:
-        print("✗ rapidgzip (run: pip install rapidgzip)")
+        print("✗ rapidgzip (run: make deps)")
     
     if len(available_compress) < 2:
         print("\nNeed at least 2 tools to run comparison benchmark")

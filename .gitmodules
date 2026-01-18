@@ -11,3 +11,6 @@
 [submodule "zopfli"]
 	path = zopfli
 	url = https://github.com/google/zopfli.git
+[submodule "rapidgzip"]
+	path = rapidgzip
+	url = https://github.com/mxmlnkn/rapidgzip.git

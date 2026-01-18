@@ -4,11 +4,12 @@
 # Quick tests (<30s) run with 'make' or 'make quick' - for AI tools and iteration
 # Full perf tests (10+ min) run with 'make perf-full' - for humans at release time
 
-# Build configuration - submodules are in ./gzip, ./pigz, ./isa-l, and ./zopfli
+# Build configuration - submodules are in ./gzip, ./pigz, ./isa-l, ./zopfli, and ./rapidgzip
 GZIP_DIR := ./gzip
 PIGZ_DIR := ./pigz
 ISAL_DIR := ./isa-l
 ZOPFLI_DIR := ./zopfli
+RAPIDGZIP_DIR := ./rapidgzip
 GZIPPY_DIR := .
 TEST_DATA_DIR := test_data
 RESULTS_DIR := test_results
@@ -19,6 +20,7 @@ UNGZIPPY_BIN := $(GZIPPY_DIR)/target/release/ungzippy
 PIGZ_BIN := $(PIGZ_DIR)/pigz
 IGZIP_BIN := $(ISAL_DIR)/build/igzip
 ZOPFLI_BIN := $(ZOPFLI_DIR)/zopfli
+RAPIDGZIP_BIN := $(RAPIDGZIP_DIR)/librapidarchive/build/src/tools/rapidgzip
 
 # Prefer local gzip build, fall back to system gzip
 GZIP_BIN := $(shell if [ -x $(GZIP_DIR)/gzip ]; then echo $(GZIP_DIR)/gzip; else echo $$(which gzip); fi)
@@ -37,10 +39,10 @@ all: quick
 
 build: $(GZIPPY_BIN) $(UNGZIPPY_BIN)
 
-deps: $(PIGZ_BIN) $(IGZIP_BIN) $(ZOPFLI_BIN)
+deps: $(PIGZ_BIN) $(IGZIP_BIN) $(ZOPFLI_BIN) $(RAPIDGZIP_BIN)
 	@# Try to build gzip, but don't fail if it doesn't work
 	@$(MAKE) $(GZIP_DIR)/gzip 2>/dev/null || true
-	@echo "✓ Dependencies ready (gzip: $(GZIP_BIN), pigz, igzip, zopfli)"
+	@echo "✓ Dependencies ready (gzip, pigz, igzip, zopfli, rapidgzip)"
 
 $(GZIP_DIR)/gzip:
 	@echo "Building gzip from source..."
@@ -67,8 +69,15 @@ $(IGZIP_BIN):
 
 $(ZOPFLI_BIN):
 	@echo "Building zopfli from source..."
-	@$(MAKE) -C $(ZOPFLI_DIR) zopfli 2>&1 | tail -1 || true
+	@$(MAKE) -C $(ZOPFLI_DIR) zopfli 2>&1 | grep -E "(cc|g\+\+|error)" || true
 	@echo "✓ Built zopfli"
+
+$(RAPIDGZIP_BIN):
+	@echo "Building rapidgzip from source..."
+	@cd $(RAPIDGZIP_DIR) && git submodule update --init --recursive >/dev/null 2>&1 || true
+	@mkdir -p $(RAPIDGZIP_DIR)/librapidarchive/build
+	@cd $(RAPIDGZIP_DIR)/librapidarchive/build && cmake .. >/dev/null 2>&1 && make -j4 rapidgzip 2>&1 | grep -E "(Built|Linking|error)" || true
+	@echo "✓ Built rapidgzip"
 
 $(GZIPPY_BIN): FORCE
 	@echo "Building gzippy..."

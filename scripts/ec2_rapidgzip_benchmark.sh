@@ -221,15 +221,29 @@ log_info "igzip built: $IGZIP"
 cd "$WORK_DIR"
 
 log_info "=== Building rapidgzip ==="
-pip3 install --user rapidgzip
-RAPIDGZIP="$HOME/.local/bin/rapidgzip"
-if [[ ! -f "$RAPIDGZIP" ]]; then
-    # Try alternative location
-    RAPIDGZIP=$(python3 -c "import rapidgzip; import os; print(os.path.dirname(rapidgzip.__file__))")/../../../bin/rapidgzip
+if [[ ! -d rapidgzip ]]; then
+    git clone --depth 1 --recursive https://github.com/mxmlnkn/rapidgzip.git
 fi
-# Verify rapidgzip works
-python3 -c "import rapidgzip; print(f'rapidgzip version: {rapidgzip.__version__}')"
-log_info "rapidgzip installed"
+cd rapidgzip
+git submodule update --init --recursive
+mkdir -p librapidarchive/build
+cd librapidarchive/build
+cmake ..
+make -j$(nproc) rapidgzip
+RAPIDGZIP="$PWD/src/tools/rapidgzip"
+log_info "rapidgzip built: $RAPIDGZIP"
+$RAPIDGZIP --version
+cd "$WORK_DIR"
+
+log_info "=== Building zopfli ==="
+if [[ ! -d zopfli ]]; then
+    git clone --depth 1 https://github.com/google/zopfli.git
+fi
+cd zopfli
+make -j$(nproc) zopfli
+ZOPFLI="$PWD/zopfli"
+log_info "zopfli built: $ZOPFLI"
+cd "$WORK_DIR"
 
 log_info "=== Downloading Silesia Corpus ==="
 SILESIA_URL="https://sun.aei.polsl.pl/~sdeor/corpus/silesia.zip"
@@ -333,15 +347,7 @@ benchmark_decompress() {
                 "$IGZIP" -d -T $threads -c "$input" > /dev/null 2>/dev/null
                 ;;
             rapidgzip)
-                python3 -c "
-import rapidgzip
-import sys
-with rapidgzip.open('$input', parallelization=$threads) as f:
-    while True:
-        chunk = f.read(1024*1024)
-        if not chunk:
-            break
-" 2>/dev/null
+                "$RAPIDGZIP" -d -P $threads -c "$input" > /dev/null 2>/dev/null
                 ;;
             gzip)
                 gzip -d -c "$input" > /dev/null 2>/dev/null
