@@ -45,10 +45,11 @@ fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
 
 use std::cell::RefCell;
 
-// Thread-local decompressor to avoid repeated initialization overhead
+// Thread-local decompressor and buffer to avoid repeated allocation
 thread_local! {
     static DECOMPRESSOR: RefCell<libdeflater::Decompressor> =
         RefCell::new(libdeflater::Decompressor::new());
+    static DECOMPRESS_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(1024 * 1024));
 }
 
 pub fn decompress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
@@ -323,12 +324,11 @@ fn decompress_bgzf_parallel<W: Write>(data: &[u8], writer: &mut W) -> RigzResult
         return decompress_multi_member_sequential(data, writer);
     }
 
-    // Decompress blocks in parallel
+    // Decompress blocks in parallel using thread-local decompressor and buffer
     let results: Vec<Result<Vec<u8>, String>> = blocks
         .par_iter()
         .map(|&(start, len)| {
             let block_data = &data[start..start + len];
-            let mut decompressor = Decompressor::new();
 
             // Read ISIZE from trailer for buffer sizing
             let isize_hint = if len >= 8 {
@@ -344,22 +344,36 @@ fn decompress_bgzf_parallel<W: Write>(data: &[u8], writer: &mut W) -> RigzResult
                 len.saturating_mul(4).max(64 * 1024)
             };
 
-            let mut output = vec![0u8; initial_size];
+            // Use thread-local buffer and decompressor
+            DECOMPRESS_BUF.with(|buf_cell| {
+                DECOMPRESSOR.with(|decomp_cell| {
+                    let mut output = buf_cell.borrow_mut();
+                    let mut decompressor = decomp_cell.borrow_mut();
+                    
+                    output.clear();
+                    let current_cap = output.capacity();
+                    if current_cap < initial_size {
+                        output.reserve(initial_size - current_cap);
+                    }
+                    output.resize(initial_size, 0);
 
-            loop {
-                match decompressor.gzip_decompress(block_data, &mut output) {
-                    Ok(size) => {
-                        output.truncate(size);
-                        return Ok(output);
+                    loop {
+                        match decompressor.gzip_decompress(block_data, &mut output) {
+                            Ok(size) => {
+                                // Return a copy; buffer stays allocated for next block
+                                return Ok(output[..size].to_vec());
+                            }
+                            Err(DecompressionError::InsufficientSpace) => {
+                                let current_len = output.len();
+                                let new_size = current_len.saturating_mul(2);
+                                output.resize(new_size, 0);
+                                continue;
+                            }
+                            Err(e) => return Err(format!("decompression error: {:?}", e)),
+                        }
                     }
-                    Err(DecompressionError::InsufficientSpace) => {
-                        let new_size = output.len().saturating_mul(2);
-                        output.resize(new_size, 0);
-                        continue;
-                    }
-                    Err(e) => return Err(format!("decompression error: {:?}", e)),
-                }
-            }
+                })
+            })
         })
         .collect();
 
@@ -610,12 +624,11 @@ fn decompress_multi_member_parallel<W: Write>(data: &[u8], writer: &mut W) -> Ri
         return decompress_multi_member_sequential(data, writer);
     }
 
-    // Decompress members in parallel
+    // Decompress members in parallel using thread-local decompressor and buffer
     let results: Vec<Result<Vec<u8>, String>> = boundaries
         .par_iter()
         .map(|&(start, len)| {
             let member_data = &data[start..start + len];
-            let mut decompressor = Decompressor::new();
 
             // Estimate output size from ISIZE trailer (last 4 bytes of member)
             let isize_hint = if len >= 8 {
@@ -631,22 +644,35 @@ fn decompress_multi_member_parallel<W: Write>(data: &[u8], writer: &mut W) -> Ri
                 len.saturating_mul(4).max(64 * 1024)
             };
 
-            let mut output = vec![0u8; initial_size];
+            // Use thread-local buffer and decompressor
+            DECOMPRESS_BUF.with(|buf_cell| {
+                DECOMPRESSOR.with(|decomp_cell| {
+                    let mut output = buf_cell.borrow_mut();
+                    let mut decompressor = decomp_cell.borrow_mut();
+                    
+                    output.clear();
+                    let current_cap = output.capacity();
+                    if current_cap < initial_size {
+                        output.reserve(initial_size - current_cap);
+                    }
+                    output.resize(initial_size, 0);
 
-            loop {
-                match decompressor.gzip_decompress(member_data, &mut output) {
-                    Ok(size) => {
-                        output.truncate(size);
-                        return Ok(output);
+                    loop {
+                        match decompressor.gzip_decompress(member_data, &mut output) {
+                            Ok(size) => {
+                                return Ok(output[..size].to_vec());
+                            }
+                            Err(DecompressionError::InsufficientSpace) => {
+                                let current_len = output.len();
+                                let new_size = current_len.saturating_mul(2);
+                                output.resize(new_size, 0);
+                                continue;
+                            }
+                            Err(e) => return Err(format!("decompression error: {:?}", e)),
+                        }
                     }
-                    Err(DecompressionError::InsufficientSpace) => {
-                        let new_size = output.len().saturating_mul(2);
-                        output.resize(new_size, 0);
-                        continue;
-                    }
-                    Err(e) => return Err(format!("decompression error: {:?}", e)),
-                }
-            }
+                })
+            })
         })
         .collect();
 
