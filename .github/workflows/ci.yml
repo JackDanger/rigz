@@ -99,6 +99,9 @@ jobs:
           cmake ..
           make -j$(nproc) igzip
 
+      - name: Build zopfli
+        run: make -C zopfli zopfli
+
       - name: Run validation matrix
         run: |
           CORES=$(nproc)
@@ -205,7 +208,7 @@ jobs:
           diff /tmp/stdin_test.bin /tmp/stdin_test.out
           echo "✓ Stdin streaming works"
 
-      - name: Test all compression levels
+      - name: Test all compression levels (1-9)
         run: |
           head -c 100000 /dev/urandom > /tmp/levels_test.bin
           for level in 1 2 3 4 5 6 7 8 9; do
@@ -214,6 +217,25 @@ jobs:
             diff /tmp/levels_test.bin /tmp/levels_test.out
             echo "✓ Level $level works"
           done
+
+      - name: Test ultra compression levels (10-12)
+        run: |
+          head -c 100000 /dev/urandom > /tmp/ultra_test.bin
+          for level in 10 11 12; do
+            cat /tmp/ultra_test.bin | ./target/release/gzippy --level $level > /tmp/ultra_test.gz
+            cat /tmp/ultra_test.gz | ./target/release/gzippy -d > /tmp/ultra_test.out
+            diff /tmp/ultra_test.bin /tmp/ultra_test.out
+            echo "✓ Level $level works"
+          done
+          # Also test --ultra and --max flags
+          cat /tmp/ultra_test.bin | ./target/release/gzippy --ultra > /tmp/ultra_test.gz
+          cat /tmp/ultra_test.gz | ./target/release/gzippy -d > /tmp/ultra_test.out
+          diff /tmp/ultra_test.bin /tmp/ultra_test.out
+          echo "✓ --ultra flag works"
+          cat /tmp/ultra_test.bin | ./target/release/gzippy --max > /tmp/ultra_test.gz
+          cat /tmp/ultra_test.gz | ./target/release/gzippy -d > /tmp/ultra_test.out
+          diff /tmp/ultra_test.bin /tmp/ultra_test.out
+          echo "✓ --max flag works"
 
       - name: Test thread counts
         run: |

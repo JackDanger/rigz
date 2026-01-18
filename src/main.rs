@@ -108,6 +108,9 @@ fn print_help() {
     println!();
     println!("Options:");
     println!("  -1..-9           Compression level (1=fast, 9=best, default=6)");
+    println!("  --level N        Set compression level 1-12");
+    println!("  --ultra          Ultra compression (level 11, near-zopfli)");
+    println!("  --max            Maximum compression (level 12, closest to zopfli)");
     println!("  -c, --stdout     Write to stdout, keep original files");
     println!("  -d, --decompress Decompress");
     println!("  -f, --force      Force overwrite of output file");
@@ -119,6 +122,11 @@ fn print_help() {
     println!("  -h, --help       Show this help");
     println!("  -V, --version    Show version");
     println!("  -L, --license    Show license");
+    println!();
+    println!("Compression levels:");
+    println!("  1-6              Fast (libdeflate, parallel decompress)");
+    println!("  7-9              Balanced (zlib-ng, gzip-compatible)");
+    println!("  10-12            Ultra (libdeflate high, near-zopfli ratio)");
     println!();
     println!("Examples:");
     println!("  gzippy file.txt          Compress file.txt → file.txt.gz");

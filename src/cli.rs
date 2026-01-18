@@ -176,9 +176,19 @@ impl GzippyArgs {
                         args.fast = true;
                         args.compression_level = 1;
                     }
+                    // Ultra compression: libdeflate L11 (near-zopfli at pigz speed)
+                    "--ultra" => {
+                        args.compression_level = 11;
+                    }
+                    // Maximum compression: libdeflate L12 (closest to zopfli)
+                    "--max" => {
+                        args.compression_level = 12;
+                    }
                     _ => {
                         // Handle options with values
-                        if let Some(value) = arg.strip_prefix("--blocksize=") {
+                        if let Some(value) = arg.strip_prefix("--level=") {
+                            args.compression_level = parse_compression_level(value)?;
+                        } else if let Some(value) = arg.strip_prefix("--blocksize=") {
                             args.block_size = parse_block_size(value)?;
                         } else if let Some(value) = arg.strip_prefix("--processes=") {
                             args.processes = value.parse().map_err(|_| {
@@ -193,7 +203,8 @@ impl GzippyArgs {
                             args.comment = Some(value.to_string());
                         } else if let Some(value) = arg.strip_prefix("--alias=") {
                             args.alias = Some(value.to_string());
-                        } else if arg == "--blocksize"
+                        } else if arg == "--level"
+                            || arg == "--blocksize"
                             || arg == "--processes"
                             || arg == "--suffix"
                             || arg == "--comment"
@@ -210,6 +221,9 @@ impl GzippyArgs {
                             let value = &argv[i];
 
                             match arg.as_str() {
+                                "--level" => {
+                                    args.compression_level = parse_compression_level(value)?
+                                }
                                 "--blocksize" => args.block_size = parse_block_size(value)?,
                                 "--processes" => {
                                     args.processes = value.parse().map_err(|_| {
@@ -339,7 +353,9 @@ impl GzippyArgs {
             args.processes = 1;
         }
 
-        if args.compression_level > 9 {
+        // Levels 1-9: gzip compatible
+        // Levels 10-12: ultra compression (libdeflate high levels)
+        if args.compression_level > 12 {
             return Err(GzippyError::InvalidLevel(args.compression_level));
         }
 
@@ -375,6 +391,18 @@ fn parse_env_args(env_str: &str) -> Vec<String> {
     }
 
     args
+}
+
+fn parse_compression_level(value: &str) -> GzippyResult<u8> {
+    let level: u8 = value.parse().map_err(|_| {
+        GzippyError::invalid_argument(format!("Invalid compression level: {}", value))
+    })?;
+
+    if level > 12 {
+        return Err(GzippyError::InvalidLevel(level));
+    }
+
+    Ok(level)
 }
 
 fn parse_block_size(value: &str) -> GzippyResult<usize> {

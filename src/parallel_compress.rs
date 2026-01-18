@@ -62,7 +62,13 @@ pub fn get_block_size_for_level(level: u32) -> usize {
         // Note: 128KB > BGZF u16 limit, so BGZF markers will be disabled
         1 | 2 => 128 * 1024,
         // L3-L6: Use 64KB blocks - fits BGZF, enables parallel decompression
-        _ => DEFAULT_BLOCK_SIZE,
+        3..=6 => DEFAULT_BLOCK_SIZE,
+        // L7-L9: Handled by pipelined compressor (shouldn't reach here)
+        7..=9 => 128 * 1024,
+        // L10-L12: Ultra compression needs larger blocks for better context
+        // libdeflate's exhaustive search benefits from more data to find matches
+        // Use 512KB blocks - still enables parallelism but gives good ratio
+        _ => 512 * 1024,
     }
 }
 
@@ -121,10 +127,11 @@ impl ParallelGzEncoder {
         let bytes_read = reader.read_to_end(&mut input_data)? as u64;
 
         if input_data.is_empty() {
-            // Write empty gzip file
+            // Write empty gzip file - use level 9 for zlib (L10+ aren't supported by zlib)
+            let zlib_level = self.compression_level.min(9);
             let encoder = GzEncoder::new(
                 writer,
-                Compression::new(adjust_compression_level(self.compression_level)),
+                Compression::new(adjust_compression_level(zlib_level)),
             );
             encoder.finish()?;
             return Ok(0);
@@ -133,8 +140,10 @@ impl ParallelGzEncoder {
         // Calculate optimal block size
         let block_size = self.calculate_block_size(input_data.len());
 
-        // For small files or single thread, use simple streaming compression
-        if input_data.len() <= block_size || self.num_threads == 1 {
+        // For small files or single thread with L1-L9, use simple zlib streaming
+        // For L10-L12, always use libdeflate blocks for better compression
+        if self.compression_level <= 9 && (input_data.len() <= block_size || self.num_threads == 1)
+        {
             let mut encoder = GzEncoder::new(
                 writer,
                 Compression::new(adjust_compression_level(self.compression_level)),
@@ -144,7 +153,7 @@ impl ParallelGzEncoder {
             return Ok(bytes_read);
         }
 
-        // Large file with multiple threads: compress blocks in parallel
+        // Large file with multiple threads, or L10-L12: compress blocks in parallel with libdeflate
         let _ = self.compress_parallel(&input_data, block_size, writer)?;
 
         Ok(bytes_read)
@@ -165,10 +174,11 @@ impl ParallelGzEncoder {
         let file_len = file.metadata()?.len() as usize;
 
         if file_len == 0 {
-            // Write empty gzip file
+            // Write empty gzip file - use level 9 for zlib (L10+ aren't supported by zlib)
+            let zlib_level = self.compression_level.min(9);
             let encoder = GzEncoder::new(
                 &mut writer,
-                Compression::new(adjust_compression_level(self.compression_level)),
+                Compression::new(adjust_compression_level(zlib_level)),
             );
             encoder.finish()?;
             return Ok(0);
@@ -177,9 +187,10 @@ impl ParallelGzEncoder {
         // Memory-map the file for zero-copy access
         let mmap = unsafe { Mmap::map(&file)? };
 
-        // For small files or single thread, use simple streaming compression
+        // For small files or single thread with L1-L9, use simple zlib streaming
+        // For L10-L12, always use libdeflate blocks for better compression
         let block_size = self.calculate_block_size(file_len);
-        if file_len <= block_size || self.num_threads == 1 {
+        if self.compression_level <= 9 && (file_len <= block_size || self.num_threads == 1) {
             let mut encoder = GzEncoder::new(
                 &mut writer,
                 Compression::new(adjust_compression_level(self.compression_level)),
@@ -189,7 +200,7 @@ impl ParallelGzEncoder {
             return Ok(file_len as u64);
         }
 
-        // Large file with multiple threads: compress blocks in parallel
+        // Large file with multiple threads, or L10-L12: compress blocks in parallel with libdeflate
         let _ = self.compress_parallel(&mmap, block_size, writer)?;
 
         Ok(file_len as u64)

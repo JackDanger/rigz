@@ -36,6 +36,7 @@ def find_gzip():
 GZIP = find_gzip()
 PIGZ = "./pigz/pigz"
 IGZIP = "./isa-l/build/igzip"
+ZOPFLI = "./zopfli/zopfli"
 GZIPPY = "./target/release/gzippy"
 
 # Defaults
@@ -111,20 +112,30 @@ def run_timed(cmd: List[str], stdin_file: str = None, stdout_file: str = None) -
 def benchmark_compress(tool: str, level: int, threads: int, 
                        input_file: str, output_file: str, runs: int) -> Tuple[float, float, int]:
     """Benchmark compression. Returns (median_time, stdev, output_size)."""
-    bin_path = {"gzip": GZIP, "pigz": PIGZ, "igzip": IGZIP, "gzippy": GZIPPY}[tool]
+    bin_path = {"gzip": GZIP, "pigz": PIGZ, "igzip": IGZIP, "zopfli": ZOPFLI, "gzippy": GZIPPY}[tool]
     
-    # igzip uses levels 0-3, map standard gzip levels
+    # For L10-L12 benchmarks, compare other tools at their max level (9)
+    effective_level = level if tool == "gzippy" else min(level, 9)
+    
+    # Handle tool-specific command line syntax
     if tool == "igzip":
         # Map gzip levels 1-9 to igzip levels 0-3
-        igzip_level = min(3, max(0, (level - 1) // 3))
+        igzip_level = min(3, max(0, (effective_level - 1) // 3))
         cmd = [bin_path, f"-{igzip_level}"]
         if threads > 1:
             cmd.append(f"-T{threads}")
+        cmd.extend(["-c", input_file])
+    elif tool == "zopfli":
+        # zopfli uses iterations, not levels. Use 5 iterations for speed.
+        cmd = [bin_path, "--i5", "-c", input_file]
+    elif tool == "gzippy" and level >= 10:
+        # Ultra compression levels need --level flag
+        cmd = [bin_path, "--level", str(level), f"-p{threads}", "-c", input_file]
     else:
-        cmd = [bin_path, f"-{level}"]
+        cmd = [bin_path, f"-{effective_level}"]
         if tool in ("pigz", "gzippy"):
             cmd.append(f"-p{threads}")
-    cmd.extend(["-c", input_file])
+        cmd.extend(["-c", input_file])
     
     times = []
     for _ in range(runs):
@@ -161,7 +172,7 @@ def benchmark_decompress(tool: str, input_file: str, output_file: str, runs: int
 
 def check_tools() -> bool:
     """Verify all tools exist."""
-    missing = [t for t in [GZIP, PIGZ, IGZIP, GZIPPY] if not os.path.isfile(t)]
+    missing = [t for t in [GZIP, PIGZ, IGZIP, ZOPFLI, GZIPPY] if not os.path.isfile(t)]
     if missing:
         print("Missing tools:")
         for t in missing:
@@ -207,7 +218,12 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                     comp_results = {}
                     comp_files = {}
                     
-                    for tool in ["gzip", "pigz", "igzip", "gzippy"]:
+                    # zopfli only at L9 (very slow, only for max compression)
+                    tools = ["gzip", "pigz", "igzip", "gzippy"]
+                    if level >= 9:
+                        tools.append("zopfli")
+                    
+                    for tool in tools:
                         out_file = tmpdir / f"test.{tool}.l{level}.t{thread_count}.gz"
                         median, stdev, out_size = benchmark_compress(
                             tool, level, thread_count, str(test_file), str(out_file), runs
@@ -215,7 +231,7 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                         comp_results[tool] = (median, stdev, out_size)
                         comp_files[tool] = out_file
                         
-                        print(f"  {tool:6}: {format_time(median):>8} ±{format_time(stdev):>6}  {format_size(out_size):>10}")
+                        print(f"  {tool:7}: {format_time(median):>8} ±{format_time(stdev):>6}  {format_size(out_size):>10}")
                     
                     # Check gzippy compression performance against all competitors
                     gzippy_time = comp_results["gzippy"][0]

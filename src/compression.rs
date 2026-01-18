@@ -223,7 +223,8 @@ fn compress_with_pipeline<R: Read, W: Write + Send>(
 ) -> GzippyResult<u64> {
     // FAST PATH: Single-threaded goes directly to flate2 with minimal overhead
     // This is critical for L1 performance where every microsecond matters
-    if opt_config.thread_count == 1 {
+    // Exception: L10-L12 use libdeflate even single-threaded for ultra compression
+    if opt_config.thread_count == 1 && args.compression_level <= 9 {
         use flate2::write::GzEncoder;
         use flate2::Compression;
 

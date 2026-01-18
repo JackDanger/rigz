@@ -8,3 +8,6 @@
 	path = isa-l
 	url = https://github.com/JackDanger/isa-l.git
 	branch = apple-arm64-fix
+[submodule "zopfli"]
+	path = zopfli
+	url = https://github.com/google/zopfli.git

@@ -40,17 +40,24 @@ def get_thresholds(level: int) -> tuple:
     Thresholds are maximums - gzippy should generally beat these.
     A small positive threshold (2%) accounts for CI measurement noise.
     """
-    if level >= 9:
+    if level >= 10:
+        # L10-L12: Ultra compression using libdeflate L10-L12
+        # Speed: Expected to be slower than pigz -9 (but still 20-50x faster than zopfli)
+        # Size: Must be at least 3% smaller than pigz -9 (typically achieves 4-5% smaller)
+        # Note: Other tools are capped at L9 for comparison since gzippy L10+ should
+        #       beat everyone's best standard compression level
+        return (500.0, -3.0)  # Speed doesn't matter, size must be 3%+ smaller
+    elif level >= 9:
         # L9: Prioritize compression ratio, speed should still be competitive
         # We must beat pigz even on 4-core GHA VMs
         # Size must be within 0.5%
         return (5.0, 0.5)
-    elif level >= 7:
-        # L7-8: Transitional - uses pipelined output (sequential decompress)
+    elif level >= 6:
+        # L6-8: Transitional - uses pipelined output (sequential decompress)
         # Allow 5% slower decompression (no BGZF markers)
         return (5.0, 2.0)
     else:
-        # L1-6: Speed + parallel decompress, accept larger output
+        # L1-5: Speed + parallel decompress, accept larger output
         # 2% threshold accounts for CI noise (variance is typically 1-2%)
         return (2.0, 8.0)
 
@@ -70,6 +77,7 @@ def find_tool(name: str) -> str:
         "gzip": ["./gzip/gzip", shutil.which("gzip") or "gzip"],
         "pigz": ["./pigz/pigz"],
         "igzip": ["./isa-l/build/igzip"],
+        "zopfli": ["./zopfli/zopfli"],
         "gzippy": ["./target/release/gzippy"],
     }
     for path in paths.get(name, []):
@@ -186,17 +194,30 @@ def benchmark_compress(tool: str, level: int, threads: int,
     """Benchmark compression. Returns stats dict."""
     bin_path = find_tool(tool)
     
-    # igzip uses levels 0-3, map standard gzip levels
+    # For L10-L12 benchmarks, compare other tools at their max level (9)
+    # since gzippy L10-L12 should beat everyone's best
+    effective_level = level if tool == "gzippy" else min(level, 9)
+    
+    # Handle tool-specific command line syntax
     if tool == "igzip":
-        igzip_level = min(3, max(0, (level - 1) // 3))
+        # igzip uses levels 0-3, map standard gzip levels
+        igzip_level = min(3, max(0, (effective_level - 1) // 3))
         cmd = [bin_path, f"-{igzip_level}"]
         if threads > 1:
             cmd.append(f"-T{threads}")
+        cmd.extend(["-c", input_file])
+    elif tool == "zopfli":
+        # zopfli uses iterations, not levels. Use fewer iterations for speed.
+        # Default is 15, we use 5 for benchmarks to keep runtime reasonable.
+        cmd = [bin_path, "--i5", "-c", input_file]
+    elif tool == "gzippy" and level >= 10:
+        # Ultra compression levels need --level flag
+        cmd = [bin_path, f"--level", str(level), f"-p{threads}", "-c", input_file]
     else:
-        cmd = [bin_path, f"-{level}"]
+        cmd = [bin_path, f"-{effective_level}"]
         if tool in ("pigz", "gzippy"):
             cmd.append(f"-p{threads}")
-    cmd.extend(["-c", input_file])
+        cmd.extend(["-c", input_file])
     
     # Set up environment for gzippy debug mode
     env = os.environ.copy()
@@ -302,7 +323,7 @@ def get_cpu_info() -> dict:
 def main():
     parser = argparse.ArgumentParser(description="CI benchmark for gzippy")
     parser.add_argument("--size", type=int, required=True, help="Test file size in MB")
-    parser.add_argument("--level", type=int, required=True, help="Compression level (1-9)")
+    parser.add_argument("--level", type=int, required=True, help="Compression level (1-12)")
     parser.add_argument("--threads", type=int, required=True, help="Thread count")
     parser.add_argument("--output", type=str, default="benchmark-results.json",
                        help="Output JSON file")
@@ -374,9 +395,13 @@ def main():
         print("\nCompression:")
         
         # Always benchmark all tools for complete comparison
+        # zopfli only at L9 (it's very slow and only makes sense for max compression)
         comp_files = {}
+        tools = ["gzip", "pigz", "igzip", "gzippy"]
+        if args.level >= 9:
+            tools.append("zopfli")
         
-        for tool in ["gzip", "pigz", "igzip", "gzippy"]:
+        for tool in tools:
             out_file = tmpdir / f"test.{tool}.gz"
             try:
                 stats = benchmark_compress(tool, args.level, args.threads,
@@ -384,11 +409,11 @@ def main():
                                          debug=args.debug)
                 results["compression"][tool] = stats
                 comp_files[tool] = out_file
-                print(f"  {tool:6}: {stats['median']:.3f}s (±{stats['stdev']:.3f}s) "
+                print(f"  {tool:7}: {stats['median']:.3f}s (±{stats['stdev']:.3f}s) "
                       f"→ {stats['output_size']:,} bytes")
             except Exception as e:
                 error = f"Compression failed for {tool}: {e}"
-                print(f"  {tool:6}: ERROR - {e}")
+                print(f"  {tool:7}: ERROR - {e}")
                 results["errors"].append(error)
                 results["passed"] = False
         

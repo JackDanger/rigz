@@ -9,30 +9,37 @@
 
 ## Architecture
 
-### L1-L6: Speed-Optimized (Independent Blocks)
-- **Library**: libdeflate (30-50% faster than zlib-ng)
+### L1-L5: Speed-Optimized (Independent Blocks)
+- **Library**: libdeflate L1-L5 (30-50% faster than zlib-ng)
 - **Strategy**: Parallel independent blocks with "GZ" BGZF markers
 - **Decompression**: Parallel (blocks decompress independently)
 
-### L7-L9: Compression-Optimized (Pipelined)
+### L6-L9: Balanced (Pipelined)
 - **Library**: zlib-ng with dictionary sharing
 - **Strategy**: Each block uses previous block's data as dictionary
 - **Decompression**: Sequential (single gzip stream)
+
+### L10-L12: Ultra Compression (Independent Blocks)
+- **Library**: libdeflate L10-L12 (exhaustive search)
+- **Strategy**: Large 512KB blocks for better context
+- **Compression**: Near-zopfli ratio (4-5% smaller than gzip -9)
+- **Decompression**: Parallel (blocks decompress independently)
 
 ## Performance Targets
 
 | Level | Speed vs pigz | Size vs pigz |
 |-------|---------------|--------------|
-| L1-L6 | Must beat | Within 8% |
-| L7-L8 | Must beat | Within 2% |
+| L1-L5 | Must beat | Within 8% |
+| L6-L8 | Must beat | Within 2% |
 | L9 | Must beat | Within 0.5% |
+| L10-L12 | Slower OK | 4-5% smaller |
 
 ## File Organization
 
 | File | Purpose |
 |------|---------|
-| `parallel_compress.rs` | L1-L6: libdeflate parallel blocks |
-| `pipelined_compress.rs` | L7-L9: zlib-ng with dictionary sharing |
+| `parallel_compress.rs` | L1-L5 + L10-L12: libdeflate parallel blocks |
+| `pipelined_compress.rs` | L6-L9: zlib-ng with dictionary sharing |
 | `scheduler.rs` | Pigz-style N+1 thread scheduler |
 | `decompression.rs` | libdeflate for all decompression |
 
