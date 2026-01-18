@@ -260,14 +260,20 @@ fn compress_block_with_dict(
     PIPELINED_COMPRESS.with(|comp_cell| {
         let mut comp_opt = comp_cell.borrow_mut();
 
-        output.clear();
-
         // Ensure buffer is large enough (block_size + 10% + 1KB for headers)
         let initial_capacity = block_size + (block_size / 10) + 1024;
         if output.capacity() < initial_capacity {
             output.reserve(initial_capacity - output.capacity());
+            output.resize(initial_capacity, 0);
+        } else if output.is_empty() {
+            // Initialize once to avoid repeated zero-fill on reuse.
+            output.resize(initial_capacity, 0);
+        } else {
+            // Safe because the buffer has been initialized in previous use.
+            unsafe {
+                output.set_len(initial_capacity);
+            }
         }
-        output.resize(initial_capacity, 0);
 
         // Get or create Compress at the right level
         let compress = match comp_opt.as_mut() {
