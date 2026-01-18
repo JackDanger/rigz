@@ -69,6 +69,7 @@ def find_tool(name: str) -> str:
     paths = {
         "gzip": ["./gzip/gzip", shutil.which("gzip") or "gzip"],
         "pigz": ["./pigz/pigz"],
+        "igzip": ["./isa-l/build/igzip"],
         "gzippy": ["./target/release/gzippy"],
     }
     for path in paths.get(name, []):
@@ -185,9 +186,16 @@ def benchmark_compress(tool: str, level: int, threads: int,
     """Benchmark compression. Returns stats dict."""
     bin_path = find_tool(tool)
     
-    cmd = [bin_path, f"-{level}"]
-    if tool in ("pigz", "gzippy"):
-        cmd.append(f"-p{threads}")
+    # igzip uses levels 0-3, map standard gzip levels
+    if tool == "igzip":
+        igzip_level = min(3, max(0, (level - 1) // 3))
+        cmd = [bin_path, f"-{igzip_level}"]
+        if threads > 1:
+            cmd.append(f"-T{threads}")
+    else:
+        cmd = [bin_path, f"-{level}"]
+        if tool in ("pigz", "gzippy"):
+            cmd.append(f"-p{threads}")
     cmd.extend(["-c", input_file])
     
     # Set up environment for gzippy debug mode
@@ -365,10 +373,10 @@ def main():
         # === COMPRESSION BENCHMARKS ===
         print("\nCompression:")
         
-        # Always benchmark all three tools for complete comparison
+        # Always benchmark all tools for complete comparison
         comp_files = {}
         
-        for tool in ["gzip", "pigz", "gzippy"]:
+        for tool in ["gzip", "pigz", "igzip", "gzippy"]:
             out_file = tmpdir / f"test.{tool}.gz"
             try:
                 stats = benchmark_compress(tool, args.level, args.threads,
@@ -376,16 +384,23 @@ def main():
                                          debug=args.debug)
                 results["compression"][tool] = stats
                 comp_files[tool] = out_file
-                print(f"  {tool:5}: {stats['median']:.3f}s (±{stats['stdev']:.3f}s) "
+                print(f"  {tool:6}: {stats['median']:.3f}s (±{stats['stdev']:.3f}s) "
                       f"→ {stats['output_size']:,} bytes")
             except Exception as e:
                 error = f"Compression failed for {tool}: {e}"
-                print(f"  {tool:5}: ERROR - {e}")
+                print(f"  {tool:6}: ERROR - {e}")
                 results["errors"].append(error)
                 results["passed"] = False
         
-        # Primary comparison: single-thread vs gzip, multi-thread vs pigz
-        primary_baseline = "gzip" if args.threads == 1 else "pigz"
+        # Primary comparison: single-thread vs gzip, multi-thread vs fastest of pigz/igzip
+        if args.threads == 1:
+            primary_baseline = "gzip"
+        else:
+            # Find fastest multi-threaded competitor
+            competitors = {t: results["compression"][t]["median"] 
+                          for t in ["pigz", "igzip"] 
+                          if t in results["compression"]}
+            primary_baseline = min(competitors, key=competitors.get) if competitors else "pigz"
         
         # Check compression time vs primary baseline using statistical testing
         if primary_baseline in results["compression"] and "gzippy" in results["compression"]:
@@ -467,30 +482,25 @@ def main():
             gzippy_compressed = comp_files["gzippy"]
             decomp_out = tmpdir / "decompressed.txt"
             
-            for tool in ["gzip", "pigz", "gzippy"]:
+            for tool in ["gzip", "pigz", "igzip", "gzippy"]:
                 try:
                     stats = benchmark_decompress(tool, str(gzippy_compressed),
                                                 str(decomp_out), runs)
                     results["decompression"][tool] = stats
-                    print(f"  {tool:5}: {stats['median']:.3f}s (±{stats['stdev']:.3f}s)")
+                    print(f"  {tool:6}: {stats['median']:.3f}s (±{stats['stdev']:.3f}s)")
                 except Exception as e:
                     error = f"Decompression failed for {tool}: {e}"
-                    print(f"  {tool:5}: ERROR - {e}")
+                    print(f"  {tool:6}: ERROR - {e}")
                     results["errors"].append(error)
                     results["passed"] = False
             
             # Check decompression time using statistical testing
             decomp_tools = results["decompression"]
-            if "gzip" in decomp_tools and "pigz" in decomp_tools and "gzippy" in decomp_tools:
-                gzip_time = decomp_tools["gzip"]["median"]
-                pigz_time = decomp_tools["pigz"]["median"]
-                
-                if gzip_time <= pigz_time:
-                    baseline_tool = "gzip"
-                    baseline_times = decomp_tools["gzip"]["times"]
-                else:
-                    baseline_tool = "pigz"
-                    baseline_times = decomp_tools["pigz"]["times"]
+            # Find fastest competitor (gzip, pigz, or igzip)
+            competitors = {t: decomp_tools[t]["median"] for t in ["gzip", "pigz", "igzip"] if t in decomp_tools}
+            if competitors and "gzippy" in decomp_tools:
+                baseline_tool = min(competitors, key=competitors.get)
+                baseline_times = decomp_tools[baseline_tool]["times"]
                 
                 gzippy_times = decomp_tools["gzippy"]["times"]
                 

@@ -35,6 +35,7 @@ def find_gzip():
 
 GZIP = find_gzip()
 PIGZ = "./pigz/pigz"
+IGZIP = "./isa-l/build/igzip"
 GZIPPY = "./target/release/gzippy"
 
 # Defaults
@@ -110,11 +111,19 @@ def run_timed(cmd: List[str], stdin_file: str = None, stdout_file: str = None) -
 def benchmark_compress(tool: str, level: int, threads: int, 
                        input_file: str, output_file: str, runs: int) -> Tuple[float, float, int]:
     """Benchmark compression. Returns (median_time, stdev, output_size)."""
-    bin_path = {"gzip": GZIP, "pigz": PIGZ, "gzippy": GZIPPY}[tool]
+    bin_path = {"gzip": GZIP, "pigz": PIGZ, "igzip": IGZIP, "gzippy": GZIPPY}[tool]
     
-    cmd = [bin_path, f"-{level}"]
-    if tool in ("pigz", "gzippy"):
-        cmd.append(f"-p{threads}")
+    # igzip uses levels 0-3, map standard gzip levels
+    if tool == "igzip":
+        # Map gzip levels 1-9 to igzip levels 0-3
+        igzip_level = min(3, max(0, (level - 1) // 3))
+        cmd = [bin_path, f"-{igzip_level}"]
+        if threads > 1:
+            cmd.append(f"-T{threads}")
+    else:
+        cmd = [bin_path, f"-{level}"]
+        if tool in ("pigz", "gzippy"):
+            cmd.append(f"-p{threads}")
     cmd.extend(["-c", input_file])
     
     times = []
@@ -133,7 +142,7 @@ def benchmark_compress(tool: str, level: int, threads: int,
 
 def benchmark_decompress(tool: str, input_file: str, output_file: str, runs: int) -> Tuple[float, float]:
     """Benchmark decompression. Returns (median_time, stdev)."""
-    bin_path = {"gzip": GZIP, "pigz": PIGZ, "gzippy": GZIPPY}[tool]
+    bin_path = {"gzip": GZIP, "pigz": PIGZ, "igzip": IGZIP, "gzippy": GZIPPY}[tool]
     
     cmd = [bin_path, "-d", "-c", input_file]
     
@@ -152,7 +161,7 @@ def benchmark_decompress(tool: str, input_file: str, output_file: str, runs: int
 
 def check_tools() -> bool:
     """Verify all tools exist."""
-    missing = [t for t in [GZIP, PIGZ, GZIPPY] if not os.path.isfile(t)]
+    missing = [t for t in [GZIP, PIGZ, IGZIP, GZIPPY] if not os.path.isfile(t)]
     if missing:
         print("Missing tools:")
         for t in missing:
@@ -198,7 +207,7 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                     comp_results = {}
                     comp_files = {}
                     
-                    for tool in ["gzip", "pigz", "gzippy"]:
+                    for tool in ["gzip", "pigz", "igzip", "gzippy"]:
                         out_file = tmpdir / f"test.{tool}.l{level}.t{thread_count}.gz"
                         median, stdev, out_size = benchmark_compress(
                             tool, level, thread_count, str(test_file), str(out_file), runs
@@ -206,14 +215,24 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                         comp_results[tool] = (median, stdev, out_size)
                         comp_files[tool] = out_file
                         
-                        print(f"  {tool:5}: {format_time(median):>8} ±{format_time(stdev):>6}  {format_size(out_size):>10}")
+                        print(f"  {tool:6}: {format_time(median):>8} ±{format_time(stdev):>6}  {format_size(out_size):>10}")
                     
-                    # Check gzippy compression performance
+                    # Check gzippy compression performance against all competitors
                     gzippy_time = comp_results["gzippy"][0]
-                    baseline_tool = "gzip" if thread_count == 1 else "pigz"
-                    baseline_time = comp_results[baseline_tool][0]
                     
-                    diff_pct = (gzippy_time / baseline_time - 1) * 100
+                    # Find the fastest competitor (excluding gzip for multi-threaded)
+                    if thread_count == 1:
+                        competitors = {"gzip": comp_results["gzip"][0]}
+                    else:
+                        competitors = {
+                            "pigz": comp_results["pigz"][0],
+                            "igzip": comp_results["igzip"][0],
+                        }
+                    
+                    fastest_name = min(competitors, key=competitors.get)
+                    fastest_time = competitors[fastest_name]
+                    
+                    diff_pct = (gzippy_time / fastest_time - 1) * 100
                     if diff_pct <= MAX_OVERHEAD_PCT:
                         status = "✓ WIN" if diff_pct < 0 else "✓ OK"
                         results["wins"] += 1
@@ -221,7 +240,7 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                         status = "✗ SLOW"
                         results["losses"] += 1
                     
-                    print(f"\n  gzippy vs {baseline_tool}: {diff_pct:+.1f}% {status}")
+                    print(f"\n  gzippy vs {fastest_name}: {diff_pct:+.1f}% {status}")
                     results["details"].append(f"Compress {size_mb}MB L{level} T{thread_count}: {diff_pct:+.1f}%")
                     
                     # === DECOMPRESSION ===
@@ -231,24 +250,27 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                     gzippy_compressed = comp_files["gzippy"]
                     decomp_results = {}
                     
-                    for tool in ["gzip", "pigz", "gzippy"]:
+                    for tool in ["gzip", "pigz", "igzip", "gzippy"]:
                         out_file = tmpdir / f"test.decomp.{tool}.tar"
                         median, stdev = benchmark_decompress(tool, str(gzippy_compressed), str(out_file), runs)
                         decomp_results[tool] = (median, stdev)
-                        print(f"  {tool:5}: {format_time(median):>8} ±{format_time(stdev):>6}")
+                        print(f"  {tool:6}: {format_time(median):>8} ±{format_time(stdev):>6}")
                         out_file.unlink()
                     
                     # Check gzippy decompression performance
                     gzippy_time = decomp_results["gzippy"][0]
-                    # For decompression, compare against gzip (pigz decompression isn't parallelized much)
-                    baseline_time = decomp_results["gzip"][0]
-                    pigz_time = decomp_results["pigz"][0]
                     
-                    # Use the faster of gzip/pigz as baseline
-                    best_baseline = min(baseline_time, pigz_time)
-                    best_name = "gzip" if baseline_time <= pigz_time else "pigz"
+                    # Compare against all competitors
+                    competitors = {
+                        "gzip": decomp_results["gzip"][0],
+                        "pigz": decomp_results["pigz"][0],
+                        "igzip": decomp_results["igzip"][0],
+                    }
                     
-                    diff_pct = (gzippy_time / best_baseline - 1) * 100
+                    fastest_name = min(competitors, key=competitors.get)
+                    fastest_time = competitors[fastest_name]
+                    
+                    diff_pct = (gzippy_time / fastest_time - 1) * 100
                     if diff_pct <= MAX_OVERHEAD_PCT:
                         status = "✓ WIN" if diff_pct < 0 else "✓ OK"
                         results["wins"] += 1
@@ -256,7 +278,7 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                         status = "✗ SLOW"
                         results["losses"] += 1
                     
-                    print(f"\n  gzippy vs {best_name}: {diff_pct:+.1f}% {status}")
+                    print(f"\n  gzippy vs {fastest_name}: {diff_pct:+.1f}% {status}")
                     results["details"].append(f"Decompress {size_mb}MB L{level} T{thread_count}: {diff_pct:+.1f}%")
                     
                     # Clean up compressed files

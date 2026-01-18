@@ -4,9 +4,10 @@
 # Quick tests (<30s) run with 'make' or 'make quick' - for AI tools and iteration
 # Full perf tests (10+ min) run with 'make perf-full' - for humans at release time
 
-# Build configuration - submodules are in ./gzip and ./pigz
+# Build configuration - submodules are in ./gzip, ./pigz, and ./isa-l
 GZIP_DIR := ./gzip
 PIGZ_DIR := ./pigz
+ISAL_DIR := ./isa-l
 GZIPPY_DIR := .
 TEST_DATA_DIR := test_data
 RESULTS_DIR := test_results
@@ -15,6 +16,7 @@ RESULTS_DIR := test_results
 GZIPPY_BIN := $(GZIPPY_DIR)/target/release/gzippy
 UNGZIPPY_BIN := $(GZIPPY_DIR)/target/release/ungzippy
 PIGZ_BIN := $(PIGZ_DIR)/pigz
+IGZIP_BIN := $(ISAL_DIR)/build/igzip
 
 # Prefer local gzip build, fall back to system gzip
 GZIP_BIN := $(shell if [ -x $(GZIP_DIR)/gzip ]; then echo $(GZIP_DIR)/gzip; else echo $$(which gzip); fi)
@@ -33,10 +35,10 @@ all: quick
 
 build: $(GZIPPY_BIN) $(UNGZIPPY_BIN)
 
-deps: $(PIGZ_BIN)
+deps: $(PIGZ_BIN) $(IGZIP_BIN)
 	@# Try to build gzip, but don't fail if it doesn't work
 	@$(MAKE) $(GZIP_DIR)/gzip 2>/dev/null || true
-	@echo "✓ Dependencies ready (gzip: $(GZIP_BIN))"
+	@echo "✓ Dependencies ready (gzip: $(GZIP_BIN), pigz, igzip)"
 
 $(GZIP_DIR)/gzip:
 	@echo "Building gzip from source..."
@@ -54,6 +56,12 @@ $(PIGZ_BIN):
 	@echo "Building pigz from source..."
 	@$(MAKE) -C $(PIGZ_DIR) pigz 2>&1 || (echo "  Cleaning and rebuilding..." && $(MAKE) -C $(PIGZ_DIR) clean >/dev/null 2>&1 && $(MAKE) -C $(PIGZ_DIR) pigz)
 	@echo "✓ Built pigz"
+
+$(IGZIP_BIN):
+	@echo "Building igzip (ISA-L) from source..."
+	@mkdir -p $(ISAL_DIR)/build
+	@cd $(ISAL_DIR)/build && cmake .. >/dev/null 2>&1 && make -j4 igzip 2>&1 | grep -E "(Built|error)" || true
+	@echo "✓ Built igzip"
 
 $(GZIPPY_BIN): FORCE
 	@echo "Building gzippy..."
