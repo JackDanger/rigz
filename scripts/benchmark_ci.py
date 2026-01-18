@@ -70,6 +70,7 @@ def find_tool(name: str) -> str:
         "gzip": ["./gzip/gzip", shutil.which("gzip") or "gzip"],
         "pigz": ["./pigz/pigz"],
         "igzip": ["./isa-l/build/igzip"],
+        "zopfli": ["./zopfli/zopfli"],
         "gzippy": ["./target/release/gzippy"],
     }
     for path in paths.get(name, []):
@@ -186,17 +187,23 @@ def benchmark_compress(tool: str, level: int, threads: int,
     """Benchmark compression. Returns stats dict."""
     bin_path = find_tool(tool)
     
-    # igzip uses levels 0-3, map standard gzip levels
+    # Handle tool-specific command line syntax
     if tool == "igzip":
+        # igzip uses levels 0-3, map standard gzip levels
         igzip_level = min(3, max(0, (level - 1) // 3))
         cmd = [bin_path, f"-{igzip_level}"]
         if threads > 1:
             cmd.append(f"-T{threads}")
+        cmd.extend(["-c", input_file])
+    elif tool == "zopfli":
+        # zopfli uses iterations, not levels. Use fewer iterations for speed.
+        # Default is 15, we use 5 for benchmarks to keep runtime reasonable.
+        cmd = [bin_path, "--i5", "-c", input_file]
     else:
         cmd = [bin_path, f"-{level}"]
         if tool in ("pigz", "gzippy"):
             cmd.append(f"-p{threads}")
-    cmd.extend(["-c", input_file])
+        cmd.extend(["-c", input_file])
     
     # Set up environment for gzippy debug mode
     env = os.environ.copy()
@@ -374,9 +381,13 @@ def main():
         print("\nCompression:")
         
         # Always benchmark all tools for complete comparison
+        # zopfli only at L9 (it's very slow and only makes sense for max compression)
         comp_files = {}
+        tools = ["gzip", "pigz", "igzip", "gzippy"]
+        if args.level >= 9:
+            tools.append("zopfli")
         
-        for tool in ["gzip", "pigz", "igzip", "gzippy"]:
+        for tool in tools:
             out_file = tmpdir / f"test.{tool}.gz"
             try:
                 stats = benchmark_compress(tool, args.level, args.threads,
@@ -384,11 +395,11 @@ def main():
                                          debug=args.debug)
                 results["compression"][tool] = stats
                 comp_files[tool] = out_file
-                print(f"  {tool:6}: {stats['median']:.3f}s (±{stats['stdev']:.3f}s) "
+                print(f"  {tool:7}: {stats['median']:.3f}s (±{stats['stdev']:.3f}s) "
                       f"→ {stats['output_size']:,} bytes")
             except Exception as e:
                 error = f"Compression failed for {tool}: {e}"
-                print(f"  {tool:6}: ERROR - {e}")
+                print(f"  {tool:7}: ERROR - {e}")
                 results["errors"].append(error)
                 results["passed"] = False
         

@@ -55,6 +55,9 @@ jobs:
           cmake ..
           make -j$(nproc) igzip
 
+      - name: Build zopfli
+        run: make -C zopfli zopfli
+
       - name: Detect cores and run benchmark
         run: |
           CORES=$(nproc)
@@ -117,6 +120,9 @@ jobs:
           cd isa-l/build
           cmake ..
           make -j$(nproc) igzip
+
+      - name: Build zopfli
+        run: make -C zopfli zopfli
 
       - name: Check compression ratio
         run: |

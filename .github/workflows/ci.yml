@@ -99,6 +99,9 @@ jobs:
           cmake ..
           make -j$(nproc) igzip
 
+      - name: Build zopfli
+        run: make -C zopfli zopfli
+
       - name: Run validation matrix
         run: |
           CORES=$(nproc)
