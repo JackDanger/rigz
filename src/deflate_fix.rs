@@ -460,7 +460,7 @@ mod tests {
         let mut deflate = Vec::new();
         // Stored block, final
         deflate.push(0b00000001); // BFINAL=1, BTYPE=00
-        // LEN=5, NLEN=~5
+                                  // LEN=5, NLEN=~5
         deflate.extend_from_slice(&[5, 0, 250, 255]);
         // 5 literal bytes
         deflate.extend_from_slice(b"hello");

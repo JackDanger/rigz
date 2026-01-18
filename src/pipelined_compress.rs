@@ -118,9 +118,7 @@ impl PipelinedGzEncoder {
         let level = adjust_compression_level(self.compression_level);
 
         // Write gzip header
-        let header = [
-            0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff,
-        ];
+        let header = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
         writer.write_all(&header)?;
 
         // Split into blocks
@@ -176,9 +174,7 @@ impl PipelinedGzEncoder {
         let level = adjust_compression_level(self.compression_level);
 
         // Write gzip header
-        let header = [
-            0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff,
-        ];
+        let header = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
         writer.write_all(&header)?;
 
         let mut compress = Compress::new(Compression::new(level), false);
