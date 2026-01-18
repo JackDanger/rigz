@@ -198,20 +198,22 @@ This represents the theoretical maximum without:
 ## GHA-Specific Optimizations (4 vCPU)
 
 ### What Works
-1. **Main thread helps compress**: Spawn N-1 workers, main thread both compresses
-   and writes. Avoids 5 threads competing for 4 vCPUs.
-2. **Aggressive spin-wait backoff**: 32 spins → yield → 10μs sleep. GHA vCPUs
-   have high context switch cost, don't waste cycles spinning.
-3. **Batch write operations**: Buffer writes up to 4*block_size, reduces syscalls.
-4. **madvise MADV_SEQUENTIAL**: Hint for mmap prefetching on Linux.
-5. **Fixed 128KB blocks**: Match pigz exactly for compression ratio compliance.
+1. **N workers compress, main thread writes**: Spawn N worker threads that all
+   compress; main thread only writes in order. Maximizes parallelism.
+2. **Hybrid spin/condvar wait**: Brief 64-spin, then condvar with 10μs timeout.
+   Balances latency and CPU efficiency.
+3. **Condvar-based signaling**: Workers signal completion via condvar, main
+   thread sleeps efficiently instead of burning CPU.
+4. **192KB blocks for files >= 50MB**: Reduces coordination overhead from 780
+   to 520 blocks, while staying within compression ratio limits.
+5. **madvise MADV_SEQUENTIAL**: Hint for mmap prefetching.
+6. **Conservative slot capacity**: block_size + 10% + 1KB to handle worst case.
 
 ### What Doesn't Work on GHA
-1. **Larger blocks for big files**: 256KB blocks cause 2%+ size increase on
-   random/incompressible data, violating the 0.5% threshold.
-2. **Small initial slot capacity**: Vec resizing during compression causes
-   data corruption for incompressible data. Always use worst-case capacity.
-3. **Pure spin-wait**: Burns vCPU time that could be used for compression.
+1. **Main thread helping compress**: Causes write delays and serialization.
+2. **256KB blocks for all files**: Exceeds 0.5% size threshold on random data.
+3. **Pure spin-wait**: Burns vCPU time, reduces compression throughput.
+4. **Long condvar timeouts**: Adds latency between block writes.
 
 ### GHA vs Local Performance
 | Metric | Local (Apple M4) | GHA (Intel Xeon 4vCPU) |
