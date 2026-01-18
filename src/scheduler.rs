@@ -15,6 +15,7 @@
 use std::cell::UnsafeCell;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -42,6 +43,79 @@ fn wait_for_ready(slot: &BlockSlot) {
             thread::sleep(Duration::from_micros(50));
         }
         spins += 1;
+    }
+}
+
+type PooledCompressFn =
+    dyn Fn(usize, &[u8], Option<&[u8]>, bool, &mut Vec<u8>) + Sync + Send + 'static;
+
+struct PooledJob {
+    input: Arc<Vec<u8>>,
+    block_size: usize,
+    num_blocks: usize,
+    slots: Arc<Vec<BlockSlot>>,
+    next_block: AtomicUsize,
+    compress_fn: Arc<PooledCompressFn>,
+}
+
+enum PoolCommand {
+    Run(Arc<PooledJob>),
+    Shutdown,
+}
+
+struct BlockPool {
+    sender: mpsc::Sender<PoolCommand>,
+    size: usize,
+}
+
+static BLOCK_POOL: OnceLock<BlockPool> = OnceLock::new();
+
+fn block_pool() -> &'static BlockPool {
+    BLOCK_POOL.get_or_init(|| {
+        let size = num_cpus::get_physical().max(1);
+        let (sender, receiver) = mpsc::channel::<PoolCommand>();
+        let receiver = Arc::new(Mutex::new(receiver));
+
+        for _ in 0..size {
+            let receiver = Arc::clone(&receiver);
+            thread::spawn(move || loop {
+                let command = receiver.lock().unwrap().recv();
+                match command {
+                    Ok(PoolCommand::Run(job)) => worker_loop_pooled(&job),
+                    Ok(PoolCommand::Shutdown) | Err(_) => break,
+                }
+            });
+        }
+
+        BlockPool { sender, size }
+    })
+}
+
+#[inline]
+fn worker_loop_pooled(job: &Arc<PooledJob>) {
+    loop {
+        let block_idx = job.next_block.fetch_add(1, Ordering::Relaxed);
+        if block_idx >= job.num_blocks {
+            break;
+        }
+
+        let start = block_idx * job.block_size;
+        let end = (start + job.block_size).min(job.input.len());
+        let block = &job.input[start..end];
+
+        let dict = if block_idx > 0 {
+            let dict_end = start;
+            let dict_start = dict_end.saturating_sub(32768);
+            Some(&job.input[dict_start..dict_end])
+        } else {
+            None
+        };
+
+        let is_last = block_idx == job.num_blocks - 1;
+        let output = unsafe { job.slots[block_idx].data_mut() };
+
+        (job.compress_fn)(block_idx, block, dict, is_last, output);
+        job.slots[block_idx].mark_ready();
     }
 }
 
@@ -164,6 +238,55 @@ where
 
         Ok(())
     })
+}
+
+/// Compress blocks in parallel using a shared thread pool (for small inputs)
+pub fn compress_parallel_pooled<W, F>(
+    input: Vec<u8>,
+    block_size: usize,
+    num_threads: usize,
+    mut writer: W,
+    compress_fn: F,
+) -> io::Result<()>
+where
+    W: Write,
+    F: Fn(usize, &[u8], Option<&[u8]>, bool, &mut Vec<u8>) + Sync + Send + 'static,
+{
+    let num_blocks = input.len().div_ceil(block_size);
+    if num_blocks == 0 {
+        return Ok(());
+    }
+
+    let slot_capacity = block_size + (block_size / 10) + 1024;
+    let slots: Arc<Vec<BlockSlot>> = Arc::new(
+        (0..num_blocks)
+            .map(|_| BlockSlot::new(slot_capacity))
+            .collect(),
+    );
+
+    let job = Arc::new(PooledJob {
+        input: Arc::new(input),
+        block_size,
+        num_blocks,
+        slots: Arc::clone(&slots),
+        next_block: AtomicUsize::new(0),
+        compress_fn: Arc::new(compress_fn),
+    });
+
+    let pool = block_pool();
+    let active_workers = num_threads.min(pool.size);
+    for _ in 0..active_workers {
+        pool.sender
+            .send(PoolCommand::Run(Arc::clone(&job)))
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err.to_string()))?;
+    }
+
+    for i in 0..num_blocks {
+        wait_for_ready(&slots[i]);
+        writer.write_all(slots[i].data())?;
+    }
+
+    Ok(())
 }
 
 /// Worker thread loop

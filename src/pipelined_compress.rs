@@ -15,7 +15,7 @@
 //! This is used when compression_level >= 7 and threads > 1.
 
 use crate::parallel_compress::adjust_compression_level;
-use crate::scheduler::compress_parallel;
+use crate::scheduler::{compress_parallel, compress_parallel_pooled};
 use flate2::write::GzEncoder;
 use flate2::{Compress, Compression, FlushCompress, Status};
 use std::cell::{RefCell, UnsafeCell};
@@ -34,6 +34,11 @@ const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
 
 /// Dictionary size (DEFLATE maximum is 32KB)
 const DICT_SIZE: usize = 32 * 1024;
+const POOL_MAX_INPUT: usize = 4 * 1024 * 1024;
+
+struct CrcSlot(UnsafeCell<MaybeUninit<crc32fast::Hasher>>);
+// Safety: each slot is written by exactly one worker before all threads join.
+unsafe impl Sync for CrcSlot {}
 
 #[inline]
 fn pipelined_block_size(input_len: usize, num_threads: usize, level: u32) -> usize {
@@ -79,6 +84,10 @@ impl PipelinedGzEncoder {
         }
 
         if self.num_threads > 1 {
+            if input_data.len() <= POOL_MAX_INPUT {
+                self.compress_parallel_pipeline_pooled(input_data, writer)?;
+                return Ok(bytes_read);
+            }
             self.compress_parallel_pipeline(&input_data, writer)?;
         } else {
             self.compress_sequential(&input_data, writer)?;
@@ -104,6 +113,11 @@ impl PipelinedGzEncoder {
         let mmap = unsafe { Mmap::map(&file)? };
 
         if self.num_threads > 1 {
+            if file_len <= POOL_MAX_INPUT {
+                let data = mmap.to_vec();
+                self.compress_parallel_pipeline_pooled(data, writer)?;
+                return Ok(file_len as u64);
+            }
             self.compress_parallel_pipeline(&mmap, writer)?;
         } else {
             self.compress_sequential(&mmap, writer)?;
@@ -132,9 +146,6 @@ impl PipelinedGzEncoder {
 
         // Use a CRC combiner to compute final CRC
         // Each block's CRC is computed in parallel, then combined
-        struct CrcSlot(UnsafeCell<MaybeUninit<crc32fast::Hasher>>);
-        // Safety: each slot is written by exactly one worker before all threads join.
-        unsafe impl Sync for CrcSlot {}
         let crc_parts: Vec<CrcSlot> = (0..num_blocks)
             .map(|_| CrcSlot(UnsafeCell::new(MaybeUninit::uninit())))
             .collect();
@@ -161,6 +172,58 @@ impl PipelinedGzEncoder {
         // Combine CRCs in order
         let mut combined_hasher = crc32fast::Hasher::new();
         for part in &crc_parts {
+            let hasher = unsafe { (*part.0.get()).assume_init_read() };
+            combined_hasher.combine(&hasher);
+        }
+        let combined_crc = combined_hasher.finalize();
+
+        // Write gzip trailer
+        let isize = (data.len() as u32).to_le_bytes();
+        writer.write_all(&combined_crc.to_le_bytes())?;
+        writer.write_all(&isize)?;
+
+        Ok(())
+    }
+
+    fn compress_parallel_pipeline_pooled<W: Write>(
+        &self,
+        data: Vec<u8>,
+        mut writer: W,
+    ) -> io::Result<()> {
+        let level = adjust_compression_level(self.compression_level);
+        let block_size = pipelined_block_size(data.len(), self.num_threads, level);
+        let num_blocks = data.len().div_ceil(block_size);
+
+        // Write gzip header
+        let header = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
+        writer.write_all(&header)?;
+
+        let crc_parts: Vec<CrcSlot> = (0..num_blocks)
+            .map(|_| CrcSlot(UnsafeCell::new(MaybeUninit::uninit())))
+            .collect();
+
+        let crc_parts = std::sync::Arc::new(crc_parts);
+        let crc_parts_worker = std::sync::Arc::clone(&crc_parts);
+
+        compress_parallel_pooled(
+            data,
+            block_size,
+            self.num_threads,
+            &mut writer,
+            move |block_idx, block, dict, is_last, output| {
+                compress_block_with_dict(block, dict, level, block_size, is_last, output);
+
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(block);
+                unsafe {
+                    *crc_parts_worker[block_idx].0.get() = MaybeUninit::new(hasher);
+                }
+            },
+        )?;
+
+        // Combine CRCs in order
+        let mut combined_hasher = crc32fast::Hasher::new();
+        for part in crc_parts.iter() {
             let hasher = unsafe { (*part.0.get()).assume_init_read() };
             combined_hasher.combine(&hasher);
         }
