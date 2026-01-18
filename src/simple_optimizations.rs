@@ -126,14 +126,13 @@ impl SimpleOptimizer {
         Ok(bytes_written)
     }
 
-    /// Calculate optimal thread count based on CPU features and request
+    /// Calculate optimal thread count based on request
     fn calculate_optimal_threads(&self) -> usize {
-        let base_threads = self.config.thread_count;
-        let cpu = CpuFeatures::get();
-
-        // Cap at physical cores to avoid hyperthreading contention
-        // for CPU-bound compression work
-        base_threads.min(cpu.physical_cores)
+        // Use the requested thread count directly.
+        // On GHA and similar VMs, physical_cores may report fewer cores
+        // than available vCPUs (e.g., 2 physical on 4 vCPU), which hurts
+        // performance. pigz uses all available threads and so should we.
+        self.config.thread_count
     }
 
     /// Get CPU feature summary for debugging/verbosity
@@ -170,9 +169,9 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn test_thread_count_capped_at_physical_cores() {
+    fn test_thread_count_respects_request() {
         let config = OptimizationConfig {
-            thread_count: 100, // Request way more than available
+            thread_count: 4,
             buffer_size: 65536,
             backend: CompressionBackend::Parallel,
             content_type: ContentType::Binary,
@@ -181,9 +180,10 @@ mod tests {
         };
 
         let optimizer = SimpleOptimizer::new(config);
-        let physical_cores = CpuFeatures::get().physical_cores;
-        // Thread count should be capped at physical cores
-        assert_eq!(optimizer.calculate_optimal_threads(), physical_cores);
+        // Thread count should match the requested count exactly
+        // (no longer capped at physical cores - VM environments report
+        // fewer physical cores than available vCPUs)
+        assert_eq!(optimizer.calculate_optimal_threads(), 4);
     }
 
     #[test]
