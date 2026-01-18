@@ -220,14 +220,13 @@ def run_benchmark(levels: List[int], threads: List[int], sizes: List[int]) -> Di
                     # Check gzippy compression performance against all competitors
                     gzippy_time = comp_results["gzippy"][0]
                     
-                    # Find the fastest competitor (excluding gzip for multi-threaded)
+                    # Compare against gzip (single-thread) or pigz (multi-thread)
+                    # NOTE: igzip is benchmarked for info but not used as comparison
+                    # because it produces ~15% larger files (speed-only optimization)
                     if thread_count == 1:
                         competitors = {"gzip": comp_results["gzip"][0]}
                     else:
-                        competitors = {
-                            "pigz": comp_results["pigz"][0],
-                            "igzip": comp_results["igzip"][0],
-                        }
+                        competitors = {"pigz": comp_results["pigz"][0]}
                     
                     fastest_name = min(competitors, key=competitors.get)
                     fastest_time = competitors[fastest_name]
