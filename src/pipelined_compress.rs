@@ -52,12 +52,15 @@ fn get_block_size_for_file(level: u32, file_size: usize) -> usize {
         // Dynamic sizing for L9 based on file size
         // Larger blocks reduce coordination overhead, especially important on
         // resource-constrained systems like GHA VMs (4 cores)
-        if file_size < 10 * 1024 * 1024 {
-            128 * 1024 // 128KB for small files
-        } else if file_size < 50 * 1024 * 1024 {
-            256 * 1024 // 256KB for medium files
+        //
+        // Key insight: pigz is highly optimized for its block pipeline.
+        // On 4-core VMs, we need larger blocks to reduce relative overhead.
+        if file_size < 5 * 1024 * 1024 {
+            256 * 1024 // 256KB for very small files
+        } else if file_size < 20 * 1024 * 1024 {
+            512 * 1024 // 512KB for small/medium files (10MB → ~20 blocks)
         } else {
-            512 * 1024 // 512KB for large files - significantly less overhead
+            1024 * 1024 // 1MB for large files (100MB → ~100 blocks)
         }
     } else {
         BLOCK_SIZE_DEFAULT
