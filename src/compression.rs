@@ -215,7 +215,7 @@ fn compress_directory(dirname: &str, args: &RigzArgs) -> RigzResult<i32> {
     Ok(exit_code)
 }
 
-fn compress_with_pipeline<R: Read, W: Write>(
+fn compress_with_pipeline<R: Read, W: Write + Send>(
     mut reader: R,
     writer: W,
     args: &RigzArgs,

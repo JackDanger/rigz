@@ -23,9 +23,6 @@ libdeflater = "1.0"
 # Low-level bindings for _ex functions (returns consumed bytes)
 libdeflate-sys = "1.0"
 
-# Parallel processing
-rayon = "1.8"
-
 # CLI and utilities  
 clap = { version = "4.5", features = ["derive"] }
 walkdir = "2.4"
@@ -38,10 +35,6 @@ memmap2 = "0.9"
 # Error handling
 anyhow = "1.0"
 thiserror = "1.0"
-
-# Parallelization utilities (used by rayon)
-crossbeam-channel = "0.5"
-crossbeam-deque = "0.8"
 
 # CRC32 (hardware-accelerated on ARM/x86)
 crc32fast = "1.4"
@@ -59,11 +52,11 @@ assert_cmd = "2.0"
 predicates = "3.0"
 
 [profile.release]
-lto = true
-codegen-units = 1
-panic = "abort"
-opt-level = 3
-strip = true
+lto = "fat"           # Full cross-crate LTO (slower build, faster binary)
+codegen-units = 1     # Single codegen unit for maximum optimization
+panic = "abort"       # Smaller binary, no unwinding overhead
+opt-level = 3         # Maximum optimization
+strip = true          # Remove symbols for smaller binary
 
 # Enable native CPU optimizations when building locally
 # (commented out for portable binaries - uncomment for max local perf)

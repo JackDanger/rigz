@@ -9,6 +9,10 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_HOME: /home/runner/.cargo
+  CARGO_INCREMENTAL: 0
+  # Enable native CPU optimizations for maximum performance
+  RUSTFLAGS: -C target-cpu=native
 
 jobs:
   benchmark:
@@ -55,12 +59,18 @@ jobs:
           # Strict thresholds: rigz must beat pigz everywhere
           # L1-8: Speed must beat pigz (0% overhead), size within 5%
           # L9: Size must match pigz (0.5%), speed within 10%
+          # Enable debug for L9 to diagnose GHA slowdown
+          DEBUG_FLAG=""
+          if [ "${{ matrix.level }}" = "9" ]; then
+            DEBUG_FLAG="--debug"
+          fi
           python3 scripts/benchmark_ci.py \
             --size ${{ matrix.size }} \
             --level ${{ matrix.level }} \
             --threads $THREADS \
             --data-type text \
-            --output benchmark-results.json
+            --output benchmark-results.json \
+            $DEBUG_FLAG
 
       - name: Upload results
         uses: actions/upload-artifact@v4
@@ -107,12 +117,18 @@ jobs:
           
           # Strict thresholds based on level
           # L9 gets special treatment (size priority)
+          # Enable debug for L9 to diagnose GHA slowdown
+          DEBUG_FLAG=""
+          if [ "${{ matrix.level }}" = "9" ]; then
+            DEBUG_FLAG="--debug"
+          fi
           python3 scripts/benchmark_ci.py \
             --size 10 \
             --level ${{ matrix.level }} \
             --threads $THREADS \
             --data-type text \
-            --output ratio-results.json
+            --output ratio-results.json \
+            $DEBUG_FLAG
 
   summary:
     name: Performance Summary

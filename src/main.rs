@@ -16,6 +16,7 @@ mod libdeflate_ext;
 mod optimization;
 mod parallel_compress;
 mod pipelined_compress;
+mod scheduler;
 mod simple_optimizations;
 mod utils;
 

@@ -45,10 +45,11 @@ fn alloc_aligned_buffer(size: usize) -> Vec<u8> {
 
 use std::cell::RefCell;
 
-// Thread-local decompressor to avoid repeated initialization overhead
+// Thread-local decompressor and buffer to avoid repeated allocation
 thread_local! {
     static DECOMPRESSOR: RefCell<libdeflater::Decompressor> =
         RefCell::new(libdeflater::Decompressor::new());
+    static DECOMPRESS_BUF: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(1024 * 1024));
 }
 
 pub fn decompress_file(filename: &str, args: &RigzArgs) -> RigzResult<i32> {
@@ -306,74 +307,124 @@ fn parse_bgzf_blocks(data: &[u8]) -> (Vec<(usize, usize)>, bool) {
 
 /// Parallel decompression for BGZF-style files (rigz output)
 /// Uses embedded block size markers to find boundaries without inflating
+///
+/// Uses our custom scheduler for zero-overhead parallelism with streaming output.
 fn decompress_bgzf_parallel<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
-    use libdeflater::{DecompressionError, Decompressor};
-    use rayon::prelude::*;
+    use libdeflater::DecompressionError;
+    use std::cell::UnsafeCell;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
 
     let (blocks, consumed_all) = parse_bgzf_blocks(data);
 
     // Fall back to sequential if we couldn't parse ALL blocks
-    // This handles files with overflow markers or mixed content
     if blocks.is_empty() || !consumed_all {
         return decompress_multi_member_sequential(data, writer);
     }
 
-    // For few blocks, sequential is faster (avoids rayon overhead)
+    // For few blocks, sequential is faster (avoids thread overhead)
     if blocks.len() < 4 {
         return decompress_multi_member_sequential(data, writer);
     }
 
-    // Decompress blocks in parallel
-    let results: Vec<Result<Vec<u8>, String>> = blocks
-        .par_iter()
-        .map(|&(start, len)| {
-            let block_data = &data[start..start + len];
-            let mut decompressor = Decompressor::new();
+    let num_blocks = blocks.len();
+    let num_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(num_blocks);
 
-            // Read ISIZE from trailer for buffer sizing
-            let isize_hint = if len >= 8 {
-                let trailer = &block_data[len - 4..];
-                u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]) as usize
-            } else {
-                0
-            };
+    // Output slot for each block
+    struct Slot {
+        ready: AtomicBool,
+        data: UnsafeCell<Vec<u8>>,
+    }
+    unsafe impl Sync for Slot {}
 
-            let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
-                isize_hint + 1024
-            } else {
-                len.saturating_mul(4).max(64 * 1024)
-            };
-
-            let mut output = vec![0u8; initial_size];
-
-            loop {
-                match decompressor.gzip_decompress(block_data, &mut output) {
-                    Ok(size) => {
-                        output.truncate(size);
-                        return Ok(output);
-                    }
-                    Err(DecompressionError::InsufficientSpace) => {
-                        let new_size = output.len().saturating_mul(2);
-                        output.resize(new_size, 0);
-                        continue;
-                    }
-                    Err(e) => return Err(format!("decompression error: {:?}", e)),
-                }
-            }
+    let slots: Vec<Slot> = (0..num_blocks)
+        .map(|_| Slot {
+            ready: AtomicBool::new(false),
+            data: UnsafeCell::new(Vec::with_capacity(128 * 1024)),
         })
         .collect();
 
-    // Collect results and write in order
+    let next_block = AtomicUsize::new(0);
     let mut total_bytes = 0u64;
-    for result in results {
-        match result {
-            Ok(decompressed) => {
-                writer.write_all(&decompressed)?;
-                total_bytes += decompressed.len() as u64;
-            }
-            Err(e) => return Err(RigzError::invalid_argument(e)),
+
+    thread::scope(|scope| {
+        // Spawn worker threads
+        for _ in 0..num_threads {
+            scope.spawn(|| {
+                loop {
+                    let idx = next_block.fetch_add(1, Ordering::Relaxed);
+                    if idx >= num_blocks {
+                        break;
+                    }
+
+                    let (start, len) = blocks[idx];
+                    let block_data = &data[start..start + len];
+
+                    // Read ISIZE from trailer for buffer sizing
+                    let isize_hint = if len >= 8 {
+                        let trailer = &block_data[len - 4..];
+                        u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]])
+                            as usize
+                    } else {
+                        0
+                    };
+
+                    let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
+                        isize_hint + 1024
+                    } else {
+                        len.saturating_mul(4).max(64 * 1024)
+                    };
+
+                    // Use thread-local decompressor
+                    DECOMPRESSOR.with(|decomp_cell| {
+                        let mut decompressor = decomp_cell.borrow_mut();
+                        let output = unsafe { &mut *slots[idx].data.get() };
+
+                        output.clear();
+                        if output.capacity() < initial_size {
+                            output.reserve(initial_size - output.capacity());
+                        }
+                        output.resize(initial_size, 0);
+
+                        loop {
+                            match decompressor.gzip_decompress(block_data, output) {
+                                Ok(size) => {
+                                    output.truncate(size);
+                                    break;
+                                }
+                                Err(DecompressionError::InsufficientSpace) => {
+                                    let new_size = output.len().saturating_mul(2);
+                                    output.resize(new_size, 0);
+                                    continue;
+                                }
+                                Err(_) => {
+                                    output.clear();
+                                    break;
+                                }
+                            }
+                        }
+                    });
+
+                    slots[idx].ready.store(true, Ordering::Release);
+                }
+            });
         }
-    }
+
+        // Main thread: stream output in order
+        for slot in slots.iter() {
+            while !slot.ready.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
+            let output = unsafe { &*slot.data.get() };
+            if !output.is_empty() {
+                writer.write_all(output).unwrap();
+                total_bytes += output.len() as u64;
+            }
+        }
+    });
 
     writer.flush()?;
     Ok(total_bytes)
@@ -589,126 +640,6 @@ fn find_member_boundaries(data: &[u8]) -> Vec<(usize, usize)> {
     }
 
     boundaries
-}
-
-/// Parallel multi-member decompression using rayon + libdeflate
-///
-/// Note: Currently unused - requires finding member boundaries first,
-/// which means decompressing once to find boundaries, then again in parallel.
-/// This 2x overhead made it slower for files with many small members.
-#[allow(dead_code)]
-fn decompress_multi_member_parallel<W: Write>(data: &[u8], writer: &mut W) -> RigzResult<u64> {
-    use libdeflater::{DecompressionError, Decompressor};
-    use rayon::prelude::*;
-    use std::io::IoSlice;
-
-    // Find member boundaries (this is sequential but fast)
-    let boundaries = find_member_boundaries(data);
-
-    // Need at least 2 members to benefit from parallelism
-    if boundaries.len() < 2 {
-        return decompress_multi_member_sequential(data, writer);
-    }
-
-    // Decompress members in parallel
-    let results: Vec<Result<Vec<u8>, String>> = boundaries
-        .par_iter()
-        .map(|&(start, len)| {
-            let member_data = &data[start..start + len];
-            let mut decompressor = Decompressor::new();
-
-            // Estimate output size from ISIZE trailer (last 4 bytes of member)
-            let isize_hint = if len >= 8 {
-                let trailer = &member_data[len - 4..];
-                u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]) as usize
-            } else {
-                0
-            };
-
-            let initial_size = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
-                isize_hint + 1024
-            } else {
-                len.saturating_mul(4).max(64 * 1024)
-            };
-
-            let mut output = vec![0u8; initial_size];
-
-            loop {
-                match decompressor.gzip_decompress(member_data, &mut output) {
-                    Ok(size) => {
-                        output.truncate(size);
-                        return Ok(output);
-                    }
-                    Err(DecompressionError::InsufficientSpace) => {
-                        let new_size = output.len().saturating_mul(2);
-                        output.resize(new_size, 0);
-                        continue;
-                    }
-                    Err(e) => return Err(format!("decompression error: {:?}", e)),
-                }
-            }
-        })
-        .collect();
-
-    // Collect successful results and check for errors
-    let mut decompressed_blocks: Vec<Vec<u8>> = Vec::with_capacity(results.len());
-    for result in results {
-        match result {
-            Ok(block) => decompressed_blocks.push(block),
-            Err(e) => return Err(RigzError::invalid_argument(e)),
-        }
-    }
-
-    // Use vectorized I/O to write all blocks efficiently
-    let total_bytes: u64 = decompressed_blocks.iter().map(|b| b.len() as u64).sum();
-
-    // For many blocks, use write_vectored to reduce syscalls
-    if decompressed_blocks.len() > 4 {
-        const MAX_IOVECS: usize = 64;
-        for chunk in decompressed_blocks.chunks(MAX_IOVECS) {
-            let slices: Vec<IoSlice<'_>> = chunk.iter().map(|b| IoSlice::new(b)).collect();
-            let mut remaining = &slices[..];
-
-            while !remaining.is_empty() {
-                let written = writer.write_vectored(remaining)?;
-                if written == 0 {
-                    return Err(RigzError::Io(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "failed to write decompressed data",
-                    )));
-                }
-
-                // Advance past written data
-                let mut bytes_left = written;
-                let mut consumed = 0;
-                for slice in remaining.iter() {
-                    if bytes_left >= slice.len() {
-                        bytes_left -= slice.len();
-                        consumed += 1;
-                    } else {
-                        break;
-                    }
-                }
-                remaining = &remaining[consumed..];
-
-                // Handle partial writes
-                if bytes_left > 0 && !remaining.is_empty() {
-                    writer.write_all(&remaining[0][bytes_left..])?;
-                    for slice in &remaining[1..] {
-                        writer.write_all(slice)?;
-                    }
-                    break;
-                }
-            }
-        }
-    } else {
-        for block in &decompressed_blocks {
-            writer.write_all(block)?;
-        }
-    }
-
-    writer.flush()?;
-    Ok(total_bytes)
 }
 
 /// Decompress zlib using libdeflate

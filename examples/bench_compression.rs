@@ -57,7 +57,7 @@ fn main() {
         let mut libdeflate_size = 0;
         for _ in 0..5 {
             let start = Instant::now();
-            let lvl = CompressionLvl::new(level as i32).unwrap_or(CompressionLvl::default());
+            let lvl = CompressionLvl::new(level as i32).unwrap_or_default();
             let mut compressor = Compressor::new(lvl);
             let max_size = compressor.gzip_compress_bound(data.len());
             let mut result = vec![0u8; max_size];

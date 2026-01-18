@@ -369,7 +369,7 @@ mod tests {
     fn test_thread_count_respects_request() {
         // Thread count should respect the request (capped at CPU count)
         let result = optimal_thread_count(4, 10_000_000, 6);
-        assert!(result >= 1 && result <= 4);
+        assert!((1..=4).contains(&result));
     }
 
     #[test]

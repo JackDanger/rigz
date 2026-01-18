@@ -15,65 +15,45 @@
 //! This is used when compression_level >= 7 and threads > 1.
 
 use crate::parallel_compress::adjust_compression_level;
+use crate::scheduler::compress_parallel;
 use flate2::write::GzEncoder;
 use flate2::{Compress, Compression, FlushCompress, Status};
-use rayon::prelude::*;
+use std::cell::{RefCell, UnsafeCell};
 use std::io::{self, Read, Write};
+use std::mem::MaybeUninit;
 use std::path::Path;
-use std::sync::OnceLock;
 
-/// Block size for pipelined compression
-/// 128KB is the default for pigz at lower levels.
-const BLOCK_SIZE_DEFAULT: usize = 128 * 1024;
+// Thread-local Compress object to avoid reinitializing zlib state (~300KB) per block
+// Note: We store Option<(level, Compress)> to cache by level
+thread_local! {
+    static PIPELINED_COMPRESS: RefCell<Option<(u32, Compress)>> = const { RefCell::new(None) };
+}
+
+/// Default block size for pipelined compression - matches pigz (128KB)
+const DEFAULT_BLOCK_SIZE: usize = 128 * 1024;
 
 /// Dictionary size (DEFLATE maximum is 32KB)
 const DICT_SIZE: usize = 32 * 1024;
 
-/// Get optimal block size for pipelined compression
-/// 
-/// For L9, we dynamically size blocks based on file size:
-/// - Small files (<10MB): 64KB blocks for more parallelism
-/// - Medium files (10-50MB): 128KB blocks
-/// - Large files (50MB+): 256KB blocks to reduce overhead
+struct CrcSlot(UnsafeCell<MaybeUninit<crc32fast::Hasher>>);
+// Safety: each slot is written by exactly one worker before all threads join.
+unsafe impl Sync for CrcSlot {}
+
+/// Block size for pipelined compression.
 ///
-/// This reduces the 7% overhead seen on 100MB files in GHA.
+/// For GHA's 4-vCPU environment with 100MB+ files, the coordination overhead
+/// of 780+ blocks dominates. Use slightly larger blocks (192KB) for very large
+/// files to reduce block count while staying within compression ratio limits.
 #[inline]
-fn get_block_size_for_file(level: u32, file_size: usize) -> usize {
-    if level >= 9 {
-        // Dynamic sizing for L9 based on file size
-        if file_size < 10 * 1024 * 1024 {
-            64 * 1024  // 64KB for small files - more parallelism
-        } else if file_size < 50 * 1024 * 1024 {
-            128 * 1024 // 128KB for medium files
-        } else {
-            256 * 1024 // 256KB for large files - less overhead
-        }
+fn pipelined_block_size(input_len: usize, _num_threads: usize, _level: u32) -> usize {
+    if input_len >= 50 * 1024 * 1024 {
+        // For files >= 50MB, use 192KB blocks (520 blocks for 100MB)
+        // This is a compromise between pigz's 128KB and our tested 256KB
+        192 * 1024
     } else {
-        BLOCK_SIZE_DEFAULT
+        // Match pigz for smaller files
+        DEFAULT_BLOCK_SIZE
     }
-}
-
-/// Get block size (legacy interface without file size)
-#[inline]
-fn get_block_size(level: u32) -> usize {
-    // Default to small file behavior when file size unknown
-    if level >= 9 {
-        64 * 1024
-    } else {
-        BLOCK_SIZE_DEFAULT
-    }
-}
-
-/// Global thread pool for pipelined compression
-static PIPELINE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-
-fn get_pipeline_pool(num_threads: usize) -> &'static rayon::ThreadPool {
-    PIPELINE_POOL.get_or_init(|| {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(num_threads)
-            .build()
-            .expect("Failed to create pipeline thread pool")
-    })
 }
 
 /// Pipelined gzip compression with dictionary sharing
@@ -96,7 +76,7 @@ impl PipelinedGzEncoder {
     }
 
     /// Compress data with dictionary sharing
-    pub fn compress<R: Read, W: Write>(&self, mut reader: R, writer: W) -> io::Result<u64> {
+    pub fn compress<R: Read, W: Write + Send>(&self, mut reader: R, writer: W) -> io::Result<u64> {
         // Read all input data
         let mut input_data = Vec::new();
         let bytes_read = reader.read_to_end(&mut input_data)? as u64;
@@ -117,7 +97,11 @@ impl PipelinedGzEncoder {
     }
 
     /// Compress file using memory-mapped I/O with dictionary sharing
-    pub fn compress_file<P: AsRef<Path>, W: Write>(&self, path: P, writer: W) -> io::Result<u64> {
+    pub fn compress_file<P: AsRef<Path>, W: Write + Send>(
+        &self,
+        path: P,
+        writer: W,
+    ) -> io::Result<u64> {
         use memmap2::Mmap;
         use std::fs::File;
 
@@ -133,6 +117,12 @@ impl PipelinedGzEncoder {
         // Memory-map the file for zero-copy access
         let mmap = unsafe { Mmap::map(&file)? };
 
+        // Hint to kernel that we'll access the data sequentially
+        #[cfg(unix)]
+        {
+            let _ = mmap.advise(memmap2::Advice::Sequential);
+        }
+
         if self.num_threads > 1 {
             self.compress_parallel_pipeline(&mmap, writer)?;
         } else {
@@ -141,74 +131,65 @@ impl PipelinedGzEncoder {
         Ok(file_len as u64)
     }
 
-    /// Parallel pipelined compression (pigz-style)
+    /// Parallel pipelined compression using custom scheduler
     ///
     /// Each block is compressed with dictionary = previous block's input data.
     /// Blocks are compressed in parallel since we have all input data upfront.
-    /// Output is collected and written in order.
+    /// Output is streamed in order as blocks complete.
     ///
-    /// Optimizations:
-    /// - Level-dependent block size (256KB at L9 for lower overhead)
-    /// - Pre-allocated output buffers
-    /// - Parallel CRC computation (combined at end)
-    fn compress_parallel_pipeline<W: Write>(&self, data: &[u8], mut writer: W) -> io::Result<()> {
+    /// Uses our custom scheduler instead of rayon for:
+    /// - Zero work-stealing overhead (uniform block sizes)
+    /// - Streaming output (no bulk collection)
+    /// - Pre-allocated buffers (no allocation in hot path)
+    fn compress_parallel_pipeline<W: Write + Send>(
+        &self,
+        data: &[u8],
+        mut writer: W,
+    ) -> io::Result<()> {
         let level = adjust_compression_level(self.compression_level);
-        let block_size = get_block_size_for_file(self.compression_level, data.len());
+        let data_len = data.len();
+        let block_size = pipelined_block_size(data_len, self.num_threads, level);
+        let num_blocks = data_len.div_ceil(block_size);
 
-        // Write gzip header
+        // Write gzip header before spawning threads
         let header = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
         writer.write_all(&header)?;
 
-        // Split into blocks
-        let blocks: Vec<&[u8]> = data.chunks(block_size).collect();
-        let n_blocks = blocks.len();
+        // Use a CRC combiner to compute final CRC
+        // Each block's CRC is computed in parallel, then combined
+        let crc_parts: Vec<CrcSlot> = (0..num_blocks)
+            .map(|_| CrcSlot(UnsafeCell::new(MaybeUninit::uninit())))
+            .collect();
 
-        // Create jobs: each job knows its block index and can access previous block for dict
-        let pool = get_pipeline_pool(self.num_threads);
+        // Compress all blocks using custom scheduler with dedicated writer thread
+        let mut writer = compress_parallel(
+            data,
+            block_size,
+            self.num_threads,
+            writer,
+            |block_idx, block, dict, is_last, output| {
+                // Compress this block with dictionary
+                compress_block_with_dict(block, dict, level, block_size, is_last, output);
 
-        // Compress all blocks in parallel AND compute CRC per block
-        // Each block gets the previous block's last 32KB as dictionary
-        // Returns (compressed_data, crc_hasher) for CRC combining
-        let results: Vec<(Vec<u8>, crc32fast::Hasher)> = pool.install(|| {
-            (0..n_blocks)
-                .into_par_iter()
-                .map(|i| {
-                    let block = blocks[i];
-                    let dict = if i > 0 {
-                        let prev = blocks[i - 1];
-                        if prev.len() > DICT_SIZE {
-                            Some(&prev[prev.len() - DICT_SIZE..])
-                        } else {
-                            Some(prev)
-                        }
-                    } else {
-                        None
-                    };
-                    let is_last = i == n_blocks - 1;
-                    let compressed =
-                        compress_block_with_dict(block, dict, level, is_last, block_size);
-                    // Compute CRC for this block using Hasher (preserves state for combining)
-                    let mut hasher = crc32fast::Hasher::new();
-                    hasher.update(block);
-                    (compressed, hasher)
-                })
-                .collect()
-        });
+                // Compute CRC for this block
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(block);
+                unsafe {
+                    *crc_parts[block_idx].0.get() = MaybeUninit::new(hasher);
+                }
+            },
+        )?;
 
-        // Write all compressed blocks in order
-        for (block, _) in &results {
-            writer.write_all(block)?;
-        }
-
-        // Combine CRCs using crc32fast's combine method
-        // This uses the mathematical property of CRC32 for combining
+        // Combine CRCs in order
         let mut combined_hasher = crc32fast::Hasher::new();
-        for (_, block_hasher) in &results {
-            combined_hasher.combine(block_hasher);
+        for part in &crc_parts {
+            let hasher = unsafe { (*part.0.get()).assume_init_read() };
+            combined_hasher.combine(&hasher);
         }
         let combined_crc = combined_hasher.finalize();
 
-        let isize = (data.len() as u32).to_le_bytes();
+        // Write gzip trailer
+        let isize = (data_len as u32).to_le_bytes();
         writer.write_all(&combined_crc.to_le_bytes())?;
         writer.write_all(&isize)?;
 
@@ -220,13 +201,13 @@ impl PipelinedGzEncoder {
         use crc32fast::Hasher;
 
         let level = adjust_compression_level(self.compression_level);
-        let block_size = get_block_size(self.compression_level);
 
         // Write gzip header
         let header = [0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0xff];
         writer.write_all(&header)?;
 
         let mut compress = Compress::new(Compression::new(level), false);
+        let block_size = pipelined_block_size(data.len(), 1, level);
         let mut output_buf = vec![0u8; block_size * 2];
         let mut crc_hasher = Hasher::new();
 
@@ -289,63 +270,79 @@ impl PipelinedGzEncoder {
 
 /// Compress a single block with optional dictionary
 ///
-/// Pre-allocates output buffer based on block_size to avoid resizing.
-/// For highly compressible data, the output is typically 40-60% of input.
-/// We allocate generously to avoid any resizing during compression.
+/// Uses thread-local Compress object to avoid per-block allocation.
 fn compress_block_with_dict(
     block: &[u8],
     dict: Option<&[u8]>,
     level: u32,
-    is_last: bool,
     block_size: usize,
-) -> Vec<u8> {
-    let mut compress = Compress::new(Compression::new(level), false);
+    is_last: bool,
+    output: &mut Vec<u8>,
+) {
+    PIPELINED_COMPRESS.with(|comp_cell| {
+        let mut comp_opt = comp_cell.borrow_mut();
 
-    // Set dictionary if provided
-    if let Some(d) = dict {
-        let _ = compress.set_dictionary(d);
-    }
+        output.clear();
 
-    let flush = if is_last {
-        FlushCompress::Finish
-    } else {
-        FlushCompress::Sync
-    };
-
-    // Pre-allocate based on block size (worst case: uncompressible data grows ~0.1%)
-    // Using block_size + 10% + 1KB for headers/sync markers
-    let initial_capacity = block_size + (block_size / 10) + 1024;
-    let mut output = vec![0u8; initial_capacity];
-    let mut total_out = 0;
-    let mut input = block;
-
-    loop {
-        let before_in = compress.total_in();
-        let before_out = compress.total_out();
-
-        let status = compress
-            .compress(input, &mut output[total_out..], flush)
-            .expect("compression failed");
-
-        let consumed = (compress.total_in() - before_in) as usize;
-        let produced = (compress.total_out() - before_out) as usize;
-
-        total_out += produced;
-        input = &input[consumed..];
-
-        match status {
-            Status::Ok if input.is_empty() && flush != FlushCompress::Finish => break,
-            Status::BufError => {
-                // Need more output space (rare case for incompressible data)
-                output.resize(output.len() * 2, 0);
-            }
-            Status::StreamEnd => break,
-            _ => {}
+        // Ensure buffer is large enough for worst case (incompressible data).
+        // Compressed output can be slightly larger than input for random data.
+        let initial_capacity = block_size + (block_size / 10) + 1024;
+        if output.capacity() < initial_capacity {
+            output.reserve(initial_capacity - output.capacity());
         }
-    }
 
-    output.truncate(total_out);
-    output
+        // Get or create Compress at the right level
+        let compress = match comp_opt.as_mut() {
+            Some((cached_level, comp)) if *cached_level == level => {
+                comp.reset();
+                comp
+            }
+            _ => {
+                *comp_opt = Some((level, Compress::new(Compression::new(level), false)));
+                &mut comp_opt.as_mut().unwrap().1
+            }
+        };
+
+        // Set dictionary if provided (last 32KB of previous block's input)
+        if let Some(d) = dict {
+            // Only use last DICT_SIZE bytes
+            let dict_slice = if d.len() > DICT_SIZE {
+                &d[d.len() - DICT_SIZE..]
+            } else {
+                d
+            };
+            let _ = compress.set_dictionary(dict_slice);
+        }
+
+        let flush = if is_last {
+            FlushCompress::Finish
+        } else {
+            FlushCompress::Sync
+        };
+
+        let mut input = block;
+
+        loop {
+            let before_in = compress.total_in();
+            let status = compress
+                .compress_vec(input, output, flush)
+                .expect("compression failed");
+
+            let consumed = (compress.total_in() - before_in) as usize;
+            input = &input[consumed..];
+
+            match status {
+                Status::Ok if input.is_empty() && flush != FlushCompress::Finish => break,
+                Status::BufError => {
+                    // Need more output space (rare case for incompressible data)
+                    let extra = output.capacity().max(1024);
+                    output.reserve(extra);
+                }
+                Status::StreamEnd => break,
+                _ => {}
+            }
+        }
+    })
 }
 
 #[cfg(test)]
