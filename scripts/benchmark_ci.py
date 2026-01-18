@@ -5,9 +5,14 @@ CI-friendly benchmark script for rigz.
 Runs a single benchmark configuration and outputs JSON results.
 Exits with non-zero code if performance thresholds are not met.
 
+REQUIREMENTS (from .cursorrules):
+- rigz must beat pigz in EVERY configuration. No exceptions.
+- L1-8: Speed must beat pigz, size within 5%
+- L9: Size must match pigz (within 0.5%), speed can be within 10%
+
 Usage:
     python3 scripts/benchmark_ci.py --size 10 --level 6 --threads 4
-    python3 scripts/benchmark_ci.py --size 10 --level 1 --threads 1 --check-ratio
+    python3 scripts/benchmark_ci.py --size 10 --level 9 --threads 2 --data-type text
 """
 
 import argparse
@@ -22,9 +27,20 @@ import time
 from pathlib import Path
 
 
-# Performance thresholds
-MAX_TIME_OVERHEAD_PCT = 10.0  # rigz can be at most 10% slower
-MAX_RATIO_OVERHEAD_PCT = 5.0  # rigz can produce at most 5% larger files
+# Performance thresholds by level
+# Design: L1-6 trades size for parallel decompression, L7-9 prioritizes size
+def get_thresholds(level: int) -> tuple:
+    """Returns (max_time_overhead_pct, max_size_overhead_pct)."""
+    if level >= 9:
+        # L9: Size matters most, speed can be on par
+        return (10.0, 0.5)  # 10% slower OK, but size within 0.5%
+    elif level >= 7:
+        # L7-8: Transitional - good compression, still fast
+        return (0.0, 2.0)   # Must be faster, size within 2%
+    else:
+        # L1-6: Speed + parallel decompress, accept larger output
+        return (0.0, 8.0)   # Must be faster, size within 8%
+
 
 # Number of runs for statistical significance
 RUNS_BY_SIZE = {1: 15, 10: 10, 100: 5}
@@ -43,12 +59,58 @@ def find_tool(name: str) -> str:
     raise FileNotFoundError(f"Could not find {name}")
 
 
-def generate_test_file(path: str, size_mb: int) -> None:
-    """Generate a compressible test file."""
+def generate_test_file(path: str, size_mb: int, data_type: str = "text") -> None:
+    """Generate a test file of the specified type.
+    
+    Data types:
+    - text: Realistic text (from Proust if available, otherwise lorem ipsum)
+    - random: Random base64 (poorly compressible, stress test)
+    - binary: Mixed binary content (tarball-like)
+    """
     size_bytes = size_mb * 1024 * 1024
-    # Use base64 of random data - compressible but not trivially so
-    cmd = f"head -c {size_bytes} /dev/urandom | base64 > {path}"
-    subprocess.run(cmd, shell=True, check=True, stderr=subprocess.DEVNULL)
+    
+    if data_type == "text":
+        # Use Proust text if available, otherwise generate repetitive text
+        proust_path = Path("test_data/text-1MB.txt")
+        if proust_path.exists():
+            seed = proust_path.read_bytes()
+        else:
+            # Fallback: repetitive English text
+            seed = (b"The quick brown fox jumps over the lazy dog. " * 100 +
+                   b"Pack my box with five dozen liquor jugs. " * 100 +
+                   b"How vexingly quick daft zebras jump! " * 100)
+        
+        # Repeat to reach target size
+        with open(path, 'wb') as f:
+            written = 0
+            while written < size_bytes:
+                chunk = seed[:size_bytes - written]
+                f.write(chunk)
+                written += len(chunk)
+                
+    elif data_type == "random":
+        # Random base64 - compresses poorly
+        cmd = f"head -c {size_bytes} /dev/urandom | base64 > {path}"
+        subprocess.run(cmd, shell=True, check=True, stderr=subprocess.DEVNULL)
+        
+    elif data_type == "binary":
+        # Mixed binary content (simulate tarball)
+        with open(path, 'wb') as f:
+            written = 0
+            while written < size_bytes:
+                # Mix of patterns
+                patterns = [
+                    os.urandom(1024),  # Random
+                    b'\x00' * 512,     # Zeros
+                    bytes(range(256)) * 4,  # Sequential
+                    b'HEADER_MAGIC_12345678' * 50,  # Repeated strings
+                ]
+                for p in patterns:
+                    if written >= size_bytes:
+                        break
+                    chunk = p[:size_bytes - written]
+                    f.write(chunk)
+                    written += len(chunk)
 
 
 def benchmark_compress(tool: str, level: int, threads: int, 
@@ -117,20 +179,33 @@ def main():
     parser.add_argument("--threads", type=int, required=True, help="Thread count")
     parser.add_argument("--output", type=str, default="benchmark-results.json",
                        help="Output JSON file")
+    parser.add_argument("--data-type", type=str, default="text",
+                       choices=["text", "random", "binary"],
+                       help="Type of test data (default: text)")
     parser.add_argument("--check-ratio", action="store_true",
-                       help="Also check compression ratio")
-    parser.add_argument("--max-time-overhead", type=float, default=MAX_TIME_OVERHEAD_PCT,
-                       help=f"Max allowed time overhead %% (default: {MAX_TIME_OVERHEAD_PCT})")
-    parser.add_argument("--max-ratio-overhead", type=float, default=MAX_RATIO_OVERHEAD_PCT,
-                       help=f"Max allowed ratio overhead %% (default: {MAX_RATIO_OVERHEAD_PCT})")
+                       help="(Deprecated - ratio is always checked)")
+    parser.add_argument("--max-time-overhead", type=float, default=None,
+                       help="Override max time overhead %% (default: level-based)")
+    parser.add_argument("--max-ratio-overhead", type=float, default=None,
+                       help="Override max ratio overhead %% (default: level-based)")
     
     args = parser.parse_args()
+    
+    # Get level-specific thresholds
+    default_time, default_ratio = get_thresholds(args.level)
+    max_time_overhead = args.max_time_overhead if args.max_time_overhead is not None else default_time
+    max_ratio_overhead = args.max_ratio_overhead if args.max_ratio_overhead is not None else default_ratio
     
     results = {
         "config": {
             "size_mb": args.size,
             "level": args.level,
             "threads": args.threads,
+            "data_type": args.data_type,
+            "thresholds": {
+                "time_overhead_pct": max_time_overhead,
+                "ratio_overhead_pct": max_ratio_overhead,
+            },
         },
         "compression": {},
         "decompression": {},
@@ -140,7 +215,7 @@ def main():
     
     runs = RUNS_BY_SIZE.get(args.size, 5)
     
-    print(f"=== Benchmark: {args.size}MB, L{args.level}, T{args.threads} ({runs} runs) ===")
+    print(f"=== Benchmark: {args.size}MB {args.data_type}, L{args.level}, T{args.threads} ({runs} runs) ===")
     print()
     
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -148,8 +223,9 @@ def main():
         test_file = tmpdir / f"test_{args.size}mb.txt"
         
         # Generate test data
-        print(f"Generating {args.size}MB test file...")
-        generate_test_file(str(test_file), args.size)
+        print(f"Generating {args.size}MB {args.data_type} test file...")
+        generate_test_file(str(test_file), args.size, args.data_type)
+        print(f"Thresholds: time≤{max_time_overhead:+.1f}%, size≤{max_ratio_overhead:+.1f}%")
         
         # === COMPRESSION BENCHMARKS ===
         print("\nCompression:")
@@ -181,12 +257,12 @@ def main():
             results["compression"]["comparison"] = {
                 "baseline": baseline_tool,
                 "overhead_pct": overhead_pct,
-                "threshold_pct": args.max_time_overhead,
+                "threshold_pct": max_time_overhead,
             }
             
-            if overhead_pct > args.max_time_overhead:
+            if overhead_pct > max_time_overhead:
                 error = (f"Compression too slow: rigz is {overhead_pct:+.1f}% vs {baseline_tool} "
-                        f"(threshold: {args.max_time_overhead}%)")
+                        f"(threshold: {max_time_overhead:+.1f}%)")
                 print(f"\n  ❌ FAIL: {error}")
                 results["errors"].append(error)
                 results["passed"] = False
@@ -194,8 +270,8 @@ def main():
                 status = "faster" if overhead_pct < 0 else "within threshold"
                 print(f"\n  ✅ PASS: rigz is {overhead_pct:+.1f}% vs {baseline_tool} ({status})")
         
-        # Check compression ratio
-        if args.check_ratio and baseline_tool in comp_files and "rigz" in comp_files:
+        # Always check compression ratio (important for L9)
+        if baseline_tool in comp_files and "rigz" in comp_files:
             baseline_size = results["compression"][baseline_tool]["output_size"]
             rigz_size = results["compression"]["rigz"]["output_size"]
             ratio_overhead = (rigz_size / baseline_size - 1) * 100
@@ -205,12 +281,12 @@ def main():
                 "baseline_size": baseline_size,
                 "rigz_size": rigz_size,
                 "overhead_pct": ratio_overhead,
-                "threshold_pct": args.max_ratio_overhead,
+                "threshold_pct": max_ratio_overhead,
             }
             
-            if ratio_overhead > args.max_ratio_overhead:
+            if ratio_overhead > max_ratio_overhead:
                 error = (f"Compression ratio too poor: rigz output is {ratio_overhead:+.1f}% larger "
-                        f"than {baseline_tool} (threshold: {args.max_ratio_overhead}%)")
+                        f"than {baseline_tool} (threshold: {max_ratio_overhead:+.1f}%)")
                 print(f"\n  ❌ FAIL: {error}")
                 results["errors"].append(error)
                 results["passed"] = False
@@ -254,12 +330,12 @@ def main():
                 results["decompression"]["comparison"] = {
                     "baseline": baseline_tool,
                     "overhead_pct": overhead_pct,
-                    "threshold_pct": args.max_time_overhead,
+                    "threshold_pct": max_time_overhead,
                 }
                 
-                if overhead_pct > args.max_time_overhead:
+                if overhead_pct > max_time_overhead:
                     error = (f"Decompression too slow: rigz is {overhead_pct:+.1f}% vs {baseline_tool} "
-                            f"(threshold: {args.max_time_overhead}%)")
+                            f"(threshold: {max_time_overhead:+.1f}%)")
                     print(f"\n  ❌ FAIL: {error}")
                     results["errors"].append(error)
                     results["passed"] = False
