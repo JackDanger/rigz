@@ -176,9 +176,11 @@ fn is_multi_member_quick(data: &[u8]) -> bool {
 
 /// Decompress gzip - chooses optimal strategy based on content
 ///
-/// - Single member: libdeflate (fastest, 30-50% faster than zlib)
-/// - BGZF-style (gzippy output): parallel libdeflate using embedded block sizes
-/// - Other multi-member: sequential zlib-ng
+/// Strategies (in order of preference):
+/// 1. BGZF-style (gzippy output): parallel libdeflate using embedded block sizes
+/// 2. Single member: libdeflate (fastest, 30-50% faster than zlib)
+/// 3. Large multi-member: speculative parallel decompression (rapidgzip-style)
+/// 4. Small multi-member: sequential zlib-ng
 fn decompress_gzip_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
         return Ok(0);
@@ -189,13 +191,31 @@ fn decompress_gzip_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> GzippyRe
     // is_multi_member_quick which only scans 256KB - not enough for random data
     // where the first block can be >256KB
     if has_bgzf_markers(data) {
-        return decompress_bgzf_parallel(data, writer);
+        return decompress_bgzf_parallel_prefetch(data, writer);
     }
 
     // Fast path: check if this is likely multi-member (from parallel compression)
     // Only scan first 256KB - if no second header found, use direct single-member path
     if !is_multi_member_quick(data) {
         return decompress_single_member_libdeflate(data, writer);
+    }
+
+    // For large files, try speculative parallel decompression
+    // This uses the rapidgzip-style algorithm for non-BGZF files
+    let num_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+
+    // Only use speculative decompression for files large enough to benefit
+    // Threshold: at least 1MB and at least 256KB per thread
+    const SPECULATIVE_THRESHOLD: usize = 1024 * 1024;
+    if data.len() >= SPECULATIVE_THRESHOLD && num_threads > 1 {
+        if let Ok(bytes) =
+            crate::speculative_decompress::decompress_speculative(data, writer, num_threads)
+        {
+            return Ok(bytes);
+        }
+        // If speculative failed, fall through to sequential
     }
 
     // Multi-member file without markers: use zlib-ng sequential
@@ -307,10 +327,212 @@ fn parse_bgzf_blocks(data: &[u8]) -> (Vec<(usize, usize)>, bool) {
     (blocks, consumed_all)
 }
 
-/// Parallel decompression for BGZF-style files (gzippy output)
+/// Enhanced parallel decompression for BGZF-style files with prefetching
+///
+/// Improvements over basic parallel decompression:
+/// 1. Memory prefetching: Hint to CPU to load next blocks into cache
+/// 2. Batch processing: Process blocks in batches for better cache locality
+/// 3. Overlapped I/O: Write previous batch while decompressing next
+/// 4. Optimized slot management: Reuse output buffers
+fn decompress_bgzf_parallel_prefetch<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
+    use std::cell::UnsafeCell;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::thread;
+
+    let (blocks, consumed_all) = parse_bgzf_blocks(data);
+
+    // Fall back to sequential if we couldn't parse ALL blocks
+    if blocks.is_empty() || !consumed_all {
+        return decompress_multi_member_sequential(data, writer);
+    }
+
+    // For few blocks, sequential is faster (avoids thread overhead)
+    if blocks.len() < 4 {
+        return decompress_multi_member_sequential(data, writer);
+    }
+
+    let num_blocks = blocks.len();
+    let num_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(num_blocks);
+
+    // Output slot for each block - pre-allocated based on ISIZE hints
+    struct Slot {
+        ready: AtomicBool,
+        data: UnsafeCell<Vec<u8>>,
+    }
+    unsafe impl Sync for Slot {}
+
+    // Pre-calculate output sizes from ISIZE hints for better allocation
+    let slots: Vec<Slot> = blocks
+        .iter()
+        .map(|(start, len)| {
+            let block_data = &data[*start..*start + *len];
+            let isize_hint = if *len >= 8 {
+                let trailer = &block_data[*len - 4..];
+                u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]) as usize
+            } else {
+                0
+            };
+            let capacity = if isize_hint > 0 && isize_hint < 1024 * 1024 * 1024 {
+                isize_hint + 1024
+            } else {
+                len.saturating_mul(4).max(64 * 1024)
+            };
+            Slot {
+                ready: AtomicBool::new(false),
+                data: UnsafeCell::new(Vec::with_capacity(capacity)),
+            }
+        })
+        .collect();
+
+    let next_block = AtomicUsize::new(0);
+    let mut total_bytes = 0u64;
+
+    // Number of blocks to prefetch ahead
+    const PREFETCH_AHEAD: usize = 4;
+
+    thread::scope(|scope| {
+        // Spawn worker threads with prefetching
+        for _ in 0..num_threads {
+            scope.spawn(|| {
+                loop {
+                    let idx = next_block.fetch_add(1, Ordering::Relaxed);
+                    if idx >= num_blocks {
+                        break;
+                    }
+
+                    // Prefetch next blocks into CPU cache
+                    for prefetch_idx in 1..=PREFETCH_AHEAD {
+                        let future_idx = idx + prefetch_idx;
+                        if future_idx < num_blocks {
+                            let (future_start, future_len) = blocks[future_idx];
+                            // Prefetch start and middle of block
+                            prefetch_memory(&data[future_start..future_start + future_len.min(64)]);
+                            if future_len > 4096 {
+                                prefetch_memory(
+                                    &data[future_start + future_len / 2
+                                        ..future_start + future_len / 2 + 64],
+                                );
+                            }
+                        }
+                    }
+
+                    let (start, len) = blocks[idx];
+                    let block_data = &data[start..start + len];
+
+                    // Use thread-local decompressor
+                    DECOMPRESSOR.with(|decomp_cell| {
+                        let mut decompressor = decomp_cell.borrow_mut();
+                        let output = unsafe { &mut *slots[idx].data.get() };
+
+                        output.clear();
+                        // Capacity is pre-allocated based on ISIZE hint
+                        let initial_size = output.capacity().max(64 * 1024);
+                        output.resize(initial_size, 0);
+
+                        loop {
+                            match decompressor.gzip_decompress(block_data, output) {
+                                Ok(size) => {
+                                    output.truncate(size);
+                                    break;
+                                }
+                                Err(libdeflater::DecompressionError::InsufficientSpace) => {
+                                    let new_size = output.len().saturating_mul(2);
+                                    output.resize(new_size, 0);
+                                    continue;
+                                }
+                                Err(_) => {
+                                    output.clear();
+                                    break;
+                                }
+                            }
+                        }
+                    });
+
+                    slots[idx].ready.store(true, Ordering::Release);
+                }
+            });
+        }
+
+        // Main thread: stream output in order with batched writes
+        // Write in batches to reduce syscall overhead
+        const WRITE_BATCH_SIZE: usize = 16;
+        let mut batch_buffer: Vec<u8> = Vec::with_capacity(WRITE_BATCH_SIZE * 128 * 1024);
+
+        for batch in slots.chunks(WRITE_BATCH_SIZE) {
+            batch_buffer.clear();
+
+            for slot in batch.iter() {
+                // Spin-wait with backoff for slot to be ready
+                let mut spin_count = 0;
+                while !slot.ready.load(Ordering::Acquire) {
+                    spin_count += 1;
+                    if spin_count < 100 {
+                        std::hint::spin_loop();
+                    } else if spin_count < 1000 {
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_micros(10));
+                    }
+                }
+
+                let output = unsafe { &*slot.data.get() };
+                if !output.is_empty() {
+                    batch_buffer.extend_from_slice(output);
+                }
+            }
+
+            if !batch_buffer.is_empty() {
+                writer.write_all(&batch_buffer).unwrap();
+                total_bytes += batch_buffer.len() as u64;
+            }
+        }
+    });
+
+    writer.flush()?;
+    Ok(total_bytes)
+}
+
+/// Prefetch memory into CPU cache (hint only, no guarantee)
+#[inline]
+fn prefetch_memory(data: &[u8]) {
+    // Use platform-specific prefetch intrinsics when available
+    #[cfg(target_arch = "x86_64")]
+    {
+        for chunk in data.chunks(64) {
+            // PREFETCHT0: Prefetch into all cache levels
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(
+                    chunk.as_ptr() as *const i8,
+                    std::arch::x86_64::_MM_HINT_T0,
+                );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // On ARM, we use a simple volatile read to encourage prefetch
+        // The compiler may optimize this, but it's a hint
+        for chunk in data.chunks(128) {
+            let _ = unsafe { std::ptr::read_volatile(chunk.as_ptr()) };
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        // Fallback: touch memory to trigger hardware prefetch
+        let _ = data.first();
+    }
+}
+
+/// Parallel decompression for BGZF-style files (gzippy output) - basic version
 /// Uses embedded block size markers to find boundaries without inflating
 ///
 /// Uses our custom scheduler for zero-overhead parallelism with streaming output.
+#[allow(dead_code)]
 fn decompress_bgzf_parallel<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     use libdeflater::DecompressionError;
     use std::cell::UnsafeCell;

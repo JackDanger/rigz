@@ -18,6 +18,7 @@ mod parallel_compress;
 mod pipelined_compress;
 mod scheduler;
 mod simple_optimizations;
+mod speculative_decompress;
 mod utils;
 
 use cli::GzippyArgs;
