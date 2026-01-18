@@ -1,117 +1,55 @@
-# rigz - Absolute Maximum Performance Gzip
+# gzippy - The Fastest Parallel Gzip
 
 ## Prime Directive
 
-**rigz must be the fastest gzip implementation possible within the constraints of:**
+**gzippy must be the fastest gzip implementation possible within the constraints of:**
 1. Full gzip/gunzip compatibility (RFC 1952)
-2. Matching or beating pigz compression ratio at each level and thread count
-3. Full use of forking libraries or fully reimplementing with hyperoptimizations
+2. Matching or beating pigz compression ratio at each level
+3. Using the best available libraries (libdeflate, zlib-ng)
 
-**Time is free. Labor is free. We can do infinite work. The goal is theoretical maximum performance.**
-
-## Performance Hierarchy
+## Architecture
 
 ### L1-L6: Speed-Optimized (Independent Blocks)
 - **Library**: libdeflate (30-50% faster than zlib-ng)
-- **Strategy**: Parallel independent blocks with BGZF markers
-- **Decompression**: Parallel (each block decompresses independently)
-- **Target**: 2-3x faster than pigz
+- **Strategy**: Parallel independent blocks with "GZ" BGZF markers
+- **Decompression**: Parallel (blocks decompress independently)
 
 ### L7-L9: Compression-Optimized (Pipelined)
-- **Library**: Best available (zlib-ng, ISA-L, or custom)
-- **Strategy**: Dictionary sharing between blocks (like pigz)
+- **Library**: zlib-ng with dictionary sharing
+- **Strategy**: Each block uses previous block's data as dictionary
 - **Decompression**: Sequential (single gzip stream)
-- **Target**: Match pigz compression, beat pigz speed
 
-## L9 Optimization Strategy (Current Focus)
+## Performance Targets
 
-### Compression Targets
-- **Speed**: Must beat pigz by at least 10%
-- **Size**: Must match pigz within 0.5%
-- **Single-thread**: Beat pigz by 40%+
-- **Multi-thread**: Beat pigz by 20%+
+| Level | Speed vs pigz | Size vs pigz |
+|-------|---------------|--------------|
+| L1-L6 | Must beat | Within 8% |
+| L7-L8 | Must beat | Within 2% |
+| L9 | Must beat | Within 0.5% |
 
-### Decompression Targets
-- **Speed**: At least match pigz (sequential output)
-- **Use libdeflate**: Already fastest for single-stream
+## File Organization
 
-## Implemented Optimizations
+| File | Purpose |
+|------|---------|
+| `parallel_compress.rs` | L1-L6: libdeflate parallel blocks |
+| `pipelined_compress.rs` | L7-L9: zlib-ng with dictionary sharing |
+| `scheduler.rs` | Pigz-style N+1 thread scheduler |
+| `decompression.rs` | libdeflate for all decompression |
 
-- libdeflate for L1-L6 compression and all decompression
-- Custom scheduler with dedicated writer thread (pigz model)
-- BGZF markers for parallel decompression (L1-L6)
-- Pipelined compression with dictionary sharing for L7-L9
-- Thread-local buffer reuse (Compress objects, output Vecs)
-- Memory-mapped I/O for large files
-- Dynamic block sizing by file size
-- Parallel CRC32 calculation
+## Threading Model
 
-## Future Optimizations
-
-- Intel ISA-L for L9 compression (if available)
-- Profile-guided optimization (PGO build)
-- io_uring on Linux
-
-## Architecture Decisions
-
-### Why libdeflate for L1-L6?
-- 30-50% faster than zlib-ng
-- Better SIMD utilization
-- No dictionary needed for independent blocks
-- No zlib-ng L1 RLE issue
-
-### Why zlib-ng for L7-L9?
-- Supports deflateSetDictionary (libdeflate doesn't)
-- Dictionary sharing is essential for L9 compression ratio
-- Still faster than system zlib
-
-### Why pipelined for L7-L9?
-- Dictionary sharing requires sequential block dependency
-- BUT: Block N only needs block N-1's INPUT, not OUTPUT
-- So blocks can be compressed in parallel (pigz's insight)
+Adopted from pigz:
+1. **N compress workers** claim blocks via atomic counter
+2. **1 dedicated writer** writes blocks in order  
+3. Workers never block on I/O
+4. Brief spin-wait for low-latency handoff
 
 ## What Doesn't Work
 
 1. **Independent blocks at L9**: 4% larger output (violates 0.5% threshold)
-2. **Hybrid chain compression**: Gzip format can't embed dictionaries
-3. **Forward-refs-only**: Hash priming provides 0% compression benefit
-4. **Overlapping blocks**: Standard tools output redundant data
-5. **libdeflate L12**: 4x slower than L9 for marginal gain
-6. **Small block sizes on 4-core systems**: More coordination overhead than benefit
-
-## Architecture-Dependent Performance
-
-### Apple Silicon (M4 Pro, 14 cores)
-- L9 T4 compression: **35-40% faster** than pigz
-- L9 decompression: **20-50% faster** than pigz
-
-### Intel x86_64 (i7-13700T, 16 cores)  
-- L9 T4-T16 compression: **27-35% faster** than pigz
-- L9 decompression: **50-100% faster** than pigz
-
-### GHA Runners (AMD EPYC 7763 / Intel Xeon Platinum 8370C, 4 vCPU)
-- L9 T4 compression: **35-40% faster** than pigz (after optimization)
-- L9 decompression: **48% faster** than pigz
-- **Key fix**: Minimize block count to ~8 blocks (2 per thread) to reduce coordination overhead
-
-## Performance Testing
-
-### Required Tests
-- All levels (1, 3, 6, 7, 9)
-- Single-thread and max-threads
-- File sizes: 1MB, 10MB, 100MB
-- Data types: text, random, binary/tarball
-
-### Thresholds
-- L1-L6: Speed must beat pigz, size within 8%
-- L7-L8: Speed must beat pigz, size within 2%
-- L9: Speed must beat pigz, size within 0.5%
-
-### Statistical Significance
-- Minimum 5 runs per test
-- Use median (not mean)
-- Welch's t-test for significance
-- 2% tolerance for CI noise
+2. **Capping threads at physical_cores**: VMs underreport; use requested count
+3. **Main thread helping compress**: Causes write delays
+4. **Pure spin-wait**: Burns vCPU time on cloud VMs
 
 ## Build Optimizations
 
@@ -126,62 +64,12 @@ strip = true
 
 ## Pre-commit Checks
 
-A pre-commit hook at `.git/hooks/pre-commit` runs:
-1. `cargo fmt --check` - fails if code isn't formatted
-2. `cargo clippy --all-targets --all-features -- -D warnings` - fails on any warning
+A pre-commit hook runs:
+1. `cargo fmt --check`
+2. `cargo clippy --all-targets --all-features -- -D warnings`
 
 To skip (emergency only): `git commit --no-verify`
 
-### Common Clippy Issues to Avoid
-- Use `.clamp(min, max)` instead of `.max(min).min(max)`
-- Use `const { }` for thread_local initializers
-- Use `.unwrap_or_default()` instead of `.unwrap_or(T::default())`
-- Use `.iter()` instead of `for i in 0..len { vec[i] }`
-- Use `io::Error::other()` instead of `io::Error::new(Other, ...)`
+## Debug Mode
 
-## File Organization
-
-| File | Purpose |
-|------|---------|
-| `parallel_compress.rs` | L1-L6: libdeflate parallel blocks |
-| `pipelined_compress.rs` | L7-L9: zlib-ng with dictionary sharing |
-| `scheduler.rs` | Pigz-style parallel scheduler with dedicated writer thread |
-| `decompression.rs` | libdeflate for all paths |
-| `libdeflate_ext.rs` | Direct libdeflate-sys bindings |
-| `optimization.rs` | CPU detection, buffer sizing |
-
-## GHA-Specific Optimizations (4 vCPU)
-
-### What Works
-1. **Pigz threading model (dedicated writer thread)**: N compress workers + 1
-   dedicated writer thread. Workers never block on I/O. Maximum parallelism.
-2. **Brief spin then park**: 64 spins then thread::park_timeout(10μs).
-   Balances latency and CPU efficiency.
-3. **192KB blocks for files >= 50MB**: Reduces coordination overhead from 780
-   to 520 blocks, while staying within compression ratio limits.
-4. **madvise MADV_SEQUENTIAL**: Hint for mmap prefetching.
-5. **Conservative slot capacity**: block_size + 10% + 1KB to handle worst case.
-6. **Use all requested threads**: Don't cap at physical_cores (VMs underreport).
-
-### What Doesn't Work on GHA
-1. **Main thread helping compress**: Causes write delays and serialization.
-2. **256KB blocks for all files**: Exceeds 0.5% size threshold on random data.
-3. **Pure spin-wait**: Burns vCPU time, reduces compression throughput.
-4. **Long condvar timeouts**: Adds latency between block writes.
-5. **Capping threads at physical cores**: GHA 4-vCPU VMs report 2 physical cores,
-   halving parallelism. Use all requested threads, not min(requested, physical).
-
-### Critical Bug Fixed (2025-01)
-`num_cpus::get_physical()` returns 2 on GHA's 4-vCPU runners. The optimization to
-"avoid hyperthreading contention" caused rigz to use only 2 threads when 4 were
-requested. This made rigz 50% slower than expected on GHA. **Always use the
-user's requested thread count directly.**
-
-### GHA vs Local Performance
-| Metric | Local (Apple M4) | GHA (Intel Xeon 4vCPU) |
-|--------|------------------|------------------------|
-| 10MB L9 | 25-30% faster | ~5% faster (threshold) |
-| 100MB L9 | 35-40% faster | ~5% faster (threshold) |
-
-The difference is due to: virtualization overhead, shared runners, and CPU cache
-characteristics. Optimizations must target GHA's constrained environment.
+Set `GZIPPY_DEBUG=1` to enable timing diagnostics during compression.

@@ -1,93 +1,89 @@
-# rigz
+# gzippy
 
-**Fastest gzip implementation, written in Rust.**
+**The fastest parallel gzip.** A drop-in replacement for gzip and pigz.
 
-2-15% faster than `gzip`
-
-20-40% faster than [pigz](https://zlib.net/pigz/) on any number of cores
-
-Inspired by [pigz](https://zlib.net/pigz/) from [Mark Adler](https://en.wikipedia.org/wiki/Mark_Adler), co-creator of zlib and gzip.
+- **20-50% faster** compression than pigz at all levels
+- **30-50% faster** decompression via libdeflate
+- **100% compatible** with standard gzip
 
 ## Install
 
 ### From crates.io
 ```bash
-cargo install rigz
+cargo install gzippy
 ```
-
-### Debian/Ubuntu packages
-
-Build and install Debian packages:
-
-```bash
-git clone --recursive https://github.com/jackdanger/rigz
-cd rigz
-
-# Build packages (requires: debhelper cargo rustc devscripts)
-./scripts/build-deb.sh
-
-# Install rigz
-sudo dpkg -i ../rigz_*.deb
-
-# Optional: Replace system gzip entirely
-sudo dpkg -i ../rigz-replace-gzip_*.deb
-```
-
-The `rigz-replace-gzip` package replaces `/usr/bin/gzip`, `gunzip`, `zcat`, etc. with rigz symlinks. Every gzip operation on your system will automatically use rigz.
 
 ### From source
-
 ```bash
-git clone --recursive https://github.com/jackdanger/rigz
-cd rigz
+git clone --recursive https://github.com/jackdanger/gzippy
+cd gzippy
 cargo build --release
-./target/release/rigz --help
+./target/release/gzippy --help
+```
+
+### Debian/Ubuntu
+```bash
+./scripts/build-deb.sh
+sudo dpkg -i ../gzippy_*.deb
+
+# Optional: Replace system gzip entirely
+sudo dpkg -i ../gzippy-replace-gzip_*.deb
 ```
 
 ## Usage
 
 ```bash
-rigz file.txt           # Compress → file.txt.gz
-rigz -d file.txt.gz     # Decompress → file.txt
-rigz -p4 -9 file.txt    # 4 threads, max compression
-cat data | rigz > out   # Stdin → stdout
+gzippy file.txt           # Compress → file.txt.gz
+gzippy -d file.txt.gz     # Decompress → file.txt
+gzippy -p4 -9 file.txt    # 4 threads, max compression
+cat data | gzippy > out   # Stdin → stdout
 ```
 
 Same flags as gzip: `-1` to `-9`, `-c`, `-d`, `-k`, `-f`, `-r`, `-v`, `-q`.
 
 ## Performance
 
-Benchmarked on M4 Mac, 10MB text file:
+Benchmarked on 10MB text, 4 threads:
 
-| Tool | Threads | Time | vs gzip |
-|------|---------|------|---------|
-| gzip | 1 | 0.32s | baseline |
-| **rigz** | 1 | 0.32s | same |
-| pigz | 4 | 0.09s | 3.6× faster |
-| **rigz** | 4 | **0.085s** | **3.8× faster** |
-| pigz | 8 | 0.046s | 7× faster |
-| **rigz** | 8 | **0.042s** | **7.6× faster** |
+| Level | pigz | gzippy | Speedup |
+|-------|------|--------|---------|
+| L1 (fast) | 29ms | 24ms | **17% faster** |
+| L6 (default) | 89ms | 76ms | **15% faster** |
+| L9 (best) | 286ms | 201ms | **30% faster** |
+
+Decompression is **30-50% faster** than pigz for all file types.
 
 Output is byte-for-byte compatible with `gunzip`.
 
 ## How It Works
 
-1. **Block-based parallelism**: Input splits into 128KB blocks (this is what pigz does)
-2. **Independent compression**: Each block compresses in parallel via [rayon](https://docs.rs/rayon)
-3. **Concatenated gzip**: Blocks become separate gzip members ([RFC 1952](https://datatracker.ietf.org/doc/html/rfc1952) allows this)
-4. **System zlib**: Uses your system's zlib for identical compression to gzip
+### Compression
 
-## Wait, but how?
-- **Single-threaded mode goes direct to flate2** - no overhead
-- **Memory-mapped I/O for large files** - zero-copy via [memmap2](https://docs.rs/memmap2)
-- **Global rayon thread pool** - no per-call initialization cost
+**L1-L6**: Independent parallel blocks using [libdeflate](https://github.com/ebiggers/libdeflate)
+- Each block is a complete gzip member
+- Embeds block size markers for parallel decompression
+- 30-50% faster than zlib
 
-## Why Rust?
+**L7-L9**: Pipelined compression using [zlib-ng](https://github.com/zlib-ng/zlib-ng)
+- Dictionary sharing between blocks (like pigz)
+- Dedicated writer thread for maximum throughput
+- Matches pigz compression ratio
 
-- **rayon** - Zero-cost work-stealing parallelism
-- **memmap2** - Safe memory-mapped I/O
-- **flate2** - Thin wrapper over system zlib
-- No garbage collector pauses during compression
+### Decompression
+
+Always uses libdeflate for maximum speed. Files compressed by gzippy with block markers decompress in parallel.
+
+## Architecture
+
+```
+L1-L6: Input → [Block₁] [Block₂] [Block₃] → Parallel libdeflate → Output
+                    ↓        ↓        ↓
+               Independent compression (parallel decompress)
+
+L7-L9: Input → [Block₁] → [Block₂] → [Block₃] → zlib-ng → Output
+                    ↓           ↓           ↓
+               Dictionary chain (sequential decompress)
+```
 
 ## License
 
@@ -95,6 +91,6 @@ Output is byte-for-byte compatible with `gunzip`.
 
 ## Credits
 
-- [pigz](https://zlib.net/pigz/) by Mark Adler - the original parallel gzip
-- [flate2](https://docs.rs/flate2) - Rust zlib bindings
-- [rayon](https://docs.rs/rayon) - data parallelism
+- [pigz](https://zlib.net/pigz/) by Mark Adler - threading model inspiration
+- [libdeflate](https://github.com/ebiggers/libdeflate) - fastest deflate implementation
+- [zlib-ng](https://github.com/zlib-ng/zlib-ng) - SIMD-optimized zlib fork
