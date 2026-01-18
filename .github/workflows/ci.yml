@@ -81,7 +81,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential zlib1g-dev gzip
+          sudo apt-get install -y build-essential zlib1g-dev gzip cmake nasm
 
       - name: Build gzippy
         run: cargo build --release
@@ -91,6 +91,13 @@ jobs:
 
       - name: Build pigz
         run: make -C pigz
+
+      - name: Build igzip (ISA-L)
+        run: |
+          mkdir -p isa-l/build
+          cd isa-l/build
+          cmake ..
+          make -j$(nproc) igzip
 
       - name: Run validation matrix
         run: |

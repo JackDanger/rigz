@@ -4,3 +4,7 @@
 [submodule "gzip"]
 	path = gzip
 	url = https://github.com/JackDanger/gzip.git
+[submodule "isa-l"]
+	path = isa-l
+	url = https://github.com/JackDanger/isa-l.git
+	branch = apple-arm64-fix

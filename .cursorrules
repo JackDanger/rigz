@@ -51,6 +51,18 @@ Adopted from pigz:
 3. **Main thread helping compress**: Causes write delays
 4. **Pure spin-wait**: Burns vCPU time on cloud VMs
 
+## igzip Comparison
+
+igzip (Intel ISA-L) is a **speed-optimized** compressor that trades compression ratio
+for speed. It produces 10-15% larger files than gzip/pigz/gzippy at similar levels.
+
+**Benchmark approach**: Compare gzippy against pigz (same compression goals), not igzip.
+igzip is benchmarked for informational purposes but not as a pass/fail target.
+
+- igzip L3 (max) ≈ gzip L4 in compression ratio
+- gzippy L1-L3 targets better compression with competitive speed
+- For users who need igzip-like speed, they can use gzippy L1
+
 ## Build Optimizations
 
 ```toml
