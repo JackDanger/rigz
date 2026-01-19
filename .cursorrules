@@ -157,3 +157,7 @@ Current infrastructure is in place; full optimization requires:
 - Tracking unresolved back-references during decode
 - Multi-pass window propagation algorithm
 - Lock-free result stitching
+
+**Key insight**: For one-time decompression of standard gzip files, parallelism 
+requires a full deflate decoder that can find bit-aligned block boundaries. 
+This is 3000+ lines of code not yet implemented.
