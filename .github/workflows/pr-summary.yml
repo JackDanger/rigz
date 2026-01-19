@@ -1,0 +1,453 @@
+# =============================================================================
+# PR Performance Summary: Rich consolidated performance table
+# =============================================================================
+# Generates a comprehensive performance summary comparing gzippy vs competitors.
+# Runs after all other workflows complete and posts a summary to the PR.
+# =============================================================================
+name: PR Summary
+
+on:
+  pull_request:
+    branches: ["*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  performance-summary:
+    name: Generate Performance Summary
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential zlib1g-dev cmake nasm
+
+      - name: Build all tools
+        run: |
+          cargo build --release
+          make -C pigz
+          cd isa-l && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc) igzip
+
+      - name: Run comprehensive benchmarks
+        id: benchmark
+        run: |
+          mkdir -p results
+          
+          # Get CPU info
+          CPU_MODEL=$(grep "model name" /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)
+          CORES=$(nproc)
+          
+          # Detect SIMD features
+          SIMD_FEATURES=""
+          if grep -q "avx512" /proc/cpuinfo; then SIMD_FEATURES="$SIMD_FEATURES avx512"; fi
+          if grep -q "avx2" /proc/cpuinfo; then SIMD_FEATURES="$SIMD_FEATURES avx2"; fi
+          if grep -q "avx " /proc/cpuinfo; then SIMD_FEATURES="$SIMD_FEATURES avx"; fi
+          if grep -q "sse4_2" /proc/cpuinfo; then SIMD_FEATURES="$SIMD_FEATURES sse4.2"; fi
+          if grep -q "bmi2" /proc/cpuinfo; then SIMD_FEATURES="$SIMD_FEATURES bmi2"; fi
+          
+          cat > results/system.json << EOF
+          {
+            "cpu": "$CPU_MODEL",
+            "cores": $CORES,
+            "simd": "$SIMD_FEATURES"
+          }
+          EOF
+          
+          # Generate test data
+          echo "Generating test data..."
+          python3 -c "
+          import random
+          random.seed(42)
+          
+          # 10MB text file
+          with open('/tmp/test-10mb.txt', 'w') as f:
+              for _ in range(100000):
+                  f.write(''.join(random.choices('abcdefghij klmnopqrs tuvwxyz ', k=100)) + '\n')
+          
+          # 1MB text file
+          with open('/tmp/test-1mb.txt', 'w') as f:
+              for _ in range(10000):
+                  f.write(''.join(random.choices('abcdefghij klmnopqrs tuvwxyz ', k=100)) + '\n')
+          "
+          
+          echo "Running compression benchmarks..."
+          
+          # Function to benchmark compression
+          benchmark_compress() {
+            local tool=$1
+            local level=$2
+            local input=$3
+            local threads=$4
+            local output_prefix=$5
+            
+            case $tool in
+              gzippy)
+                cmd="./target/release/gzippy -$level -p$threads -c $input"
+                ;;
+              pigz)
+                cmd="./pigz/pigz -$level -p$threads -c $input"
+                ;;
+              igzip)
+                # igzip doesn't support threads
+                cmd="./isa-l/build/igzip -c $input"
+                ;;
+              gzip)
+                cmd="gzip -$level -c $input"
+                ;;
+            esac
+            
+            # Warmup
+            eval "$cmd > /tmp/warmup.gz" 2>/dev/null
+            
+            # Timed runs
+            local start=$(date +%s.%N)
+            for i in 1 2 3; do
+              eval "$cmd > /tmp/out.gz" 2>/dev/null
+            done
+            local end=$(date +%s.%N)
+            
+            local total=$(echo "$end - $start" | bc)
+            local avg=$(echo "$total / 3" | bc -l)
+            local size=$(stat -c%s /tmp/out.gz)
+            local input_size=$(stat -c%s $input)
+            local ratio=$(echo "scale=2; $size * 100 / $input_size" | bc)
+            local speed=$(echo "$input_size / $avg / 1000000" | bc -l)
+            
+            printf '{"tool":"%s","level":%d,"threads":%d,"time":%.4f,"size":%d,"ratio":%.2f,"speed":%.1f}' \
+              "$tool" "$level" "$threads" "$avg" "$size" "$ratio" "$speed"
+          }
+          
+          # Function to benchmark decompression
+          benchmark_decompress() {
+            local tool=$1
+            local input=$2
+            
+            case $tool in
+              gzippy)
+                cmd="./target/release/gzippy -d < $input > /tmp/out.txt"
+                ;;
+              pigz)
+                cmd="./pigz/pigz -d < $input > /tmp/out.txt"
+                ;;
+              igzip)
+                cmd="./isa-l/build/igzip -d < $input > /tmp/out.txt"
+                ;;
+              gzip)
+                cmd="gzip -d < $input > /tmp/out.txt"
+                ;;
+            esac
+            
+            # Warmup
+            eval "$cmd" 2>/dev/null
+            
+            # Timed runs
+            local start=$(date +%s.%N)
+            for i in 1 2 3 4 5; do
+              eval "$cmd" 2>/dev/null
+            done
+            local end=$(date +%s.%N)
+            
+            local total=$(echo "$end - $start" | bc)
+            local avg=$(echo "$total / 5" | bc -l)
+            local output_size=$(stat -c%s /tmp/out.txt)
+            local speed=$(echo "$output_size / $avg / 1000000" | bc -l)
+            
+            printf '{"tool":"%s","time":%.4f,"speed":%.1f}' "$tool" "$avg" "$speed"
+          }
+          
+          CORES=$(nproc)
+          
+          # Compression benchmarks
+          echo "[" > results/compression.json
+          first=true
+          for level in 1 6 9; do
+            for threads in 1 $CORES; do
+              for tool in gzippy pigz gzip; do
+                if [ "$first" = true ]; then first=false; else echo "," >> results/compression.json; fi
+                benchmark_compress $tool $level /tmp/test-10mb.txt $threads >> results/compression.json
+              done
+              # igzip (no thread support, only run once per level)
+              if [ "$threads" = "1" ]; then
+                echo "," >> results/compression.json
+                benchmark_compress igzip $level /tmp/test-10mb.txt 1 >> results/compression.json
+              fi
+            done
+          done
+          echo "]" >> results/compression.json
+          
+          # Create compressed files for decompression tests
+          ./target/release/gzippy -1 -c /tmp/test-10mb.txt > /tmp/test-gzippy.gz
+          ./pigz/pigz -1 -p$CORES -c /tmp/test-10mb.txt > /tmp/test-pigz.gz
+          gzip -1 -c /tmp/test-10mb.txt > /tmp/test-gzip.gz
+          
+          # Decompression benchmarks
+          echo "[" > results/decompression.json
+          first=true
+          for source in gzippy pigz gzip; do
+            for tool in gzippy pigz igzip gzip; do
+              if [ "$first" = true ]; then first=false; else echo "," >> results/decompression.json; fi
+              result=$(benchmark_decompress $tool /tmp/test-$source.gz)
+              echo "${result%\}},\"source\":\"$source\"}" >> results/decompression.json
+            done
+          done
+          echo "]" >> results/decompression.json
+
+      - name: Generate rich summary
+        run: |
+          python3 << 'PYTHON_SCRIPT' > summary.md
+          import json
+          import os
+          
+          # Load results
+          with open('results/system.json') as f:
+              system = json.load(f)
+          
+          with open('results/compression.json') as f:
+              compression = json.load(f)
+          
+          with open('results/decompression.json') as f:
+              decompression = json.load(f)
+          
+          print("# 🚀 gzippy Performance Summary")
+          print()
+          print(f"**System**: {system['cpu']} ({system['cores']} cores)")
+          print(f"**SIMD**:{system['simd']}")
+          print()
+          
+          # =================================================================
+          # Compression Summary
+          # =================================================================
+          print("## 📦 Compression Performance")
+          print()
+          
+          # Group by level and threads
+          levels = sorted(set(r['level'] for r in compression))
+          threads = sorted(set(r['threads'] for r in compression))
+          tools = ['gzippy', 'pigz', 'igzip', 'gzip']
+          
+          for t in threads:
+            print(f"### {t} Thread{'s' if t > 1 else ''}")
+            print()
+            print("| Level | Tool | Speed (MB/s) | Size | Ratio | vs pigz |")
+            print("|-------|------|--------------|------|-------|---------|")
+            
+            for level in levels:
+              level_results = [r for r in compression if r['level'] == level and r['threads'] == t]
+              pigz_result = next((r for r in level_results if r['tool'] == 'pigz'), None)
+              
+              for tool in tools:
+                result = next((r for r in level_results if r['tool'] == tool), None)
+                if not result:
+                  continue
+                
+                speed = result['speed']
+                size = result['size']
+                ratio = result['ratio']
+                
+                # Compare to pigz
+                if pigz_result and tool != 'pigz':
+                  speed_diff = (speed / pigz_result['speed'] - 1) * 100
+                  size_diff = (size / pigz_result['size'] - 1) * 100
+                  
+                  if speed_diff >= 0:
+                    speed_icon = "🟢" if speed_diff > 10 else "🟡"
+                  else:
+                    speed_icon = "🔴" if speed_diff < -10 else "🟡"
+                  
+                  if size_diff <= 0:
+                    size_icon = "🟢" if size_diff < -2 else "🟡"
+                  else:
+                    size_icon = "🔴" if size_diff > 2 else "🟡"
+                  
+                  vs_pigz = f"{speed_icon} {speed_diff:+.1f}% speed, {size_icon} {size_diff:+.1f}% size"
+                else:
+                  vs_pigz = "—" if tool == 'pigz' else "N/A"
+                
+                # Format size
+                if size > 1000000:
+                  size_str = f"{size/1000000:.2f} MB"
+                else:
+                  size_str = f"{size/1000:.1f} KB"
+                
+                # Highlight gzippy
+                tool_name = f"**{tool}**" if tool == 'gzippy' else tool
+                
+                print(f"| L{level} | {tool_name} | {speed:.1f} | {size_str} | {ratio:.1f}% | {vs_pigz} |")
+            
+            print()
+          
+          # =================================================================
+          # Decompression Summary
+          # =================================================================
+          print("## 📤 Decompression Performance")
+          print()
+          
+          sources = sorted(set(r['source'] for r in decompression))
+          
+          print("| Source | gzippy | pigz | igzip | gzip | Winner |")
+          print("|--------|--------|------|-------|------|--------|")
+          
+          for source in sources:
+            source_results = [r for r in decompression if r['source'] == source]
+            
+            row = [f"**{source}**-compressed"]
+            speeds = {}
+            
+            for tool in ['gzippy', 'pigz', 'igzip', 'gzip']:
+              result = next((r for r in source_results if r['tool'] == tool), None)
+              if result:
+                speed = result['speed']
+                speeds[tool] = speed
+                row.append(f"{speed:.0f} MB/s")
+              else:
+                row.append("—")
+            
+            # Determine winner
+            if speeds:
+              winner = max(speeds, key=speeds.get)
+              winner_speed = speeds[winner]
+              
+              if winner == 'gzippy':
+                row.append(f"🏆 **gzippy**")
+              elif winner == 'igzip':
+                gzippy_speed = speeds.get('gzippy', 0)
+                diff = (gzippy_speed / winner_speed - 1) * 100 if winner_speed > 0 else 0
+                row.append(f"igzip ({diff:+.0f}%)")
+              else:
+                row.append(winner)
+            else:
+              row.append("—")
+            
+            print("| " + " | ".join(row) + " |")
+          
+          print()
+          
+          # =================================================================
+          # Key Metrics Summary
+          # =================================================================
+          print("## 📊 Key Metrics")
+          print()
+          
+          # Find best gzippy results
+          gzippy_comp = [r for r in compression if r['tool'] == 'gzippy']
+          pigz_comp = [r for r in compression if r['tool'] == 'pigz']
+          gzippy_decomp = [r for r in decompression if r['tool'] == 'gzippy']
+          
+          if gzippy_comp and pigz_comp:
+            # L1 multi-thread speed comparison
+            gzippy_l1_mt = next((r for r in gzippy_comp if r['level'] == 1 and r['threads'] > 1), None)
+            pigz_l1_mt = next((r for r in pigz_comp if r['level'] == 1 and r['threads'] > 1), None)
+            
+            if gzippy_l1_mt and pigz_l1_mt:
+              speed_advantage = (gzippy_l1_mt['speed'] / pigz_l1_mt['speed'] - 1) * 100
+              print(f"- **Compression Speed (L1)**: {speed_advantage:+.0f}% vs pigz")
+            
+            # L9 size comparison
+            gzippy_l9 = next((r for r in gzippy_comp if r['level'] == 9), None)
+            pigz_l9 = next((r for r in pigz_comp if r['level'] == 9), None)
+            
+            if gzippy_l9 and pigz_l9:
+              size_advantage = (gzippy_l9['size'] / pigz_l9['size'] - 1) * 100
+              print(f"- **Compression Ratio (L9)**: {size_advantage:+.1f}% vs pigz")
+          
+          if gzippy_decomp:
+            # Best decompression speed
+            best_decomp = max(gzippy_decomp, key=lambda r: r['speed'])
+            print(f"- **Best Decompression**: {best_decomp['speed']:.0f} MB/s ({best_decomp['source']}-compressed)")
+          
+          print()
+          
+          # =================================================================
+          # Pass/Fail Summary
+          # =================================================================
+          print("## ✅ Performance Goals")
+          print()
+          print("| Goal | Status |")
+          print("|------|--------|")
+          
+          # Check compression speed goal
+          if gzippy_l1_mt and pigz_l1_mt:
+            if gzippy_l1_mt['speed'] >= pigz_l1_mt['speed']:
+              print("| Compression faster than pigz | ✅ PASS |")
+            else:
+              print("| Compression faster than pigz | ❌ FAIL |")
+          
+          # Check compression ratio goal
+          if gzippy_l9 and pigz_l9:
+            if gzippy_l9['size'] <= pigz_l9['size'] * 1.005:  # Within 0.5%
+              print("| Compression ratio matches pigz (L9) | ✅ PASS |")
+            else:
+              print("| Compression ratio matches pigz (L9) | ❌ FAIL |")
+          
+          # Check decompression speed goal
+          gzippy_from_gzippy = [r for r in decompression if r['tool'] == 'gzippy' and r['source'] == 'gzippy']
+          if gzippy_from_gzippy:
+            if gzippy_from_gzippy[0]['speed'] >= 300:  # Conservative CI threshold
+              print("| Decompression ≥300 MB/s (BGZF) | ✅ PASS |")
+            else:
+              print("| Decompression ≥300 MB/s (BGZF) | ❌ FAIL |")
+          
+          print()
+          
+          PYTHON_SCRIPT
+          
+          cat summary.md >> $GITHUB_STEP_SUMMARY
+          cat summary.md
+
+      - name: Post comment to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('summary.md', 'utf8');
+            
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            
+            const botComment = comments.find(c => 
+              c.user.type === 'Bot' && 
+              c.body.includes('gzippy Performance Summary')
+            );
+            
+            const body = summary + '\n\n---\n*Updated: ' + new Date().toISOString() + '*';
+            
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: results/
