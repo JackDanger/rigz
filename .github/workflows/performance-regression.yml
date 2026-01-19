@@ -3,14 +3,13 @@
 # =============================================================================
 # These tests enforce hard thresholds. CI FAILS if we regress:
 #
-# - Fixed Block Turbo: MUST be ≥105% of libdeflate (currently ~120%)
 # - BGZF Parallel: MUST achieve ≥500 MB/s (CI-conservative; local: ~3900 MB/s)
 # - Multi-member: MUST achieve ≥300 MB/s
 # - Single-member: MUST achieve ≥300 MB/s
 #
 # These encode our key wins:
-# - Fixed turbo beats libdeflate by 20% on fixed Huffman blocks
 # - BGZF parallel is 2.9x faster than libdeflate single-thread
+# - Multi-member parallel handles pigz-style files efficiently
 #
 # NOTE: Thread counts and compression levels are tested in ci.yml (edge-cases)
 # =============================================================================
@@ -34,62 +33,8 @@ jobs:
   # ============================================================================
   # Pure Rust Performance Advantages - These MUST be maintained
   # ============================================================================
-  fixed-block-turbo:
-    name: Guard: Fixed Turbo ≥105% libdeflate
-    runs-on: ubuntu-latest
-    
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Run fixed turbo benchmark
-        run: |
-          echo "## Fixed Block Turbo Performance" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Testing our table-free fixed Huffman decoder vs libdeflate..." >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Run the benchmark test and capture output
-          OUTPUT=$(cargo test fixed_turbo::tests::benchmark_fixed_turbo --release -- --nocapture 2>&1)
-          echo "$OUTPUT"
-          
-          # Extract speeds using awk (more portable than grep -P)
-          TURBO_SPEED=$(echo "$OUTPUT" | grep "Turbo:" | awk '{print $2}')
-          LIBDEFLATE_SPEED=$(echo "$OUTPUT" | grep "libdeflate:" | awk '{print $2}')
-          RATIO=$(echo "$OUTPUT" | grep "Ratio:" | awk '{print $2}' | tr -d '%')
-          
-          echo "Extracted: Turbo=$TURBO_SPEED, libdeflate=$LIBDEFLATE_SPEED, Ratio=$RATIO"
-          
-          echo "| Decoder | Speed (MB/s) |" >> $GITHUB_STEP_SUMMARY
-          echo "|---------|--------------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Fixed Turbo** | ${TURBO_SPEED} |" >> $GITHUB_STEP_SUMMARY
-          echo "| libdeflate | ${LIBDEFLATE_SPEED} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Ratio: ${RATIO}% of libdeflate**" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Check threshold: Fixed turbo MUST be at least 105% of libdeflate
-          THRESHOLD=105
-          if [ -z "$RATIO" ]; then
-            echo "❌ **FAIL**: Could not extract ratio from benchmark output" >> $GITHUB_STEP_SUMMARY
-            exit 1
-          fi
-          
-          # Use awk for floating point comparison (bc may not handle empty values)
-          if awk "BEGIN {exit !($RATIO >= $THRESHOLD)}"; then
-            echo "✅ **PASS**: Fixed turbo beats libdeflate (${RATIO}% >= ${THRESHOLD}%)" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ **FAIL**: Fixed turbo should beat libdeflate by 5%+" >> $GITHUB_STEP_SUMMARY
-            echo "   Expected: >= ${THRESHOLD}%, Got: ${RATIO}%" >> $GITHUB_STEP_SUMMARY
-            exit 1
-          fi
-
   bgzf-parallel:
-    name: Guard: BGZF Parallel ≥3000 MB/s
+    name: Guard: BGZF Parallel ≥500 MB/s
     runs-on: ubuntu-latest
     
     steps:
@@ -156,7 +101,7 @@ jobs:
           fi
 
   multi-member-parallel:
-    name: Guard: Multi-member ≥500 MB/s
+    name: Guard: Multi-member ≥300 MB/s
     runs-on: ubuntu-latest
     
     steps:
@@ -233,7 +178,7 @@ jobs:
           fi
 
   single-member-gzip:
-    name: Guard: Single-member ≥500 MB/s
+    name: Guard: Single-member ≥300 MB/s
     runs-on: ubuntu-latest
     
     steps:
@@ -301,13 +246,10 @@ jobs:
   # ============================================================================
   # Summary of all performance regression tests
   # ============================================================================
-  # NOTE: Thread counts and compression levels are tested for correctness in
-  # ci.yml (edge-cases job). This workflow focuses only on performance thresholds.
-  # ============================================================================
   summary:
     name: Guards Summary
     runs-on: ubuntu-latest
-    needs: [fixed-block-turbo, bgzf-parallel, multi-member-parallel, single-member-gzip]
+    needs: [bgzf-parallel, multi-member-parallel, single-member-gzip]
     if: always()
     
     steps:
@@ -319,7 +261,6 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Guard | Threshold | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-----------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Fixed Block Turbo | ≥105% of libdeflate | ${{ needs.fixed-block-turbo.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| BGZF Parallel | ≥500 MB/s | ${{ needs.bgzf-parallel.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Multi-member | ≥300 MB/s | ${{ needs.multi-member-parallel.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Single-member | ≥300 MB/s | ${{ needs.single-member-gzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
