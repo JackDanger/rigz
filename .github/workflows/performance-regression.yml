@@ -55,11 +55,14 @@ jobs:
           
           # Run the benchmark test and capture output
           OUTPUT=$(cargo test fixed_turbo::tests::benchmark_fixed_turbo --release -- --nocapture 2>&1)
+          echo "$OUTPUT"
           
-          # Extract speeds
-          TURBO_SPEED=$(echo "$OUTPUT" | grep "Turbo:" | grep -oP '\d+' | head -1)
-          LIBDEFLATE_SPEED=$(echo "$OUTPUT" | grep "libdeflate:" | grep -oP '\d+' | head -1)
-          RATIO=$(echo "$OUTPUT" | grep "Ratio:" | grep -oP '[\d.]+')
+          # Extract speeds using awk (more portable than grep -P)
+          TURBO_SPEED=$(echo "$OUTPUT" | grep "Turbo:" | awk '{print $2}')
+          LIBDEFLATE_SPEED=$(echo "$OUTPUT" | grep "libdeflate:" | awk '{print $2}')
+          RATIO=$(echo "$OUTPUT" | grep "Ratio:" | awk '{print $2}' | tr -d '%')
+          
+          echo "Extracted: Turbo=$TURBO_SPEED, libdeflate=$LIBDEFLATE_SPEED, Ratio=$RATIO"
           
           echo "| Decoder | Speed (MB/s) |" >> $GITHUB_STEP_SUMMARY
           echo "|---------|--------------|" >> $GITHUB_STEP_SUMMARY
@@ -71,7 +74,13 @@ jobs:
           
           # Check threshold: Fixed turbo MUST be at least 105% of libdeflate
           THRESHOLD=105
-          if [ "$(echo "$RATIO >= $THRESHOLD" | bc)" -eq 1 ]; then
+          if [ -z "$RATIO" ]; then
+            echo "❌ **FAIL**: Could not extract ratio from benchmark output" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          
+          # Use awk for floating point comparison (bc may not handle empty values)
+          if awk "BEGIN {exit !($RATIO >= $THRESHOLD)}"; then
             echo "✅ **PASS**: Fixed turbo beats libdeflate (${RATIO}% >= ${THRESHOLD}%)" >> $GITHUB_STEP_SUMMARY
           else
             echo "❌ **FAIL**: Fixed turbo should beat libdeflate by 5%+" >> $GITHUB_STEP_SUMMARY
