@@ -48,22 +48,6 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install build dependencies
-        run: |
-          if [ "${{ runner.os }}" = "Linux" ]; then
-            sudo apt-get update
-            sudo apt-get install -y cmake nasm
-          elif [ "${{ runner.os }}" = "macOS" ]; then
-            brew install cmake nasm
-          fi
-
-      - name: Build ISA-L
-        run: |
-          cd isa-l
-          mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
-
       - name: Build release
         run: cargo build --release
 
@@ -107,13 +91,6 @@ jobs:
 
       - name: Build pigz
         run: make -C pigz
-
-      - name: Build igzip (ISA-L)
-        run: |
-          mkdir -p isa-l/build
-          cd isa-l/build
-          cmake ..
-          make -j$(nproc) igzip
 
       - name: Build zopfli
         run: make -C zopfli zopfli

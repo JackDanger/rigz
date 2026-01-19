@@ -14,6 +14,7 @@ We will do **any amount of work** to beat all competitors:
 1. Full gzip/gunzip compatibility (RFC 1952)
 2. Drop-in replacement for gzip CLI
 3. Matching or beating pigz compression ratio at each level
+4. When making a tradeoff, you MUST choose the most performant option
 
 ### Performance Requirements
 - **Compression**: Beat pigz at all levels and thread counts
@@ -44,9 +45,7 @@ We will do **any amount of work** to beat all competitors:
 | `decompression.rs` | Main entry point, routes to appropriate backend |
 | `ultra_decompress.rs` | Dispatcher for BGZF/multi-member/single |
 | `marker_decode.rs` | Marker-based speculative decoding (like rapidgzip) |
-| `block_finder.rs` | LUT-based block boundary detection |
-| `isal.rs` | ISA-L bindings with libdeflate fallback |
-| `index_cache.rs` | Block index caching for repeated decompression |
+| `isal.rs` | High-performance inflater (libdeflate, statically linked) |
 
 ## Marker-Based Speculative Decoding
 
@@ -101,7 +100,6 @@ The key to matching rapidgzip on arbitrary gzip files:
 2. **Parallel speculative decode** with marker tracking
 3. **Window propagation** through chunk chain
 4. **Parallel marker replacement** via thread pool
-5. **Index caching** for repeated access
 
 ## What We've Learned
 
@@ -109,8 +107,9 @@ The key to matching rapidgzip on arbitrary gzip files:
 1. **4-byte block sizes** in BGZF headers (supports >64KB blocks)
 2. **Pre-allocated output buffers** with direct parallel writes
 3. **Lock-free work distribution** via atomic counters
-4. **ISA-L for verified blocks** once window is known
+4. **libdeflate for verified blocks** once window is known
 5. **Chunk spacing** (guess positions) rather than block finding
+6. **Statically-linked dependencies** - no runtime library issues
 
 ### What Doesn't Work
 1. **Finding actual block boundaries** - Success rate too low (<5%)
@@ -118,8 +117,13 @@ The key to matching rapidgzip on arbitrary gzip files:
 3. **Sequential marker replacement** - Must be parallel
 4. **Independent blocks at L9** - 4% larger output
 5. **Capping threads at physical_cores** - VMs underreport
+6. **ISA-L FFI on ARM** - Complex struct layout (200KB+), pure C fallback anyway
 
-## Build Optimizations
+## Build & Dependencies
+
+gzippy uses only statically-linked dependencies for maximum portability:
+- **libdeflate** (via libdeflater crate) - Fast inflate/deflate
+- **zlib-ng** (via flate2 with zlib-ng feature) - CRC32 and streaming
 
 ```toml
 [profile.release]
@@ -130,24 +134,15 @@ panic = "abort"
 strip = true
 ```
 
-### ISA-L Integration
-
-ISA-L is a git submodule at `isa-l/`. Build before gzippy:
+**No external library dependencies** - The binary is fully self-contained:
 ```bash
-cd isa-l && mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
+$ ldd target/release/gzippy  # Linux
+        linux-vdso.so.1
+        libc.so.6
+$ otool -L target/release/gzippy  # macOS
+        /usr/lib/libiconv.2.dylib
+        /usr/lib/libSystem.B.dylib
 ```
-
-The library is then linked via build.rs:
-```
-isa-l/build/libisal.dylib (macOS)
-isa-l/build/libisal.so (Linux)
-```
-
-**Critical**: ISA-L must be built BEFORE `cargo build` in all CI workflows.
-
-Enable with: `cargo build --release --features isal`
 
 ## Pre-commit Checks
 
@@ -161,8 +156,8 @@ To skip (emergency only): `git commit --no-verify`
 
 ### Critical CI Rules
 1. **Never use `-C target-cpu=native`** - Causes SIGILL on heterogeneous CI runners
-2. **Build ISA-L before gzippy** - Must be done in every workflow
-3. **Use adaptive benchmarking** - Run until stdev < 5% of mean (min 5, max 30 trials)
+2. **Use adaptive benchmarking** - Run until stdev < 5% of mean (min 5, max 30 trials)
+3. **All deps statically linked** - No ISA-L or other external libs to build
 
 ### Workflow Design (4-stage pipeline)
 1. **Build** - Build all tools once, upload as artifacts
@@ -180,14 +175,13 @@ Set `GZIPPY_DEBUG=1` to enable timing diagnostics during compression.
 - Beats pigz at all levels
 - L10-L12 ultra compression (near-zopfli ratios)
 
-### Decompression: 🚧 In Progress
+### Decompression: ✅ Core Complete
 - ✅ BGZF files: 3400+ MB/s (beats rapidgzip)
-- 🚧 gzip files: Implementing marker-based speculative decode
-- 🚧 Index caching: In progress
+- ✅ Marker-based speculative decoding
+- ✅ Chunk spacing strategy
+- ✅ libdeflate integration (statically linked)
+- ✅ Parallel marker replacement pipeline
 
-### Remaining Work
-1. ✅ Marker-based speculative decoding
-2. ✅ Chunk spacing strategy
-3. ✅ Deep ISA-L integration for verified blocks
-4. ✅ Parallel marker replacement pipeline
-5. ✅ Block index caching and reuse
+### Architecture Decisions
+- **libdeflate over ISA-L**: ISA-L's complex FFI (200KB+ struct) and ARM fallback to pure C made libdeflate the pragmatic choice. libdeflate is ~90% of ISA-L's SIMD speed with simpler integration.
+- **Static linking only**: All dependencies are statically linked - no runtime library discovery issues.

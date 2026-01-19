@@ -278,142 +278,14 @@ fn validate_huffman_lengths(lengths: &[u8]) -> bool {
 }
 
 // ============================================================================
-// ISA-L FFI Bindings
+// ISA-L Integration (uses statically-linked ISA-L from crate::isal)
 // ============================================================================
 
-#[repr(C)]
-struct IsalInflateState {
-    next_out: *mut u8,
-    avail_out: u32,
-    total_out: u32,
-    next_in: *const u8,
-    avail_in: u32,
-    read_in: u64,
-    read_in_length: i32,
-    crc: u32,
-    hist_bits: i32,
-    state: i32,
-    bfinal: i32,
-    btype: i32,
-    block_state: i32,
-    dict_length: i32,
-    dict_id: i32,
-    copy_overflow_length: i32,
-    copy_overflow_distance: i32,
-    lit_huff_code: [u16; 286],
-    dist_huff_code: [u16; 30],
-    // ... more internal state (8KB total struct size)
-    _padding: [u8; 4096],
-}
+use crate::isal::IsalInflater;
 
-impl Default for IsalInflateState {
-    fn default() -> Self {
-        // SAFETY: Zero-initialization is valid for this C struct
-        unsafe { std::mem::zeroed() }
-    }
-}
-
-type IsalInflateInit = unsafe extern "C" fn(*mut IsalInflateState);
-type IsalInflate = unsafe extern "C" fn(*mut IsalInflateState) -> i32;
-type IsalInflateSetDict = unsafe extern "C" fn(*mut IsalInflateState, *const u8, u32) -> i32;
-
-struct IsalLib {
-    _lib: libloading::Library,
-    init: IsalInflateInit,
-    inflate: IsalInflate,
-    set_dict: IsalInflateSetDict,
-}
-
-impl IsalLib {
-    fn load() -> Option<Self> {
-        let paths = [
-            "libisal.dylib",
-            "libisal.so",
-            "./isa-l/build/lib/libisal.dylib",
-            "./isa-l/build/lib/libisal.so.2",
-            "/usr/local/lib/libisal.dylib",
-            "/opt/homebrew/lib/libisal.dylib",
-        ];
-
-        for path in &paths {
-            if let Ok(lib) = unsafe { libloading::Library::new(path) } {
-                // Get raw function pointers before storing
-                let init_fn = unsafe {
-                    match lib.get::<IsalInflateInit>(b"isal_inflate_init") {
-                        Ok(s) => *s,
-                        Err(_) => continue,
-                    }
-                };
-                let inflate_fn = unsafe {
-                    match lib.get::<IsalInflate>(b"isal_inflate") {
-                        Ok(s) => *s,
-                        Err(_) => continue,
-                    }
-                };
-                let set_dict_fn = unsafe {
-                    match lib.get::<IsalInflateSetDict>(b"isal_inflate_set_dict") {
-                        Ok(s) => *s,
-                        Err(_) => continue,
-                    }
-                };
-
-                return Some(Self {
-                    _lib: lib,
-                    init: init_fn,
-                    inflate: inflate_fn,
-                    set_dict: set_dict_fn,
-                });
-            }
-        }
-        None
-    }
-
-    fn inflate_raw(
-        &self,
-        input: &[u8],
-        output: &mut Vec<u8>,
-        window: Option<&[u8]>,
-    ) -> io::Result<usize> {
-        let mut state = IsalInflateState::default();
-        unsafe { (self.init)(&mut state) };
-
-        if let Some(w) = window {
-            unsafe { (self.set_dict)(&mut state, w.as_ptr(), w.len() as u32) };
-        }
-
-        let initial_len = output.len();
-        let capacity = output.capacity();
-
-        state.next_in = input.as_ptr();
-        state.avail_in = input.len() as u32;
-
-        // Reserve output space
-        output.reserve(input.len() * 4);
-        let out_ptr = unsafe { output.as_mut_ptr().add(initial_len) };
-        let out_space = output.capacity() - initial_len;
-
-        state.next_out = out_ptr;
-        state.avail_out = out_space as u32;
-
-        let ret = unsafe { (self.inflate)(&mut state) };
-
-        if ret != 0 && ret != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "ISA-L inflate error",
-            ));
-        }
-
-        let written = (capacity - initial_len) - state.avail_out as usize;
-        unsafe { output.set_len(initial_len + written) };
-
-        Ok(written)
-    }
-}
-
-// Thread-local ISA-L instance
+// Thread-local ISA-L inflater
 thread_local! {
-    static ISAL: Option<IsalLib> = IsalLib::load();
+    static ISAL: Option<IsalInflater> = IsalInflater::new().ok();
 }
 
 // ============================================================================
@@ -590,24 +462,30 @@ impl UltraInflate {
     }
 }
 
-fn decode_chunk(data: &[u8], index: usize, bit_offset: u8, isal: Option<&IsalLib>) -> ChunkResult {
-    // Try ISA-L first
-    if let Some(lib) = isal {
-        let mut output = Vec::with_capacity(data.len() * 4);
-        if lib.inflate_raw(data, &mut output, None).is_ok() && !output.is_empty() {
-            let window = if output.len() >= WINDOW_SIZE {
-                output[output.len() - WINDOW_SIZE..].to_vec()
-            } else {
-                output.clone()
-            };
+fn decode_chunk(
+    data: &[u8],
+    index: usize,
+    bit_offset: u8,
+    _isal: Option<&IsalInflater>,
+) -> ChunkResult {
+    // Try ISA-L/libdeflate first
+    if let Ok(mut inflater) = IsalInflater::new() {
+        if let Ok(output) = inflater.decompress_all(data, data.len() * 4) {
+            if !output.is_empty() {
+                let window = if output.len() >= WINDOW_SIZE {
+                    output[output.len() - WINDOW_SIZE..].to_vec()
+                } else {
+                    output.clone()
+                };
 
-            return ChunkResult {
-                index,
-                output,
-                window,
-                success: true,
-                bit_offset: Some((0, bit_offset)),
-            };
+                return ChunkResult {
+                    index,
+                    output,
+                    window,
+                    success: true,
+                    bit_offset: Some((0, bit_offset)),
+                };
+            }
         }
     }
 

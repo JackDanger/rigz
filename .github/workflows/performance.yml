@@ -16,7 +16,7 @@ env:
   CARGO_HOME: /home/runner/.cargo
   CARGO_INCREMENTAL: 0
   # Don't use -C target-cpu=native - causes SIGILL on heterogeneous CI runners
-  # ISA-L provides SIMD optimizations instead
+  # gzippy uses libdeflate (statically linked) for high performance
 
 jobs:
   benchmark:
@@ -50,14 +50,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential zlib1g-dev gzip cmake nasm
 
-      - name: Build ISA-L library
-        run: |
-          cd isa-l
-          mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc)
-
-      - name: Build gzippy (with ISA-L)
+      - name: Build gzippy
         run: cargo build --release
 
       - name: Build pigz
@@ -121,14 +114,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential zlib1g-dev gzip cmake nasm
 
-      - name: Build ISA-L library
-        run: |
-          cd isa-l
-          mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc)
-
-      - name: Build gzippy (with ISA-L)
+      - name: Build gzippy
         run: cargo build --release
 
       - name: Build pigz
@@ -184,14 +170,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential zlib1g-dev gzip cmake nasm
 
-      - name: Build ISA-L library
-        run: |
-          cd isa-l
-          mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc)
-
-      - name: Build gzippy (with ISA-L)
+      - name: Build gzippy
         run: cargo build --release
 
       - name: Build pigz
@@ -306,14 +285,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake nasm
 
-      - name: Build ISA-L library
-        run: |
-          cd isa-l
-          mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc)
-
-      - name: Build gzippy (with ISA-L)
+      - name: Build gzippy
         run: cargo build --release
 
       - name: Test random data compression/decompression

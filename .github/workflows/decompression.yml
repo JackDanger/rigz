@@ -14,7 +14,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   # Don't use -C target-cpu=native in CI - causes SIGILL on heterogeneous runners
-  # ISA-L provides the SIMD optimizations we need
+  # gzippy uses libdeflate (statically linked) for high performance
 
 jobs:
   # ============================================================================
@@ -47,22 +47,11 @@ jobs:
             target/
           key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build ISA-L
+      - name: Build gzippy
         run: |
-          cd isa-l
-          mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc)
-          ls -la *.so* *.dylib* 2>/dev/null || ls -la lib* 2>/dev/null || true
-          echo "ISA-L built successfully"
-
-      - name: Build gzippy (with ISA-L)
-        run: |
-          # Verify ISA-L is available
-          ls -la isa-l/build/lib* 2>/dev/null || true
           cargo build --release
-          # Verify ISA-L was linked
-          ldd target/release/gzippy 2>/dev/null | grep -i isal || echo "ISA-L linked statically or not found"
+          # Verify binary is self-contained (no custom dynamic libs)
+          ldd target/release/gzippy 2>/dev/null || otool -L target/release/gzippy || true
 
       - name: Build pigz
         run: make -C pigz

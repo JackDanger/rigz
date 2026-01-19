@@ -18,7 +18,7 @@
 //! - Multi-member (pigz): Parallel per-member with ISA-L
 //! - Single-member: Streaming with large buffers and prefetch
 
-use crate::isal::{decompress_parallel as isal_parallel, IsalInflater};
+use crate::isal::IsalInflater;
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -186,7 +186,8 @@ impl UltraDecompressor {
         members: &[(usize, usize)],
         writer: &mut W,
     ) -> io::Result<u64> {
-        isal_parallel(data, writer, self.num_threads)
+        // Use marker-based decoder for multi-member files
+        crate::marker_decode::decompress_parallel(data, writer, self.num_threads)
     }
 
     /// Parallel decompression for single-member gzip using ultra-fast engine
