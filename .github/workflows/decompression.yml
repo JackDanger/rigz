@@ -16,50 +16,10 @@ env:
   RUSTFLAGS: -C target-cpu=native
 
 jobs:
-  # Build rapidgzip for comparison
-  build-tools:
-    name: Build Comparison Tools
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake nasm zlib1g-dev python3-dev
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build gzippy
-        run: cargo build --release
-
-      - name: Build pigz
-        run: make -C pigz
-
-      - name: Build rapidgzip
-        run: |
-          cd rapidgzip
-          pip3 install --user .
-          # Also build CLI if available
-          which rapidgzip || echo "Using Python module"
-
-      - name: Upload binaries
-        uses: actions/upload-artifact@v4
-        with:
-          name: tools
-          path: |
-            target/release/gzippy
-            pigz/pigz
-            pigz/unpigz
-
   # Test decompression of files created by different tools
   decompress-matrix:
     name: Decompress ${{ matrix.source }}-L${{ matrix.level }} T${{ matrix.threads }}
     runs-on: ubuntu-latest
-    needs: build-tools
     strategy:
       fail-fast: false
       matrix:
@@ -86,7 +46,8 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake nasm zlib1g-dev python3
+          sudo apt-get install -y build-essential cmake nasm zlib1g-dev python3 python3-pip
+          pip3 install --user cython
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -97,10 +58,19 @@ jobs:
       - name: Build pigz
         run: make -C pigz
 
-      - name: Install rapidgzip
+      - name: Build rapidgzip from source
         run: |
-          cd rapidgzip
-          pip3 install --user .
+          # Build rapidgzip CLI from C++ source
+          cd rapidgzip/librapidarchive
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc) rapidgzip
+          # Copy to a known location
+          cp tools/rapidgzip ../../rapidgzip-cli || echo "CLI build failed, using Python fallback"
+          
+          # Also install Python module as fallback
+          cd ../../python/rapidgzip
+          pip3 install --user . || echo "Python module install failed"
 
       - name: Generate test data
         run: |
@@ -201,10 +171,15 @@ jobs:
           fi
           echo "| gzip | 1 | $TIME | $SPEED | $STATUS |"
           
-          # rapidgzip decompression (if available)
-          if python3 -c "import rapidgzip" 2>/dev/null; then
-            for t in 1 ${{ matrix.threads }}; do
-              START=$(date +%s.%N)
+          # rapidgzip decompression (CLI preferred, Python fallback)
+          RAPIDGZIP_CLI="./rapidgzip/rapidgzip-cli"
+          for t in 1 ${{ matrix.threads }}; do
+            START=$(date +%s.%N)
+            if [ -x "$RAPIDGZIP_CLI" ]; then
+              # Use CLI (faster, more accurate benchmark)
+              $RAPIDGZIP_CLI -d -P $t < /tmp/test.gz > /tmp/out_rapidgzip.dat 2>/dev/null
+            elif python3 -c "import rapidgzip" 2>/dev/null; then
+              # Fallback to Python module
               python3 -c "
           import rapidgzip
           import sys
@@ -212,18 +187,21 @@ jobs:
               data = f.read()
               sys.stdout.buffer.write(data)
           " > /tmp/out_rapidgzip.dat 2>/dev/null
-              END=$(date +%s.%N)
-              TIME=$(echo "$END - $START" | bc)
-              SPEED=$(echo "scale=1; $ORIGINAL_SIZE / 1048576 / $TIME" | bc)
-              
-              if diff -q /tmp/test.dat /tmp/out_rapidgzip.dat > /dev/null; then
-                STATUS="✓"
-              else
-                STATUS="✗ MISMATCH"
-              fi
-              echo "| rapidgzip | $t | $TIME | $SPEED | $STATUS |"
-            done
-          fi
+            else
+              echo "| rapidgzip | $t | N/A | N/A | not installed |"
+              continue
+            fi
+            END=$(date +%s.%N)
+            TIME=$(echo "$END - $START" | bc)
+            SPEED=$(echo "scale=1; $ORIGINAL_SIZE / 1048576 / $TIME" | bc)
+            
+            if diff -q /tmp/test.dat /tmp/out_rapidgzip.dat > /dev/null; then
+              STATUS="✓"
+            else
+              STATUS="✗ MISMATCH"
+            fi
+            echo "| rapidgzip | $t | $TIME | $SPEED | $STATUS |"
+          done
 
   # Summary job
   summary:
