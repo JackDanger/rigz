@@ -414,8 +414,29 @@ fn decode_huffman_into(
     use crate::combined_lut::{DIST_END_OF_BLOCK, DIST_LITERAL, DIST_SLOW_PATH};
     use crate::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
 
+    // Prefetch next output cache line (64 bytes ahead on x86_64)
+    // This hides memory latency by loading data into L1 cache before it's needed
+    #[inline(always)]
+    #[allow(unused_variables)]
+    fn prefetch_output(output: &[u8], pos: usize) {
+        #[cfg(target_arch = "x86_64")]
+        if pos + 64 < output.len() {
+            // SAFETY: Pointer arithmetic within bounds, prefetch is advisory
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(
+                    output.as_ptr().add(pos + 64) as *const i8,
+                    std::arch::x86_64::_MM_HINT_T0,
+                );
+            }
+        }
+        // ARM prefetch is unstable in Rust, no-op for now
+    }
+
     loop {
         bits.ensure(32);
+
+        // Prefetch next output cache line
+        prefetch_output(output, out_pos);
 
         let entry = combined_lut.decode(bits.buffer());
 
