@@ -64,6 +64,7 @@ extern "C" {
     fn isal_inflate_init(state: *mut InflateState) -> i32;
     fn isal_inflate_reset(state: *mut InflateState) -> i32;
     fn isal_inflate(state: *mut InflateState) -> i32;
+    fn isal_inflate_set_dict(state: *mut InflateState, dict: *const u8, dict_len: u32) -> i32;
 }
 
 /// Check if ISA-L is available
@@ -110,6 +111,31 @@ impl IsalInflater {
             ));
         }
         Ok(())
+    }
+
+    /// Set dictionary/window for speculative decompression
+    ///
+    /// This is critical for parallel decompression: when starting mid-stream,
+    /// back-references may point to data before our chunk. This sets that data.
+    pub fn set_dict(&mut self, dict: &[u8]) -> io::Result<()> {
+        let ret =
+            unsafe { isal_inflate_set_dict(self.state.as_mut(), dict.as_ptr(), dict.len() as u32) };
+        if ret != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("isal_inflate_set_dict failed: {}", ret),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Prime the inflater with bits for non-byte-aligned starts
+    ///
+    /// When starting decompression at a bit offset that isn't byte-aligned,
+    /// we need to prime the bit buffer with the leading bits.
+    pub fn prime(&mut self, bits: u64, num_bits: u32) {
+        self.state.read_in = bits;
+        self.state.read_in_length = num_bits;
     }
 
     /// Decompress gzip data

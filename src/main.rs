@@ -7,6 +7,7 @@ use std::env;
 use std::path::Path;
 use std::process;
 
+mod block_finder;
 mod cli;
 mod compression;
 mod decompression;

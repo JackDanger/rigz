@@ -839,6 +839,15 @@ fn decode_chunk_speculative(
     bit_offset: u8,
     has_window: bool,
 ) -> ChunkResult {
+    // Try ISA-L first if we have the feature enabled
+    #[cfg(feature = "isal")]
+    {
+        if let Some(result) = decode_chunk_isal(data, index, bit_offset, has_window) {
+            return result;
+        }
+    }
+
+    // Fallback to custom decoder
     let mut decoder = if has_window {
         let mut d = SpeculativeDecoder::new(data, bit_offset);
         d.available_window = WINDOW_SIZE; // First chunk has full virtual window
@@ -875,6 +884,78 @@ fn decode_chunk_speculative(
     }
 }
 
+/// Try to decode a chunk using ISA-L for maximum speed
+#[cfg(feature = "isal")]
+fn decode_chunk_isal(
+    data: &[u8],
+    index: usize,
+    bit_offset: u8,
+    has_window: bool,
+) -> Option<ChunkResult> {
+    use crate::isal::IsalInflater;
+
+    // ISA-L works best when starting at byte boundaries with raw deflate
+    // For non-zero bit offsets, we need to adjust the data
+    if bit_offset != 0 {
+        // For non-byte-aligned starts, use our custom decoder
+        return None;
+    }
+
+    // Try to decompress with ISA-L
+    let mut inflater = IsalInflater::new().ok()?;
+
+    // Estimate output size (typically 3-10x compression ratio)
+    let estimated_output = data.len() * 5;
+    let mut output = vec![0u8; estimated_output.max(64 * 1024)];
+    let mut total_out = 0;
+
+    // If this is the first chunk, we have a virtual window
+    // Otherwise, we'll need a previous chunk's window (handled elsewhere)
+    if !has_window && index > 0 {
+        // Can't use ISA-L without window for mid-stream decompression
+        return None;
+    }
+
+    // Try decompression
+    loop {
+        let result = inflater.decompress(data, &mut output[total_out..]);
+        match result {
+            Ok(n) => {
+                total_out += n;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WriteZero => {
+                // Need more output space
+                output.resize(output.len() * 2, 0);
+            }
+            Err(_) => {
+                // ISA-L failed, fall back to custom decoder
+                return None;
+            }
+        }
+    }
+
+    output.truncate(total_out);
+
+    // Get final window (last 32KB)
+    let final_window = if output.len() >= WINDOW_SIZE {
+        output[output.len() - WINDOW_SIZE..].to_vec()
+    } else {
+        output.clone()
+    };
+
+    Some(ChunkResult {
+        index,
+        valid_bit_offset: Some(bit_offset),
+        output,
+        unresolved: Vec::new(), // ISA-L handles all references internally
+        final_window,
+        success: true,
+        bytes_before_unresolved: 0,
+        end_bit_pos: data.len() * 8,
+    })
+}
+
 /// Try to decode at a specific bit offset
 fn try_decode_at_bit(data: &[u8], index: usize, bit_offset: u8) -> Option<ChunkResult> {
     let mut decoder = SpeculativeDecoder::new(data, bit_offset);
@@ -901,39 +982,35 @@ fn try_decode_at_bit(data: &[u8], index: usize, bit_offset: u8) -> Option<ChunkR
 /// Find a valid block start near a target position
 /// Returns (byte_offset, bit_offset) if found
 fn find_block_start(data: &[u8], target: usize, search_range: usize) -> Option<(usize, u8)> {
+    use crate::block_finder::BlockFinder;
+
+    let start_bit = target.saturating_sub(search_range / 2) * 8;
+    let end_bit = ((target + search_range / 2).min(data.len().saturating_sub(5))) * 8;
+
+    // Use the sophisticated block finder with LUT and precode validation
+    let finder = BlockFinder::new(data);
+    let blocks = finder.find_blocks(start_bit, end_bit);
+
+    if let Some(block) = blocks.first() {
+        let byte_offset = block.bit_offset / 8;
+        let bit_offset = (block.bit_offset % 8) as u8;
+        return Some((byte_offset, bit_offset));
+    }
+
+    // Fallback: Try stored blocks (BTYPE=00) with LEN/NLEN pattern
     let start = target.saturating_sub(search_range / 2);
     let end = (target + search_range / 2).min(data.len().saturating_sub(5));
 
-    // Strategy 1: Look for stored block signatures (BTYPE=00)
-    // Stored blocks have LEN (2 bytes) followed by ~LEN (2 bytes)
     for offset in start..end {
         if offset + 4 >= data.len() {
             break;
         }
 
-        // Try at byte boundary (bit_offset = 0)
-        // After skipping BFINAL (1 bit) and BTYPE (2 bits), we need byte alignment
-        // So we look for the pattern where LEN starts at byte boundary
-
-        // Check for stored block pattern
         let len = u16::from_le_bytes([data[offset], data[offset + 1]]);
         let nlen = u16::from_le_bytes([data[offset + 2], data[offset + 3]]);
 
         if len == !nlen && len > 0 && len < 65535 {
-            // Valid stored block! The block starts with BFINAL + BTYPE (3 bits)
-            // which would be at the byte before, with some bit offset
-            // For simplicity, return byte offset and try bit offsets
             return Some((offset.saturating_sub(1), 0));
-        }
-    }
-
-    // Strategy 2: Try to parse dynamic Huffman headers
-    // This is more complex and has a lower success rate
-    for offset in start..end {
-        for bit_offset in 0..8 {
-            if try_validate_block_start(data, offset, bit_offset) {
-                return Some((offset, bit_offset));
-            }
         }
     }
 
