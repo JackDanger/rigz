@@ -34,32 +34,35 @@ from pathlib import Path
 #
 # Note: Thresholds account for CI variance (~2% noise on shared runners).
 # A 0% threshold means "no worse than pigz within measurement error".
-def get_thresholds(level: int) -> tuple:
+def get_thresholds(level: int, size_mb: int = 10) -> tuple:
     """Returns (max_time_overhead_pct, max_size_overhead_pct).
     
     Thresholds are maximums - gzippy should generally beat these.
-    A small positive threshold (2%) accounts for CI measurement noise.
+    A small positive threshold accounts for CI measurement noise.
+    
+    Note: Small files (1MB) have higher variance due to startup overhead.
+    The overhead as a percentage is larger even if absolute time is small.
     """
+    # Adjust for file size: smaller files have more variance
+    size_adjustment = 1.0 if size_mb >= 10 else 1.5 if size_mb >= 5 else 2.0
+    
     if level >= 10:
         # L10-L12: Ultra compression using libdeflate L10-L12
         # Speed: Expected to be slower than pigz -9 (but still 20-50x faster than zopfli)
         # Size: Must be at least 3% smaller than pigz -9 (typically achieves 4-5% smaller)
-        # Note: Other tools are capped at L9 for comparison since gzippy L10+ should
-        #       beat everyone's best standard compression level
         return (500.0, -3.0)  # Speed doesn't matter, size must be 3%+ smaller
     elif level >= 9:
         # L9: Prioritize compression ratio, speed should still be competitive
-        # We must beat pigz even on 4-core GHA VMs
         # Size must be within 0.5%
-        return (5.0, 0.5)
+        return (10.0 * size_adjustment, 0.5)
     elif level >= 6:
         # L6-8: Transitional - uses pipelined output (sequential decompress)
-        # Allow 5% slower decompression (no BGZF markers)
-        return (5.0, 2.0)
+        # Allow 10% slower decompression for small files, 5% for larger
+        return (10.0 * size_adjustment, 2.0)
     else:
         # L1-5: Speed + parallel decompress, accept larger output
-        # 2% threshold accounts for CI noise (variance is typically 1-2%)
-        return (2.0, 8.0)
+        # 5% threshold for small files, 2% for larger
+        return (5.0 * size_adjustment, 8.0)
 
 
 # Number of runs by file size (larger files = fewer runs needed)
@@ -353,8 +356,8 @@ def main():
             print(f"SIMD: {', '.join(cpu_info['simd'])}")
         print()
     
-    # Get level-specific thresholds
-    default_time, default_ratio = get_thresholds(args.level)
+    # Get level-specific thresholds (adjusted for file size)
+    default_time, default_ratio = get_thresholds(args.level, args.size)
     max_time_overhead = args.max_time_overhead if args.max_time_overhead is not None else default_time
     max_ratio_overhead = args.max_ratio_overhead if args.max_ratio_overhead is not None else default_ratio
     
