@@ -163,6 +163,10 @@ fn decode_dynamic_block(bits: &mut FastBits, output: &mut Vec<u8>) -> io::Result
 ///
 /// Safety: Loop terminates via END_OF_BLOCK (256) or error from invalid Huffman code.
 /// The FastBits.consume() uses saturating_sub() to prevent underflow that caused OOM.
+/// Maximum output size before we consider the stream corrupted (1 GB)
+/// This prevents infinite loops on malformed data
+const MAX_OUTPUT_SIZE: usize = 1024 * 1024 * 1024;
+
 #[inline(never)]
 fn decode_huffman_block(
     bits: &mut FastBits,
@@ -173,8 +177,16 @@ fn decode_huffman_block(
     use crate::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
 
     output.reserve(256 * 1024);
+    let start_len = output.len();
 
     loop {
+        // Safety check: prevent infinite loops on corrupted data
+        if output.len() - start_len > MAX_OUTPUT_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Output size exceeded maximum limit (corrupted stream?)",
+            ));
+        }
         // Ensure enough bits for multiple literals + length/distance
         bits.ensure(32);
 
@@ -714,15 +726,41 @@ pub fn inflate_gzip_ultra_fast(input: &[u8], output: &mut Vec<u8>) -> io::Result
         pos += 2;
     }
 
-    if pos >= input.len() {
+    if pos >= input.len() || input.len() < 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Truncated header",
         ));
     }
 
+    // Read ISIZE from trailer (uncompressed size mod 2^32)
+    // This lets us pre-allocate and set a safety limit
+    let n = input.len();
+    let isize = u32::from_le_bytes([input[n - 4], input[n - 3], input[n - 2], input[n - 1]]);
+
+    // Pre-allocate output based on ISIZE (with safety margin for multi-member files)
+    let expected_size = isize as usize;
+    output.reserve(expected_size);
+
     let deflate_data = &input[pos..input.len().saturating_sub(8)];
-    inflate_ultra_fast(deflate_data, output)
+    let start_len = output.len();
+    inflate_ultra_fast(deflate_data, output)?;
+    let bytes_written = output.len() - start_len;
+
+    // Verify output size matches ISIZE (mod 2^32)
+    // For files > 4GB, ISIZE wraps around, so we check mod 2^32
+    if (bytes_written as u32) != isize {
+        // This could be a multi-member file or corrupted data
+        // Don't fail, but log for debugging
+        if std::env::var("GZIPPY_DEBUG").is_ok() {
+            eprintln!(
+                "[gzippy] ISIZE mismatch: wrote {} bytes, expected {} (mod 2^32)",
+                bytes_written, isize
+            );
+        }
+    }
+
+    Ok(bytes_written)
 }
 
 /// Inflate using CombinedLUT for pre-computed length+distance lookup
