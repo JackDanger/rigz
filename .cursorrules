@@ -349,11 +349,12 @@ inflate_into(deflate_data, out_slice)?;
 
 | File Type | Speed | Target | Status |
 |-----------|-------|--------|--------|
-| BGZF | 3850 MB/s | 4000+ MB/s | ✅ CLOSE (96%) |
+| BGZF parallel (8 threads) | 3300-3900 MB/s | 4000+ MB/s | ✅ CLOSE (85-98%) |
 | Multi-member | Parallel | 3000+ MB/s | ✅ Working |
-| Single-member (CombinedLUT) | 10055 MB/s | 2500+ MB/s | ✅ EXCEEDED |
-| Single-member (silesia, preallocated) | 677 MB/s | 720 MB/s (ISA-L target) | 94% |
-| Single-member (silesia, Vec) | 623 MB/s | N/A | Vec::push overhead |
+| Simple data (Combined) | 16500 MB/s | libdeflate 17000 | ✅ 97% |
+| Simple data (Ultra-fast) | 15100 MB/s | libdeflate 17000 | ✅ 89% |
+| Silesia (preallocated) | 680 MB/s | 720 MB/s (ISA-L) | 94% |
+| Silesia (complex) | 520 MB/s | libdeflate 1014 | 51% |
 
 ### Remaining Gap to libdeflate
 
@@ -379,6 +380,32 @@ Contains optimized decode loop with:
 - `copy_match_fast`: LZ77 copy with distance=1 memset
 - `decode_huffman_fastloop`: Main fastloop with multi-literal optimization
 - `decode_huffman_generic`: Safe fallback for buffer boundaries
+
+### New Module: `packed_table.rs`
+
+libdeflate-style packed entry format:
+- Single u32 entry encodes literal/length/bits
+- `HUFFDEC_LITERAL` in high bit (test with `entry < 0`)
+- `bitsleft -= entry` optimization (subtract whole entry)
+- Multi-literal decode (up to 3 per iteration)
+
+**Note:** The packed table is ready but not yet integrated into the main decode path.
+Full integration would require updating all decode functions to use the packed format.
+
+### Remaining Performance Gap (Complex Data)
+
+On simple/repetitive data, our pure Rust code is competitive with libdeflate (89-97%).
+On complex silesia data, we're at ~51% of libdeflate.
+
+The remaining gap is:
+1. **libdeflate's tight C decode loop**: Hand-optimized with aggressive unrolling
+2. **Register allocation**: Rust compiler may not optimize as well as hand-tuned C
+3. **Memory access patterns**: libdeflate pre-fetches next entry before completing copy
+4. **Extract bits micro-ops**: BMI2 `bzhi` instruction vs mask+shift
+
+These last 50% gains would require either:
+- Hand-written assembly for the inner decode loop
+- Accepting libdeflate as fallback for complex single-member files
 
 **Note:** The 10700 MB/s figure is for simple/repetitive data with CombinedLUT.
 Real-world complex data (silesia) achieves ~600 MB/s single-threaded.
