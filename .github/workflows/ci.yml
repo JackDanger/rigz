@@ -25,18 +25,32 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.os }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        rust: [stable]
         include:
-          - os: ubuntu-latest
+          # Linux x86_64
+          - os: linux
+            arch: x86_64
+            runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - os: macos-latest
+          # Linux ARM64
+          - os: linux
+            arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          # macOS x86_64
+          - os: macos
+            arch: x86_64
+            runner: macos-13
             target: x86_64-apple-darwin
+          # macOS ARM64 (Apple Silicon)
+          - os: macos
+            arch: arm64
+            runner: macos-latest
+            target: aarch64-apple-darwin
 
     steps:
       - uses: actions/checkout@v4
@@ -66,7 +80,7 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: gzippy-${{ matrix.os }}
+          name: gzippy-${{ matrix.os }}-${{ matrix.arch }}
           path: target/release/gzippy
 
   validate:
