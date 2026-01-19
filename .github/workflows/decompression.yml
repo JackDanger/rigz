@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: true
+          submodules: recursive  # Need recursive for rapidgzip's nested submodules
 
       - name: Install dependencies
         run: |
@@ -59,14 +59,20 @@ jobs:
         run: make -C pigz
 
       - name: Build rapidgzip from source
+        continue-on-error: true  # Don't fail the whole job if rapidgzip doesn't build
         run: |
           # Build rapidgzip CLI from C++ source
           cd rapidgzip/librapidarchive
           mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc) rapidgzip
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_ISAL=OFF
+          make -j$(nproc) rapidgzip || true
           # Copy to a known location
-          cp tools/rapidgzip ../../rapidgzip-cli || echo "CLI build failed, using Python fallback"
+          if [ -f tools/rapidgzip ]; then
+            cp tools/rapidgzip ../../rapidgzip-cli
+            echo "✓ rapidgzip CLI built successfully"
+          else
+            echo "✗ rapidgzip CLI build failed"
+          fi
           
           # Also install Python module as fallback
           cd ../../python/rapidgzip
