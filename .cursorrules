@@ -176,11 +176,35 @@ Set `GZIPPY_DEBUG=1` to enable timing diagnostics during compression.
 - L10-L12 ultra compression (near-zopfli ratios)
 
 ### Decompression: ✅ Core Complete
-- ✅ BGZF files: 3400+ MB/s (beats rapidgzip)
-- ✅ Marker-based speculative decoding
-- ✅ Chunk spacing strategy
+- ✅ BGZF files: 4930+ MB/s parallel (8 threads) - beats rapidgzip
+- ✅ Multi-member files: 3636 MB/s parallel (5.46x speedup)
+- ✅ Single-member files: 750 MB/s sequential (libdeflate-based)
+- ✅ Block finder LUT (15-bit) with precode validation
 - ✅ libdeflate integration (statically linked)
 - ✅ Parallel marker replacement pipeline
+
+### Parallel Decompression Architecture (Jan 2026)
+
+| File Type | Speed (8 threads) | Strategy |
+|-----------|-------------------|----------|
+| BGZF (gzippy output) | 4930 MB/s | Parallel via BGZF markers |
+| Multi-member (concatenated) | 3636 MB/s | Parallel per-member with libdeflate |
+| Single-member (gzip) | 750 MB/s | Sequential (speculative fails) |
+
+Key modules:
+- `parallel_decompress.rs`: Main parallel engine with member detection
+- `block_finder_lut.rs`: 15-bit LUT for deflate block candidates
+- `marker_decode.rs`: Marker-based speculative decoder
+
+### Why Single-Member is Hard to Parallelize
+
+For single-member gzip files (like `gzip -9`), speculative parallel decode fails because:
+1. Block boundaries don't align with fixed partition points
+2. LUT finds false positives (~5% true positive rate)
+3. Even when blocks are found, chunks don't chain properly
+
+The solution would be rapidgzip's approach: decode sequentially to find boundaries,
+then re-decode with libdeflate once windows are known. This is complex but achievable.
 
 ### Architecture Decisions
 - **libdeflate over ISA-L**: ISA-L's complex FFI (200KB+ struct) and ARM fallback to pure C made libdeflate the pragmatic choice. libdeflate is ~90% of ISA-L's SIMD speed with simpler integration.
