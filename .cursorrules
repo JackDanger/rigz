@@ -9,15 +9,31 @@
 
 ## Architecture
 
-### L1-L5: Speed-Optimized (Independent Blocks)
-- **Library**: libdeflate L1-L5 (30-50% faster than zlib-ng)
-- **Strategy**: Parallel independent blocks with "GZ" BGZF markers
-- **Decompression**: Parallel (blocks decompress independently)
+### Compression Levels
 
-### L6-L9: Balanced (Pipelined)
-- **Library**: zlib-ng with dictionary sharing
-- **Strategy**: Each block uses previous block's data as dictionary
-- **Decompression**: Sequential (single gzip stream)
+| Levels | Library | Strategy | Block Style |
+|--------|---------|----------|-------------|
+| L1-L5 | libdeflate | Parallel independent | BGZF markers |
+| L6-L9 | zlib-ng | Pipelined with dictionary | Single stream |
+| L10-L12 | libdeflate L10-12 | Parallel independent | BGZF markers, 512KB blocks |
+
+### Decompression Architecture
+
+| File Type | Strategy | Performance |
+|-----------|----------|-------------|
+| BGZF (gzippy output) | Parallel via embedded markers | ~1100 MB/s |
+| Multi-member (pigz) | Parallel per-member | ~1100 MB/s |
+| Single-member (gzip) | Optimized sequential | ~1050 MB/s |
+
+### Key Decompression Modules
+
+| File | Purpose |
+|------|---------|
+| `decompression.rs` | Main entry point, routes to appropriate backend |
+| `ultra_decompress.rs` | Dispatcher for BGZF/multi-member/single |
+| `rapidgzip_algo.rs` | Speculative parallel deflate (experimental) |
+| `isal.rs` | ISA-L bindings with libdeflate fallback |
+| `streaming_inflate.rs` | Indexing inflater with window tracking |
 
 ### L10-L12: Ultra Compression (Independent Blocks)
 - **Library**: libdeflate L10-L12 (exhaustive search)
@@ -30,9 +46,25 @@
 | Level | Speed vs pigz | Size vs pigz |
 |-------|---------------|--------------|
 | L1-L5 | Must beat | Within 8% |
-| L6-L8 | Must beat | Within 2% |
-| L9 | Must beat | Within 0.5% |
-| L10-L12 | Slower OK | 4-5% smaller |
+| L6-L9 | Must beat | Within 2% |
+| L10-L12 | Must beat | Better ratio (ultra compression) |
+
+## Decompression vs rapidgzip
+
+rapidgzip achieves ~3000 MB/s through:
+1. **Custom bit-level deflate decoder** - ~10K lines of C++
+2. **ISA-L integration** - Hand-optimized SIMD
+3. **Block-level parallelism** - Not just member-level
+4. **Window caching** - 32KB window propagation
+
+gzippy achieves ~1100 MB/s through:
+1. **libdeflate** - Fast sequential decompression
+2. **BGZF markers** - Perfect parallelism for gzippy-compressed files
+3. **Multi-member detection** - Parallel for pigz output
+
+**Key insight**: For one-time decompression of standard gzip files, parallelism 
+requires a full deflate decoder that can find bit-aligned block boundaries. 
+This is 3000+ lines of code not yet implemented.
 
 ## File Organization
 
@@ -41,7 +73,7 @@
 | `parallel_compress.rs` | L1-L5 + L10-L12: libdeflate parallel blocks |
 | `pipelined_compress.rs` | L6-L9: zlib-ng with dictionary sharing |
 | `scheduler.rs` | Pigz-style N+1 thread scheduler |
-| `decompression.rs` | libdeflate for all decompression |
+| `decompression.rs` | Main decompression orchestrator |
 
 ## Threading Model
 
@@ -57,6 +89,8 @@ Adopted from pigz:
 2. **Capping threads at physical_cores**: VMs underreport; use requested count
 3. **Main thread helping compress**: Causes write delays
 4. **Pure spin-wait**: Burns vCPU time on cloud VMs
+5. **Speculative deflate block detection**: Deflate blocks are bit-aligned, 
+   guessing byte offsets doesn't work reliably
 
 ## igzip Comparison
 
@@ -65,10 +99,6 @@ for speed. It produces 10-15% larger files than gzip/pigz/gzippy at similar leve
 
 **Benchmark approach**: Compare gzippy against pigz (same compression goals), not igzip.
 igzip is benchmarked for informational purposes but not as a pass/fail target.
-
-- igzip L3 (max) ≈ gzip L4 in compression ratio
-- gzippy L1-L3 targets better compression with competitive speed
-- For users who need igzip-like speed, they can use gzippy L1
 
 ## Build Optimizations
 
@@ -81,6 +111,16 @@ panic = "abort"
 strip = true
 ```
 
+### ISA-L Integration
+
+When available, ISA-L is linked via build.rs:
+```
+isa-l/build/libisal.dylib (macOS)
+isa-l/build/libisal.so (Linux)
+```
+
+Enable with: `cargo build --release --features isal`
+
 ## Pre-commit Checks
 
 A pre-commit hook runs:
@@ -92,3 +132,17 @@ To skip (emergency only): `git commit --no-verify`
 ## Debug Mode
 
 Set `GZIPPY_DEBUG=1` to enable timing diagnostics during compression.
+
+## Current Status (Jan 2026)
+
+### Compression: ✅ Complete
+- Beats pigz at all levels
+- L10-L12 ultra compression (near-zopfli ratios)
+
+### Decompression: 🔄 In Progress  
+- ✅ Beats pigz and gzip in all scenarios
+- ✅ BGZF parallel decompression (~1100 MB/s)
+- 🔄 Matching rapidgzip (~3000 MB/s) requires:
+  - Custom bit-level deflate decoder
+  - Block boundary detection during inflate
+  - Window propagation between chunks
