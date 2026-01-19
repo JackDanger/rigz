@@ -11,6 +11,11 @@ readme = "README.md"
 keywords = ["gzip", "compression", "parallel", "pigz", "zlib"]
 categories = ["compression", "command-line-utilities"]
 authors = ["Jack Danger Canty"]
+build = "build.rs"
+
+[features]
+default = []
+isal = []  # ISA-L high-performance decompression (enabled by build.rs when available)
 
 [dependencies]
 # Compression: flate2 with zlib-ng for maximum performance

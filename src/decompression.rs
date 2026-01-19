@@ -91,9 +91,21 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
     let format = detect_compression_format_from_path(input_path)?;
 
     let result = if args.stdout {
-        let stdout = stdout();
-        let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
-        decompress_mmap_libdeflate(&mmap, &mut writer, format)
+        // For stdout, we need to buffer in memory first because StdoutLock isn't Send
+        // This allows parallel decompression to work, then we write the result
+        let mut buffer = Vec::new();
+        let result = decompress_mmap_libdeflate(&mmap, &mut buffer, format);
+
+        // Write buffer to stdout
+        if let Ok(size) = result {
+            let stdout = stdout();
+            let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
+            writer.write_all(&buffer)?;
+            writer.flush()?;
+            Ok(size)
+        } else {
+            result
+        }
     } else {
         let output_path = output_path.clone().unwrap();
         let output_file = File::create(&output_path)?;
@@ -139,7 +151,7 @@ pub fn decompress_stdin(_args: &GzippyArgs) -> GzippyResult<i32> {
 }
 
 /// Decompress using libdeflate (fastest for in-memory data)
-fn decompress_mmap_libdeflate<W: Write>(
+fn decompress_mmap_libdeflate<W: Write + Send>(
     mmap: &Mmap,
     writer: &mut W,
     format: CompressionFormat,
@@ -181,7 +193,7 @@ fn is_multi_member_quick(data: &[u8]) -> bool {
 /// 2. Single member: libdeflate (fastest, 30-50% faster than zlib)
 /// 3. Large multi-member: speculative parallel decompression (rapidgzip-style)
 /// 4. Small multi-member: sequential zlib-ng
-fn decompress_gzip_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
+fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
         return Ok(0);
     }
@@ -200,10 +212,13 @@ fn decompress_gzip_libdeflate<W: Write>(data: &[u8], writer: &mut W) -> GzippyRe
         return decompress_single_member_libdeflate(data, writer);
     }
 
-    // Use the optimized hybrid decompressor for non-BGZF files
-    // This handles multi-member files in parallel and uses fast sequential for single-member
-    let hybrid = crate::indexed_decompress::HybridDecompressor::new();
-    match hybrid.decompress(data, writer) {
+    // Use the ultra-fast parallel decompressor
+    // This uses ISA-L and block-level parallelism for maximum speed
+    let num_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
+
+    match crate::ultra_decompress::decompress_ultra(data, writer, num_threads) {
         Ok(bytes) => Ok(bytes),
         Err(_) => {
             // Fallback to flate2 sequential
