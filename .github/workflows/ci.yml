@@ -44,7 +44,7 @@ jobs:
           # macOS x86_64
           - os: macos
             arch: x86_64
-            runner: macos-13
+            runner: macos-15
             target: x86_64-apple-darwin
           # macOS ARM64 (Apple Silicon)
           - os: macos
