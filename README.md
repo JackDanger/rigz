@@ -119,3 +119,7 @@ Both produce valid gzip output that any gzip tool can decompress.
 - [pigz](https://zlib.net/pigz/) by Mark Adler - threading model inspiration
 - [libdeflate](https://github.com/ebiggers/libdeflate) - fastest deflate implementation
 - [zlib-ng](https://github.com/zlib-ng/zlib-ng) - SIMD-optimized zlib fork
+
+## About
+
+gzippy was created by [Jack Danger](https://github.com/jackdanger) as a [centaur](https://locusmag.com/feature/commentary-cory-doctorow-reverse-centaurs/) with Claude Opus 4.5. The human provided direction, taste, and judgment while the AI contributed implementation, optimization, and tireless iteration across thousands of lines of Rust.
