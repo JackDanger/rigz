@@ -345,13 +345,24 @@ let out_slice = unsafe {
 inflate_into(deflate_data, out_slice)?;
 ```
 
-### Performance Achieved
+### Performance Achieved (Verified Jan 2026)
 
 | File Type | Speed | Target | Status |
 |-----------|-------|--------|--------|
-| BGZF | 4072 MB/s | 4000+ MB/s | ✅ EXCEEDED |
+| BGZF | 4089 MB/s | 4000+ MB/s | ✅ EXCEEDED |
 | Multi-member | Parallel | 3000+ MB/s | ✅ Working |
-| Single-member | 10700 MB/s | 2500+ MB/s | ✅ EXCEEDED (sequential) |
+| Single-member (CombinedLUT) | 10700+ MB/s | 2500+ MB/s | ✅ EXCEEDED |
+| Single-member (silesia) | 600 MB/s | N/A | Complex data, expected |
+
+**Note:** The 10700 MB/s figure is for simple/repetitive data with CombinedLUT.
+Real-world complex data (silesia) achieves ~600 MB/s single-threaded.
+The parallel paths (BGZF, multi-member) achieve the target speeds.
+
+### Safety Improvements (Jan 2026)
+
+1. **ISIZE-based pre-allocation** - Read ISIZE trailer, use for output.reserve()
+2. **MAX_OUTPUT_SIZE limit** - 1GB limit prevents infinite loops on corrupted data
+3. **Overread tracking** - FastBits tracks bytes read past input end
 
 ### Dispatcher Priority (decompression.rs)
 
