@@ -1,4 +1,11 @@
-name: Debian Packages
+# =============================================================================
+# Release Packages: Build and publish Debian packages
+# =============================================================================
+# - Builds .deb packages on version tags (v*)
+# - Tests package installation
+# - Creates GitHub release with artifacts
+# =============================================================================
+name: Release Packages
 
 on:
   push:

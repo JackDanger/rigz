@@ -1,3 +1,10 @@
+# =============================================================================
+# Decompression Benchmarks: Compare gzippy vs competitors
+# =============================================================================
+# - Benchmarks decompression of files from gzippy, pigz, gzip, rapidgzip
+# - Uses adaptive benchmarking (runs until CV < 5% or max 30 trials)
+# - Reports speed in MB/s for each tool at each thread count
+# =============================================================================
 name: Decompression Benchmarks
 
 on:
@@ -21,7 +28,7 @@ jobs:
   # STAGE 1: Build all tools once
   # ============================================================================
   build:
-    name: Build Tools
+    name: Build Decompression Tools
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -148,7 +155,7 @@ jobs:
   # STAGE 3: Run comprehensive decompression benchmarks
   # ============================================================================
   benchmark:
-    name: Benchmark Decompression
+    name: Decompress All Sources
     runs-on: ubuntu-latest
     needs: prepare-data
     steps:
@@ -308,7 +315,7 @@ jobs:
   # STAGE 4: Generate summary and post to PR
   # ============================================================================
   summary:
-    name: Performance Summary
+    name: Decompression Summary
     runs-on: ubuntu-latest
     needs: benchmark
     if: always()

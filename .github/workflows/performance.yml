@@ -1,4 +1,12 @@
-name: Performance
+# =============================================================================
+# Compression Benchmarks: Compare gzippy vs competitors
+# =============================================================================
+# - Benchmarks compression at all levels (L1-L12) and thread counts
+# - Compares speed and ratio vs pigz, igzip, zopfli
+# - Tests random (incompressible) data handling
+# - Generates summary with pass/fail status
+# =============================================================================
+name: Compression Benchmarks
 
 on:
   push:
@@ -20,7 +28,7 @@ env:
 
 jobs:
   benchmark:
-    name: Perf ${{ matrix.size }}MB L${{ matrix.level }} (${{ matrix.thread_mode }})
+    name: Compress ${{ matrix.size }}MB L${{ matrix.level }} ${{ matrix.thread_mode }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -93,7 +101,7 @@ jobs:
           path: benchmark-results.json
 
   compression-ratio:
-    name: Ratio L${{ matrix.level }} (${{ matrix.thread_mode }})
+    name: Ratio L${{ matrix.level }} ${{ matrix.thread_mode }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -149,7 +157,7 @@ jobs:
   # Ultra compression levels (L10-L12) - near-zopfli ratio
   # These are slower but should achieve significantly smaller output
   ultra-compression:
-    name: Ultra L${{ matrix.level }} (${{ matrix.thread_mode }})
+    name: Ultra L${{ matrix.level }} ${{ matrix.thread_mode }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -311,7 +319,7 @@ jobs:
           echo "✓ gzip can decompress gzippy output"
 
   summary:
-    name: Performance Summary
+    name: Compression Summary
     runs-on: ubuntu-latest
     needs: [benchmark, compression-ratio, ultra-compression, random-data]
     if: always()
