@@ -358,3 +358,65 @@ inflate_into(deflate_data, out_slice)?;
 1. **BGZF files** → `bgzf::decompress_bgzf_parallel`
 2. **Multi-member** → `bgzf::decompress_multi_member_parallel`
 3. **Single-member** → `bgzf::decompress_single_member_parallel` → fast sequential
+
+## Key Insights from Source Code Analysis (Jan 2026)
+
+### From libdeflate (`libdeflate/lib/deflate_decompress.c`)
+
+**Critical Safety Design:**
+1. **Fixed-size output buffer** - Caller MUST provide pre-sized buffer (from ISIZE)
+2. **Fastloop vs generic loop** - Fastloop runs when there's plenty of buffer space; falls back to generic loop near buffer ends with careful checking
+3. **Output bounds checking** - Decode loop terminates when output buffer is full
+4. **overread_count tracking** - Tracks bytes read past input end, validates `overread_count <= sizeof(bitbuf_t)` at end
+
+**Our Gap:** We use `Vec<u8>` with unlimited growth and no output limit. For malformed data, this can cause infinite growth. Solution: Pre-allocate from ISIZE, add output bounds check.
+
+**Branchless Bit Refill (lines 206-212):**
+```c
+#define REFILL_BITS_BRANCHLESS()
+    bitbuf |= get_unaligned_leword(in_next) << (u8)bitsleft;
+    in_next += sizeof(bitbuf_t) - 1;
+    in_next -= (bitsleft >> 3) & 0x7;
+    bitsleft |= MAX_BITSLEFT & ~7;
+```
+This uses `MAX_BITSLEFT = WORDBITS - 1` (e.g., 63) so the `|= MAX_BITSLEFT & ~7` compiles to a single `or $0x38, %rbp`.
+
+**Entry Format Optimization (lines 437-499):**
+- Single u32 entry encodes: literal value, length base, extra bits count, codeword length
+- HUFFDEC_LITERAL flag in high bit (easy to test on most CPUs)
+- Low byte is total bits to consume (codeword length + extra bits)
+- Avoids separate array lookups by indexing symbol → result
+
+### From rapidgzip (`rapidgzip/librapidarchive/src/rapidgzip/`)
+
+**HuffmanCodingShortBitsCachedDeflate.hpp (lines 35-141):**
+- `CacheEntry` struct: `{ bitsToSkip: u8, symbolOrLength: u8, distance: u16 }`
+- LUT_BITS_COUNT = 11 is optimal (fits in L1 cache, 4KB table)
+- Pre-computes length+distance together when they fit in LUT bits
+- `distance = 0xFFFF` signals end-of-block, `distance = 0xFFFE` signals slow path
+- Falls back to bit-by-bit decode for codes > LUT_BITS_COUNT
+
+**MarkerReplacement.hpp (lines 15-59):**
+- Uses `uint16_t` output buffer: values 0-255 are bytes, 256+ are markers
+- Marker value encodes window index: `value - MAX_WINDOW_SIZE` = index into window
+- `replaceMarkerBytes()` uses `std::transform()` for efficient parallel replacement
+- Full 32KB window: even UINT16_MAX is valid, so no range check needed
+
+**deflate.hpp (lines 1350-1422) - Back-reference resolution:**
+- Fast path: `length <= distance && distance <= m_windowPosition` → simple memcpy
+- Special case: `nToCopyPerRepeat == 1` → memset (common in silesia!)
+- Circular buffer with wrap-around handling
+- Tracks `m_distanceToLastMarkerByte` for marker detection
+
+**Performance Benchmarks from rapidgzip source (lines 56-173):**
+- ISA-L with LUT: 5024 MB/s parallel, 720 MB/s sequential (silesia)
+- HuffmanCodingShortBitsCached with 10 bits: 3953 MB/s parallel, 330 MB/s sequential
+- LUT_BITS_COUNT=10 or 11 is optimal; larger uses more cache, smaller needs more fallbacks
+
+### Implementation Priorities Based on Source Study
+
+1. **Add output size limit** from ISIZE to prevent infinite loops
+2. **Adopt libdeflate's entry format** - encode length+extra+codeword in single u32
+3. **Use 11-bit LUT** (matches rapidgzip's optimal, 8KB table fits L1)
+4. **Special-case distance=1** as memset (very common pattern)
+5. **Branchless bit refill** - copy libdeflate's approach exactly
