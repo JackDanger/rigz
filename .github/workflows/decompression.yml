@@ -167,7 +167,11 @@ jobs:
         run: |
           ORIGINAL="./data/tmp/test-100mb.txt"
           ORIGINAL_SIZE=$(stat -c%s "$ORIGINAL")
-          TRIALS=5  # Multiple trials for statistical significance
+          
+          # Adaptive benchmarking parameters
+          MIN_TRIALS=5           # Minimum iterations (avoid flukes)
+          MAX_TRIALS=30          # Maximum iterations (prevent infinite loop)
+          TARGET_CV=0.05         # Target coefficient of variation (stdev/mean < 5%)
           
           echo '{"benchmarks": [' > results/decompression.json
           first=true
@@ -202,45 +206,76 @@ jobs:
                     ;;
                 esac
                 
-                # Run multiple trials
+                # Warmup run (discard - primes caches)
+                $cmd < "$gz_file" > /tmp/out.dat 2>/dev/null
+                
+                # Verify correctness once
+                if ! diff -q "$ORIGINAL" /tmp/out.dat > /dev/null 2>&1; then
+                  echo "  $tool T$threads: FAILED (output mismatch)"
+                  if [ "$first" = "true" ]; then first=false; else echo ',' >> results/decompression.json; fi
+                  echo "{\"source\": \"$source\", \"level\": $level, \"tool\": \"$tool\", \"threads\": $threads, \"mean_time\": 0, \"stdev\": 0, \"speed_mbps\": 0, \"trials\": 0, \"status\": \"fail\"}" >> results/decompression.json
+                  continue
+                fi
+                
+                # Adaptive benchmarking: run until stable or max trials
                 times=""
-                valid=true
-                for trial in $(seq 1 $TRIALS); do
+                trial=0
+                converged=false
+                
+                while [ $trial -lt $MAX_TRIALS ]; do
+                  trial=$((trial + 1))
+                  
                   start=$(date +%s.%N)
                   $cmd < "$gz_file" > /tmp/out.dat 2>/dev/null
                   end=$(date +%s.%N)
                   
-                  # Verify correctness
-                  if ! diff -q "$ORIGINAL" /tmp/out.dat > /dev/null 2>&1; then
-                    valid=false
-                    break
-                  fi
-                  
                   elapsed=$(echo "$end - $start" | bc)
                   times="$times $elapsed"
+                  
+                  # Check convergence after minimum trials
+                  if [ $trial -ge $MIN_TRIALS ]; then
+                    cv=$(echo "$times" | python3 -c "
+          import sys
+          import statistics
+          times = [float(x) for x in sys.stdin.read().split()]
+          mean = statistics.mean(times)
+          stdev = statistics.stdev(times)
+          cv = stdev / mean if mean > 0 else 1
+          print(f'{cv:.4f}')
+          ")
+                    
+                    # Check if coefficient of variation is below threshold
+                    if python3 -c "exit(0 if $cv < $TARGET_CV else 1)"; then
+                      converged=true
+                      break
+                    fi
+                  fi
                 done
                 
-                if [ "$valid" = "true" ]; then
-                  # Calculate statistics
-                  stats=$(echo "$times" | python3 -c "
+                # Calculate final statistics
+                stats=$(echo "$times" | python3 -c "
           import sys
           import statistics
           times = [float(x) for x in sys.stdin.read().split()]
           mean = statistics.mean(times)
           stdev = statistics.stdev(times) if len(times) > 1 else 0
+          cv = stdev / mean if mean > 0 else 0
           speed = $ORIGINAL_SIZE / 1048576 / mean
-          print(f'{mean:.3f} {stdev:.3f} {speed:.1f}')
+          print(f'{mean:.4f} {stdev:.4f} {speed:.1f} {cv:.4f}')
           ")
-                  mean=$(echo "$stats" | cut -d' ' -f1)
-                  stdev=$(echo "$stats" | cut -d' ' -f2)
-                  speed=$(echo "$stats" | cut -d' ' -f3)
-                  status="pass"
+                mean=$(echo "$stats" | cut -d' ' -f1)
+                stdev=$(echo "$stats" | cut -d' ' -f2)
+                speed=$(echo "$stats" | cut -d' ' -f3)
+                cv=$(echo "$stats" | cut -d' ' -f4)
+                
+                conv_status=""
+                if [ "$converged" = "true" ]; then
+                  conv_status="converged"
                 else
-                  mean="0"
-                  stdev="0"
-                  speed="0"
-                  status="fail"
+                  conv_status="max_trials"
                 fi
+                
+                echo "  $tool T$threads: ${speed} MB/s (${trial} trials, CV=${cv}, ${conv_status})"
                 
                 # Output JSON
                 if [ "$first" = "true" ]; then
@@ -250,7 +285,7 @@ jobs:
                 fi
                 
                 cat >> results/decompression.json << EOF
-          {"source": "$source", "level": $level, "tool": "$tool", "threads": $threads, "mean_time": $mean, "stdev": $stdev, "speed_mbps": $speed, "status": "$status"}
+          {"source": "$source", "level": $level, "tool": "$tool", "threads": $threads, "mean_time": $mean, "stdev": $stdev, "speed_mbps": $speed, "trials": $trial, "cv": $cv, "converged": $converged, "status": "pass"}
           EOF
               done
             done
@@ -328,20 +363,24 @@ jobs:
           failures = []
           
           print("### Results by Source File\n")
+          print("> Adaptive benchmarking: runs until CV < 5% or max 30 trials\n")
           
           for source_key in sorted(by_source.keys()):
               results = by_source[source_key]
               print(f"#### {source_key}\n")
-              print("| Tool | Threads | Speed (MB/s) | ±Stdev | Status |")
-              print("|------|---------|--------------|--------|--------|")
+              print("| Tool | Threads | Speed (MB/s) | CV | Trials | Status |")
+              print("|------|---------|--------------|-----|--------|--------|")
               
               gzippy_speeds = {}
               rapidgzip_speeds = {}
               
               for r in sorted(results, key=lambda x: (x['tool'], x['threads'])):
                   status_icon = "✅" if r['status'] == 'pass' else "❌"
-                  stdev_str = f"±{r['stdev']:.3f}s" if r['stdev'] > 0 else "-"
-                  print(f"| {r['tool']} | {r['threads']} | {r['speed_mbps']:.1f} | {stdev_str} | {status_icon} |")
+                  cv_pct = r.get('cv', 0) * 100
+                  trials = r.get('trials', '?')
+                  converged = r.get('converged', False)
+                  conv_icon = "✓" if converged else f"({trials})"
+                  print(f"| {r['tool']} | {r['threads']} | {r['speed_mbps']:.1f} | {cv_pct:.1f}% | {trials}{'' if converged else '*'} | {status_icon} |")
                   
                   if r['status'] != 'pass':
                       all_passed = False
