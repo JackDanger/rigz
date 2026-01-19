@@ -139,10 +139,21 @@ Set `GZIPPY_DEBUG=1` to enable timing diagnostics during compression.
 - Beats pigz at all levels
 - L10-L12 ultra compression (near-zopfli ratios)
 
-### Decompression: 🔄 In Progress  
+### Decompression: ✅ Framework Complete
 - ✅ Beats pigz and gzip in all scenarios
 - ✅ BGZF parallel decompression (~1100 MB/s)
-- 🔄 Matching rapidgzip (~3000 MB/s) requires:
-  - Custom bit-level deflate decoder
-  - Block boundary detection during inflate
-  - Window propagation between chunks
+- ✅ Custom deflate decoder implemented (deflate_decoder.rs)
+- ✅ Block boundary tracking and window caching
+- ✅ Two-phase parallel inflate framework
+
+### Gap to rapidgzip (~3000 MB/s)
+rapidgzip achieves 3x speedup through:
+1. **Speculative decode without window** - Decode first, resolve refs later
+2. **Bit-aligned block finding** - Try all 8 bit offsets at each position
+3. **Window propagation** - Forward windows through chunk chain
+4. **Result stitching** - Merge parallel outputs with resolved refs
+
+Current infrastructure is in place; full optimization requires:
+- Tracking unresolved back-references during decode
+- Multi-pass window propagation algorithm
+- Lock-free result stitching
