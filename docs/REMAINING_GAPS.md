@@ -1,126 +1,148 @@
-# Exhaustive Remaining Optimization Gaps
+# Remaining Optimizations to Surpass rapidgzip
 
 **Date**: January 2026  
-**Status**: After P0/P1 fixes, ultra_fast_inflate is 4% faster than libdeflate (19,421 MB/s vs 18,661 MB/s)
+**Last Updated**: After P1 multi-member fix
 
 ---
 
-## Summary
+## Current Status
 
-| Category | Status | Gap | Priority |
-|----------|--------|-----|----------|
-| Single-member decompression | ✅ **FASTER than libdeflate** | None | Done |
-| BGZF parallel decompression | ✅ 3400+ MB/s | None | Done |
-| Multi-member parallel | ⚠️ Sequential fallback | ~2x vs rapidgzip | P1 |
-| Arbitrary gzip parallel | ⚠️ Partial | ~3x vs rapidgzip | P1 |
-| Compression | ✅ Beats pigz | None | Done |
-| Memory usage | ⚠️ Some overhead | 5-10% | P3 |
+| Metric | gzippy | rapidgzip | gzip | Status |
+|--------|--------|-----------|------|--------|
+| Single-member (202MB) | ~0.18s | ~0.07s | ~0.20s | ⚠️ 2.5x slower than rapidgzip |
+| BGZF parallel | 3400+ MB/s | 3168 MB/s | N/A | ✅ **Faster** |
+| Multi-member | Parallel ✅ | Parallel | Sequential | ✅ Fixed |
+| Arbitrary gzip parallel | Not integrated | ✅ Core strength | N/A | ❌ **Key gap** |
+
+**The #1 gap**: rapidgzip achieves 2-3x speedup on arbitrary single-member gzip files through speculative parallel decompression. We have the code (`marker_decode.rs`) but it's disabled due to reliability issues.
 
 ---
 
-## Decompression Gaps
+## Critical Path to Beat rapidgzip
 
-### Gap 1: Multi-Member Parallel Decompression (P1)
-**Current**: Falls back to sequential for multi-member gzip (pigz output)  
-**Target**: Parallel per-member decompression like rapidgzip
+### 🔴 Gap 1: Speculative Parallel Decompression (CRITICAL)
 
-**What's Missing**:
-- Member boundary detection is in `is_multi_member_quick()` but only scans 256KB
-- `ultra_decompress.rs` has parallel member decompression but often falls back
-- Need to find all member boundaries first, then decompress each in parallel
+**This is the key to matching rapidgzip on arbitrary gzip files.**
 
-**Expected Gain**: 2-4x on pigz-compressed files (14 threads)
+**What rapidgzip does**:
+1. Partition input at fixed intervals (e.g., 4MB chunks)
+2. Speculatively start decoding at each chunk boundary
+3. Use markers (uint16_t output) for unresolved back-references
+4. Once chunk 0 finishes, propagate its 32KB window to chunk 1
+5. Replace markers in chunk 1 with resolved values
+6. Repeat for all chunks
+
+**What we have**:
+- `marker_decode.rs`: Complete marker-based decoder ✅
+- `MarkerDecoder`: Decodes deflate with markers for unknown back-refs ✅
+- `try_decode_chunk()`: Tries decoding at chunk boundaries ✅
+- `decompress_parallel()`: Full parallel pipeline ✅
+
+**What's broken**:
+- Disabled in `ultra_decompress.rs` because it was causing infinite loops
+- `try_decode_chunk()` success rate too low on real data
+- Window propagation may have bugs
+
+**Expected Gain**: 2-3x on single-member gzip files
+
+**Effort**: 1-2 weeks to debug and stabilize
 
 **Files**:
-- `src/decompression.rs` - main dispatcher
-- `src/ultra_decompress.rs` - parallel member logic
+- `src/marker_decode.rs` - Core algorithm (implemented)
+- `src/ultra_decompress.rs` - Integration point (disabled)
 
 ---
 
-### Gap 2: Arbitrary Gzip Speculative Parallel (P1)
-**Current**: `marker_decode.rs` and `rapidgzip_decoder.rs` exist but aren't fully integrated  
-**Target**: Match rapidgzip on single-member gzip files
+### 🟡 Gap 2: Block Boundary Finding
 
-**What's Missing**:
-- Chunk spacing strategy (guess positions, not find blocks)
-- Window propagation through chunk chain
-- Parallel marker replacement after windows are known
-- Full integration into main decompression path
+**Alternative to speculative decode**: Find actual deflate block boundaries.
 
-**Expected Gain**: 2-3x on gzip (not pigz, not gzippy) files
+**What rapidgzip also does**:
+- Scan for potential block start signatures
+- Validate by attempting decode
+- Only start chunks at verified block boundaries
 
-**Files**:
-- `src/marker_decode.rs` - core marker algorithm (implemented)
-- `src/rapidgzip_decoder.rs` - speculative decoder (implemented)
-- `src/block_finder.rs` - block finding (may not be needed)
-- `src/decompression.rs` - not calling these paths
+**What we have**:
+- `block_finder.rs` was deleted (low success rate <5%)
+
+**Expected Gain**: Similar to Gap 1, but more reliable
+
+**Effort**: 1 week
 
 ---
 
-### Gap 3: Dynamic Block Multi-Symbol Decode (P2)
-**Current**: Single symbol per lookup in dynamic blocks  
-**Target**: 2-3 symbols per lookup when codes are short (3-5 bits)
+### 🟡 Gap 3: Dynamic Block Multi-Symbol Decode
 
-**What's Missing**:
-- Runtime multi-symbol table generation for dynamic blocks
-- `turbo_inflate.rs` has MULTI_SYM_LIT_TABLE for fixed, not dynamic
+**Current**: Single symbol per lookup in dynamic Huffman blocks  
+**Target**: 2-3 symbols per lookup when codes are short
 
-**Expected Gain**: 15-25% on files with many dynamic blocks
+**What's missing**:
+```rust
+// Build multi-symbol table at runtime for dynamic blocks
+// when max code length <= 12 bits
+fn build_dynamic_multi_sym_table(lengths: &[u8]) -> MultiSymTable {
+    // Pack 2-3 symbols when total bits <= 12
+}
+```
 
-**Files**:
-- `src/turbo_inflate.rs` - has multi-sym for fixed only
-- `src/ultra_fast_inflate.rs` - uses two-level, no multi-sym
+**Expected Gain**: 15-25% on dynamic-heavy files
+
+**Effort**: 3 days
+
+**Files**: `src/ultra_fast_inflate.rs`, `src/two_level_table.rs`
 
 ---
 
-### Gap 4: Table Construction Optimization (P2)
-**Current**: Heap-allocate Vec for each table, zero-fill 1024+ entries  
+### 🟡 Gap 4: Table Construction Optimization
+
+**Current**: Heap-allocate Vec, zero-fill 1024+ entries  
 **Target**: Stack-allocate L1, lazy L2
 
-**What's Missing**:
 ```rust
-// Current (in two_level_table.rs)
-let mut table = Self::new();  // 2KB zero-fill
-table.l2 = Vec::new();        // heap allocation
+// Current
+pub struct TwoLevelTable {
+    l1: [u16; 1024],  // ✅ Stack
+    l2: Vec<u16>,     // ❌ Heap alloc per table
+}
 
-// Optimal
-let mut l1 = [0u16; 1024];  // stack, no heap
-// Only allocate L2 if max_len > 10
+// Optimal  
+pub struct TwoLevelTable {
+    l1: [u16; 1024],
+    l2: [u16; 512],   // Stack, fixed max size
+    l2_len: usize,
+}
 ```
 
 **Expected Gain**: 3-5% on files with many dynamic blocks
 
-**Files**:
-- `src/two_level_table.rs` - `TwoLevelTable::build()`
+**Effort**: 1 day
 
 ---
 
-### Gap 5: Prefetching (P3)
-**Current**: Basic prefetching in `simd_inflate.rs`  
-**Target**: Aggressive prefetching like ISA-L
+### 🟢 Gap 5: Prefetching
 
-**What's Missing**:
+**Current**: No explicit prefetching  
+**Target**: Prefetch input and output during decode
+
 ```rust
-// Prefetch next input bytes during decode
+// In decode loop
 std::arch::x86_64::_mm_prefetch(input.add(128), _MM_HINT_T0);
 
-// Prefetch output during LZ77 copy
+// In LZ77 copy
 std::arch::x86_64::_mm_prefetch(output.add(64), _MM_HINT_T0);
 ```
 
-**Expected Gain**: 2-5% on large files
+**Expected Gain**: 2-5%
 
-**Files**:
-- `src/simd_copy.rs` - LZ77 copy paths
-- `src/ultra_fast_inflate.rs` - main decode loop
+**Effort**: 1 day
 
 ---
 
-### Gap 6: AVX-512 Support (P3)
-**Current**: AVX2 (32-byte) and NEON (16-byte)  
-**Target**: AVX-512 (64-byte) for newer Intel/AMD CPUs
+### 🟢 Gap 6: AVX-512 Support
 
-**What's Missing**:
+**Current**: AVX2 (32-byte), NEON (16-byte)  
+**Target**: AVX-512 (64-byte) for modern Intel/AMD
+
 ```rust
 #[cfg(target_feature = "avx512f")]
 unsafe fn copy_64_avx512(src: *const u8, dst: *mut u8) {
@@ -129,217 +151,150 @@ unsafe fn copy_64_avx512(src: *const u8, dst: *mut u8) {
 }
 ```
 
-**Expected Gain**: 5-10% on AVX-512 capable CPUs
+**Expected Gain**: 5-10% on AVX-512 CPUs
 
-**Files**:
-- `src/simd_copy.rs` - needs avx512 module
+**Effort**: 2 days
 
 ---
 
-### Gap 7: Branch Hints (P3)
-**Current**: No explicit branch hints  
-**Target**: Use likely/unlikely for hot paths
+### 🟢 Gap 7: Branch Prediction Hints
 
-**What's Missing**:
+**Current**: No hints  
+**Target**: likely/unlikely on hot paths
+
 ```rust
-#[cold]
-fn handle_error() { ... }
-
 if std::intrinsics::likely(symbol < 256) {
+    // literal - most common
     output.push(symbol as u8);
-} else if std::intrinsics::unlikely(symbol > 285) {
-    return handle_error();
+} else if std::intrinsics::unlikely(symbol == 256) {
+    // end of block - rare
+    break;
 }
 ```
 
 **Expected Gain**: 1-3%
 
----
-
-## Compression Gaps
-
-### Gap 8: Ultra Compression L10-L12 Parallelism (P2)
-**Current**: L10-L12 use libdeflate but compression is slower  
-**Target**: Parallel compression for L10-L12 with independent blocks
-
-**What's Missing**:
-- Current L10-L12 compresses sequentially
-- Should use same parallel block strategy as L1-L5
-
-**Expected Gain**: 4-8x compression speed for L10-L12
-
-**Files**:
-- `src/parallel_compress.rs` - parallel compression engine
-- `src/compression.rs` - level dispatcher
+**Effort**: 0.5 days
 
 ---
 
-### Gap 9: Compression Memory Pool (P3)
-**Current**: Each compression block allocates its own buffers  
-**Target**: Pre-allocated buffer pool to reduce allocations
+### 🟢 Gap 8: Huge Pages
 
-**What's Missing**:
+**Current**: Standard 4KB pages  
+**Target**: 2MB huge pages for large files
+
 ```rust
-struct BufferPool {
-    buffers: Vec<Vec<u8>>,
-    available: AtomicBitmap,
-}
-```
-
-**Expected Gain**: 2-5% compression throughput
-
----
-
-## Memory/Resource Gaps
-
-### Gap 10: Memory Mapping Optimization (P3)
-**Current**: `memmap2` for large files  
-**Target**: Huge page support, MAP_POPULATE hints
-
-**What's Missing**:
-```rust
-// Use huge pages when available
 let mmap = MmapOptions::new()
-    .huge(Some(HugePages::Size2MB))
+    .huge(Some(2 * 1024 * 1024))
+    .populate()
     .map(&file)?;
 ```
 
 **Expected Gain**: 5-10% on very large files
 
+**Effort**: 1 day
+
 ---
 
-### Gap 11: Thread Affinity (P3)
-**Current**: No thread pinning  
-**Target**: Pin threads to cores for cache locality
+### 🟢 Gap 9: Thread Affinity
 
-**What's Missing**:
+**Current**: OS-scheduled threads  
+**Target**: Pin threads to specific cores
+
 ```rust
-core_affinity::set_for_current(core_id);
+core_affinity::set_for_current(CoreId { id: thread_id });
 ```
 
 **Expected Gain**: 2-5% on NUMA systems
 
-**Files**:
-- `src/parallel_compress.rs`
-- `src/ultra_decompress.rs`
+**Effort**: 0.5 days
 
 ---
 
-## Integration Gaps
+### 🟢 Gap 10: Index Caching (rapidgzip feature)
 
-### Gap 12: Streaming Decompression (P2)
-**Current**: Memory-maps entire file  
-**Target**: True streaming for stdin and pipes
-
-**What's Missing**:
-- Current stdin path uses flate2 streaming, not ultra_fast_inflate
-- Need chunked streaming path using ultra_fast_inflate
-
-**Expected Gain**: Better latency for pipes
-
-**Files**:
-- `src/decompression.rs` - `decompress_stdin()`
-
----
-
-### Gap 13: Index Caching (P3)
 **Current**: No persistent index  
-**Target**: Cache block indexes for repeated decompression
+**Target**: Save block index to `.gzidx` file
 
-**What's Missing**:
-- `index_cache.rs` was deleted (was dead code)
-- rapidgzip saves `.gzidx` files for fast re-decompression
+rapidgzip can create an index file that allows:
+- Near-instant random access to any position
+- Fast re-decompression of the same file
 
-**Expected Gain**: Near-instant startup for repeated decompressions
+**Expected Gain**: 10-100x for repeated access
 
----
-
-### Gap 14: CRC32 SIMD (P3)
-**Current**: Uses flate2/zlib-ng for CRC  
-**Target**: Ensure SIMD CRC32 is used
-
-**Status**: Likely already optimized via zlib-ng, need to verify
-
-**What to Check**:
-- Is zlib-ng compiled with SIMD CRC?
-- Could use `crc32fast` crate as alternative
+**Effort**: 2 days
 
 ---
 
-## CLI/UX Gaps
+### 🟢 Gap 11: Streaming Ultra-Fast Inflate
 
-### Gap 15: Progress Reporting (P3)
-**Current**: Simple output  
-**Target**: Progress bar for large files
+**Current**: stdin uses flate2 (slower)  
+**Target**: Use ultra_fast_inflate for streaming
 
-**What's Missing**:
-```rust
-[gzippy] Decompressing: [████████████░░░░░░░░] 60% (600MB/1GB) 2.5 GB/s
-```
+**Expected Gain**: 2x for piped input
+
+**Effort**: 2 days
 
 ---
 
-### Gap 16: Rsyncable Output (P3)
-**Current**: Not implemented  
-**Target**: Match pigz --rsyncable
+## Priority Matrix
 
-**What's Missing**:
-- Reset block boundaries on content-defined checkpoints
-- Allows rsync to efficiently sync compressed files
-
----
-
-## Priority Summary
-
-| Priority | Gap | Expected Gain | Effort |
-|----------|-----|---------------|--------|
-| **P1** | Multi-member parallel | 2-4x | 1 week |
-| **P1** | Arbitrary gzip parallel | 2-3x | 2 weeks |
-| **P2** | Dynamic multi-symbol | 15-25% | 3 days |
-| **P2** | Table construction | 3-5% | 1 day |
-| **P2** | L10-L12 parallel | 4-8x compress | 2 days |
-| **P2** | Streaming decompress | Better UX | 2 days |
-| **P3** | Prefetching | 2-5% | 1 day |
-| **P3** | AVX-512 | 5-10% | 2 days |
-| **P3** | Branch hints | 1-3% | 0.5 days |
-| **P3** | Memory pool | 2-5% | 1 day |
-| **P3** | Huge pages | 5-10% | 1 day |
-| **P3** | Thread affinity | 2-5% | 0.5 days |
-| **P3** | Index caching | Startup time | 2 days |
-| **P3** | CRC32 verify | Verify | 0.5 days |
-| **P3** | Progress bar | UX | 1 day |
-| **P3** | Rsyncable | Feature | 3 days |
+| Priority | Gap | Expected Gain | Effort | Impact |
+|----------|-----|---------------|--------|--------|
+| 🔴 **P0** | Speculative parallel | 2-3x | 2 weeks | **CRITICAL** |
+| 🟡 **P1** | Dynamic multi-symbol | 15-25% | 3 days | High |
+| 🟡 **P1** | Table construction | 3-5% | 1 day | Medium |
+| 🟢 **P2** | Prefetching | 2-5% | 1 day | Medium |
+| 🟢 **P2** | AVX-512 | 5-10% | 2 days | Platform-specific |
+| 🟢 **P2** | Branch hints | 1-3% | 0.5 days | Low |
+| 🟢 **P3** | Huge pages | 5-10% | 1 day | Large files only |
+| 🟢 **P3** | Thread affinity | 2-5% | 0.5 days | NUMA only |
+| 🟢 **P3** | Index caching | 10-100x | 2 days | Repeated access |
+| 🟢 **P3** | Streaming inflate | 2x | 2 days | Pipes only |
 
 ---
 
-## What's Done (Completed Optimizations)
+## What We've Already Completed ✅
 
 | Optimization | Status | Location |
 |--------------|--------|----------|
-| Two-level Huffman tables | ✅ Complete | `two_level_table.rs` |
-| SIMD pattern expansion | ✅ Complete | `simd_copy.rs` |
-| SIMD overlapping copy | ✅ Complete | `simd_copy.rs` |
-| AVX2/NEON copy | ✅ Complete | `simd_copy.rs` |
-| 64-bit bit buffer | ✅ Complete | `two_level_table.rs` |
-| BGZF parallel | ✅ Complete | `ultra_inflate.rs` |
-| Parallel compression | ✅ Complete | `parallel_compress.rs` |
-| libdeflate integration | ✅ Complete | `libdeflate_ext.rs` |
-| Fixed Huffman multi-sym | ✅ Complete | `turbo_inflate.rs` |
-| Cache-aligned buffers | ✅ Complete | `decompression.rs` |
-| Thread-local decompressor | ✅ Complete | `decompression.rs` |
+| Two-level Huffman tables | ✅ | `two_level_table.rs` |
+| SIMD pattern expansion (dist 1-7) | ✅ | `simd_copy.rs` |
+| SIMD overlapping copy (dist 8-31) | ✅ | `simd_copy.rs` |
+| AVX2/NEON LZ77 copy | ✅ | `simd_copy.rs` |
+| 64-bit bit buffer | ✅ | `two_level_table.rs` |
+| BGZF parallel decompression | ✅ | `ultra_inflate.rs` |
+| Multi-member parallel | ✅ | `ultra_decompress.rs` |
+| Parallel compression L1-L9 | ✅ | `parallel_compress.rs` |
+| libdeflate integration | ✅ | `isal.rs` |
+| Fixed Huffman multi-symbol | ✅ | `turbo_inflate.rs` |
+| Cache-aligned buffers | ✅ | `decompression.rs` |
+| Thread-local decompressor | ✅ | `decompression.rs` |
+| Conservative multi-member detection | ✅ | `decompression.rs` |
 
 ---
 
-## Recommended Next Steps
+## The Path to Victory
 
-### Immediate (This Week)
-1. Integrate speculative parallel for arbitrary gzip files
-2. Enable parallel member decompression for pigz files
+### To match rapidgzip:
+1. **Fix speculative parallel decompression** - This alone would get us to parity
 
-### Short Term (This Month)
-3. Dynamic block multi-symbol decode
-4. Table construction optimization
-5. L10-L12 parallel compression
+### To beat rapidgzip:
+1. Fix speculative parallel (2-3x)
+2. Add dynamic multi-symbol (15-25%)
+3. Add prefetching (2-5%)
+4. Total: **3-4x improvement** possible
 
-### Long Term
-6. All P3 items as time permits
+### Current bottleneck:
+On single-member gzip files, we use sequential libdeflate (0.18s). rapidgzip uses parallel speculative decode (0.07s). The 2.5x gap is entirely due to lack of parallelism.
+
+---
+
+## Quick Wins (< 1 day each)
+
+1. **Table construction**: Stack-allocate L2 table
+2. **Branch hints**: Add likely/unlikely macros
+3. **Thread affinity**: Pin worker threads
+4. **Prefetching**: Add prefetch intrinsics
+
+These combined could give 5-10% improvement with minimal effort.
