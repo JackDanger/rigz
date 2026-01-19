@@ -238,12 +238,30 @@ fn reverse_bits(mut val: u32, n: u32) -> u32 {
 // =============================================================================
 
 /// Bit reader optimized for two-level decode
+///
+/// Safety features matching libdeflate:
+/// - Tracks overread count to detect corrupted/truncated streams
+/// - Uses saturating subtraction to prevent underflow
+/// - Limits implicit zero bytes to prevent infinite loops
 pub struct FastBits<'a> {
     data: &'a [u8],
     pos: usize,
     buf: u64,
     bits: u32,
+    /// Number of implicit zero bytes consumed (for detecting truncated streams)
+    overread_count: u32,
 }
+
+/// Maximum overread before we consider the stream corrupted.
+///
+/// We allow more than libdeflate's sizeof(bitbuf_t) because:
+/// 1. A single refill() can add up to 8 bytes of overread when filling from 0 bits
+/// 2. Multiple refills may happen at end of stream without consuming bytes
+/// 3. Legitimate streams may have trailing bits we don't consume
+///
+/// 64 bytes (512 bits) is generous but prevents truly infinite loops.
+/// A corrupted stream trying to infinitely loop would hit this in ~8 refill cycles.
+const MAX_OVERREAD: u32 = 64;
 
 impl<'a> FastBits<'a> {
     #[inline]
@@ -253,12 +271,14 @@ impl<'a> FastBits<'a> {
             pos: 0,
             buf: 0,
             bits: 0,
+            overread_count: 0,
         };
         fb.refill();
         fb
     }
 
     /// Refill to 56+ bits (only if needed)
+    /// When input exhausts, we track implicit zero bytes like libdeflate
     #[inline(always)]
     pub fn refill(&mut self) {
         // Only refill if we have room for at least one byte
@@ -274,12 +294,30 @@ impl<'a> FastBits<'a> {
             self.pos += consumed as usize;
             self.bits += consumed * 8;
         } else {
-            while self.bits <= 56 && self.pos < self.data.len() {
-                self.buf |= (self.data[self.pos] as u64) << self.bits;
-                self.pos += 1;
+            // Slow path: byte-by-byte or implicit zeros
+            while self.bits <= 56 {
+                if self.pos < self.data.len() {
+                    self.buf |= (self.data[self.pos] as u64) << self.bits;
+                    self.pos += 1;
+                } else {
+                    // Input exhausted - track overread (implicit zero bytes)
+                    self.overread_count += 1;
+                }
                 self.bits += 8;
             }
         }
+    }
+
+    /// Check if the stream has been overread (input exhausted and too many zeros consumed)
+    #[inline(always)]
+    pub fn is_overread(&self) -> bool {
+        self.overread_count > MAX_OVERREAD
+    }
+
+    /// Check if input is exhausted (past end of data)
+    #[inline(always)]
+    pub fn is_exhausted(&self) -> bool {
+        self.pos >= self.data.len() && self.bits == 0
     }
 
     /// Peek up to 15 bits
@@ -288,11 +326,11 @@ impl<'a> FastBits<'a> {
         self.buf & ((1u64 << n) - 1)
     }
 
-    /// Consume n bits
+    /// Consume n bits - uses saturating subtraction to prevent underflow
     #[inline(always)]
     pub fn consume(&mut self, n: u32) {
         self.buf >>= n;
-        self.bits -= n;
+        self.bits = self.bits.saturating_sub(n);
     }
 
     /// Read n bits

@@ -110,6 +110,9 @@ impl FastDecodeTable {
 }
 
 /// Decode a Huffman block using fast combined table
+///
+/// Safety: Loop terminates via END_OF_BLOCK or error from invalid code.
+/// The FastBits.consume() uses saturating_sub() to prevent underflow that caused OOM.
 #[inline(never)]
 pub fn decode_block_fast(
     bits: &mut FastBits,

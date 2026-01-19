@@ -260,6 +260,9 @@ fn reverse_bits(code: u16, len: u8) -> u16 {
 }
 
 /// Ultra-fast decode loop using turbo tables
+///
+/// Safety: Loop terminates via END_OF_BLOCK or error from invalid code.
+/// The FastBits.consume() uses saturating_sub() to prevent underflow that caused OOM.
 #[inline(never)]
 pub fn decode_block_turbo(
     bits: &mut FastBits,

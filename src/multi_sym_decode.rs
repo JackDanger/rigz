@@ -242,6 +242,9 @@ fn reverse_bits(mut val: u32, n: u32) -> u32 {
 // =============================================================================
 
 /// Decode a Huffman block using multi-symbol decode
+///
+/// Safety: Loop terminates via END_OF_BLOCK (256) or error from invalid code.
+/// The FastBits.consume() uses saturating_sub() to prevent underflow that caused OOM.
 #[inline(never)]
 pub fn decode_block_multi_sym(
     bits: &mut FastBits,
