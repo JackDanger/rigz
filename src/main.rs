@@ -27,6 +27,7 @@ mod libdeflate_ext;
 mod marker_decode;
 mod multi_sym_decode;
 mod optimization;
+mod packed_decode;
 mod packed_table;
 mod parallel_compress;
 mod parallel_decompress;
