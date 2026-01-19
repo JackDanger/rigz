@@ -392,6 +392,26 @@ fn decode_dynamic_into(
     let dist_table = TwoLevelTable::build(&code_lens[hlit..])?;
     let combined_lut = CombinedLUT::build(&code_lens[..hlit], &code_lens[hlit..])?;
 
+    // Check if codes are short enough for multi-symbol optimization
+    // If max code length <= 6, we can fit 2 symbols in 12 bits
+    let max_lit_len = code_lens[..hlit].iter().copied().max().unwrap_or(0);
+    let use_multi_sym = max_lit_len <= 6 && max_lit_len > 0;
+
+    if use_multi_sym {
+        // Try multi-symbol decode for literal-heavy blocks
+        if let Ok(multi_sym_table) = crate::simd_huffman::MultiSymTable::build(&code_lens[..hlit]) {
+            return decode_huffman_multi_sym(
+                bits,
+                output,
+                out_pos,
+                &multi_sym_table,
+                &combined_lut,
+                &lit_len_table,
+                &dist_table,
+            );
+        }
+    }
+
     decode_huffman_into(
         bits,
         output,
@@ -400,6 +420,189 @@ fn decode_dynamic_into(
         &lit_len_table,
         &dist_table,
     )
+}
+
+/// Decode using multi-symbol table for literal runs
+/// Falls back to regular decode for length codes and complex cases
+fn decode_huffman_multi_sym(
+    bits: &mut FastBits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    multi_sym_table: &crate::simd_huffman::MultiSymTable,
+    _combined_lut: &CombinedLUT,
+    lit_len_table: &TwoLevelTable,
+    dist_table: &TwoLevelTable,
+) -> io::Result<usize> {
+    use crate::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
+
+    loop {
+        bits.ensure(32);
+
+        // Try multi-symbol decode first
+        let entry = multi_sym_table.lookup(bits.buffer());
+
+        if entry.sym_count > 0 && entry.total_bits > 0 {
+            // Got literals - write them all
+            bits.consume(entry.total_bits as u32);
+
+            match entry.sym_count {
+                1 => {
+                    if out_pos >= output.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "Output buffer full",
+                        ));
+                    }
+                    output[out_pos] = entry.sym1;
+                    out_pos += 1;
+                }
+                2 => {
+                    if out_pos + 1 >= output.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "Output buffer full",
+                        ));
+                    }
+                    output[out_pos] = entry.sym1;
+                    output[out_pos + 1] = entry.sym2;
+                    out_pos += 2;
+                }
+                3 => {
+                    if out_pos + 2 >= output.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "Output buffer full",
+                        ));
+                    }
+                    output[out_pos] = entry.sym1;
+                    output[out_pos + 1] = entry.sym2;
+                    output[out_pos + 2] = entry.sym3;
+                    out_pos += 3;
+                }
+                4 => {
+                    if out_pos + 3 >= output.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "Output buffer full",
+                        ));
+                    }
+                    output[out_pos] = entry.sym1;
+                    output[out_pos + 1] = entry.sym2;
+                    output[out_pos + 2] = entry.sym3;
+                    output[out_pos + 3] = entry.sym4;
+                    out_pos += 4;
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        // Non-literal or invalid - use fallback
+        if entry.total_bits > 0 {
+            bits.consume(entry.total_bits as u32);
+            let symbol = entry.symbol();
+
+            if symbol == 256 {
+                // End of block
+                break;
+            }
+
+            // Length code - handle with regular path
+            let len_idx = (symbol - 257) as usize;
+            if len_idx >= 29 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid length code",
+                ));
+            }
+
+            bits.ensure(16);
+            let length =
+                LEN_START[len_idx] as usize + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
+
+            let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
+            if dist_len == 0 || dist_sym >= 30 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid distance code",
+                ));
+            }
+            bits.consume(dist_len);
+
+            bits.ensure(16);
+            let distance = DIST_START[dist_sym as usize] as usize
+                + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+
+            if distance > out_pos || distance == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid distance",
+                ));
+            }
+
+            out_pos = copy_match_into(output, out_pos, distance, length);
+        } else {
+            // Fall back to regular decode for long codes
+            let (symbol, code_len) = lit_len_table.decode(bits.buffer());
+            if code_len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid Huffman code",
+                ));
+            }
+            bits.consume(code_len);
+
+            if symbol < 256 {
+                if out_pos >= output.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "Output buffer full",
+                    ));
+                }
+                output[out_pos] = symbol as u8;
+                out_pos += 1;
+            } else if symbol == 256 {
+                break;
+            } else {
+                // Length code
+                let len_idx = (symbol - 257) as usize;
+                if len_idx >= 29 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Invalid length code",
+                    ));
+                }
+
+                bits.ensure(16);
+                let length = LEN_START[len_idx] as usize
+                    + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
+
+                let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
+                if dist_len == 0 || dist_sym >= 30 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Invalid distance code",
+                    ));
+                }
+                bits.consume(dist_len);
+
+                bits.ensure(16);
+                let distance = DIST_START[dist_sym as usize] as usize
+                    + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+
+                if distance > out_pos || distance == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Invalid distance",
+                    ));
+                }
+
+                out_pos = copy_match_into(output, out_pos, distance, length);
+            }
+        }
+    }
+
+    Ok(out_pos)
 }
 
 /// Core decode loop using CombinedLUT, writing directly to output slice

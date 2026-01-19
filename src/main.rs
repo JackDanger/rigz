@@ -30,6 +30,7 @@ mod pipelined_compress;
 mod rapidgzip_decoder;
 mod scheduler;
 mod simd_copy;
+mod simd_huffman;
 mod simd_inflate;
 mod simple_optimizations;
 mod turbo_inflate;
