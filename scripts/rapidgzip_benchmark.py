@@ -3,7 +3,7 @@
 Local benchmark comparing gzippy decompression against rapidgzip.
 
 This script downloads the Silesia corpus and runs compression/decompression
-benchmarks comparing gzippy, pigz, igzip, and rapidgzip.
+benchmarks comparing gzippy, pigz, and rapidgzip.
 
 Usage:
     python3 scripts/rapidgzip_benchmark.py
@@ -11,7 +11,6 @@ Usage:
 Prerequisites:
     - gzippy built: cargo build --release
     - pigz built: make -C pigz
-    - igzip built (optional): mkdir -p isa-l/build && cd isa-l/build && cmake .. && make igzip
     - rapidgzip installed: pip install rapidgzip
 
 The Silesia corpus will be downloaded automatically if not present.
@@ -33,7 +32,6 @@ from typing import Dict, List, Tuple, Optional
 # Tool paths (relative to repo root)
 GZIPPY = "./target/release/gzippy"
 PIGZ = "./pigz/pigz"
-IGZIP = "./isa-l/build/igzip"
 RAPIDGZIP = "./rapidgzip/librapidarchive/build/src/tools/rapidgzip"
 ZOPFLI = "./zopfli/zopfli"
 GZIP = "gzip"
@@ -125,10 +123,6 @@ def benchmark_compress(tool: str, level: int, threads: int,
     elif tool == "pigz":
         bin_path = str(repo_root / "pigz/pigz")
         cmd = [bin_path, f"-{level}", f"-p", str(threads), "-c", str(input_file)]
-    elif tool == "igzip":
-        bin_path = str(repo_root / "isa-l/build/igzip")
-        igzip_level = min(3, max(0, (level - 1) // 3))
-        cmd = [bin_path, f"-{igzip_level}", f"-T", str(threads), "-c", str(input_file)]
     elif tool == "gzip":
         cmd = ["gzip", f"-{level}", "-c", str(input_file)]
     else:
@@ -166,10 +160,6 @@ def benchmark_decompress(tool: str, threads: int, input_file: Path,
         elif tool == "pigz":
             bin_path = str(repo_root / "pigz/pigz")
             subprocess.run([bin_path, "-d", "-p", str(threads), "-c", str(input_file)],
-                          stdout=subprocess.DEVNULL, check=True, stderr=subprocess.DEVNULL)
-        elif tool == "igzip":
-            bin_path = str(repo_root / "isa-l/build/igzip")
-            subprocess.run([bin_path, "-d", "-T", str(threads), "-c", str(input_file)],
                           stdout=subprocess.DEVNULL, check=True, stderr=subprocess.DEVNULL)
         elif tool == "rapidgzip":
             # rapidgzip CLI: -d decompress, -P parallelism, -c stdout
@@ -211,13 +201,6 @@ def run_benchmarks():
         print("✓ pigz")
     else:
         print("✗ pigz (run: make -C pigz)")
-    
-    if check_tool(IGZIP, "igzip"):
-        available_compress.append("igzip")
-        available_decompress.append("igzip")
-        print("✓ igzip")
-    else:
-        print("✗ igzip (optional)")
     
     if check_tool(GZIP, "gzip"):
         available_compress.append("gzip")

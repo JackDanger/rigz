@@ -184,13 +184,14 @@ impl UltraDecompressor {
         isal_parallel(data, writer, self.num_threads)
     }
 
-    /// Parallel decompression for single-member gzip using rapidgzip algorithm
+    /// Parallel decompression for single-member gzip using custom deflate decoder
     fn decompress_single_parallel<W: Write + Send>(
         &self,
         data: &[u8],
         writer: &mut W,
     ) -> io::Result<u64> {
-        crate::rapidgzip_algo::decompress_parallel(data, writer, self.num_threads)
+        // Use the new parallel inflater with custom deflate decoder
+        crate::parallel_inflate::decompress_gzip_parallel(data, writer, self.num_threads)
     }
 
     /// Optimized sequential decompression
