@@ -18,6 +18,7 @@ mod error;
 mod fast_decode;
 mod fast_inflate;
 mod fastloop_decode;
+mod fixed_turbo;
 mod format;
 mod hyper_inflate;
 mod hyper_table;
