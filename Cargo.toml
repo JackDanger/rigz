@@ -37,6 +37,9 @@ num_cpus = "1.16"
 # Memory-mapped I/O for zero-copy file access
 memmap2 = "0.9"
 
+# Dynamic library loading for ISA-L
+libloading = "0.8"
+
 # Error handling
 anyhow = "1.0"
 thiserror = "1.0"

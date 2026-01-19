@@ -203,6 +203,28 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
     // is_multi_member_quick which only scans 256KB - not enough for random data
     // where the first block can be >256KB
     if has_bgzf_markers(data) {
+        // Try ultra-fast BGZF decompressor first (truly parallel, no writer bottleneck)
+        let num_threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4);
+
+        match crate::ultra_inflate::decompress_bgzf_ultra(data, writer, num_threads) {
+            Ok(bytes) => {
+                if std::env::var("GZIPPY_DEBUG").is_ok() {
+                    eprintln!(
+                        "[gzippy] BGZF ultra: {} bytes, {} threads",
+                        bytes, num_threads
+                    );
+                }
+                return Ok(bytes);
+            }
+            Err(e) => {
+                if std::env::var("GZIPPY_DEBUG").is_ok() {
+                    eprintln!("[gzippy] BGZF ultra failed: {}, falling back", e);
+                }
+            }
+        }
+        // Fallback to streaming parallel decompressor
         return decompress_bgzf_parallel_prefetch(data, writer);
     }
 

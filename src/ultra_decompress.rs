@@ -184,14 +184,20 @@ impl UltraDecompressor {
         isal_parallel(data, writer, self.num_threads)
     }
 
-    /// Parallel decompression for single-member gzip using rapidgzip algorithm
+    /// Parallel decompression for single-member gzip using ultra-fast engine
     fn decompress_single_parallel<W: Write + Send>(
         &self,
         data: &[u8],
         writer: &mut W,
     ) -> io::Result<u64> {
-        // Use the rapidgzip-style decoder with speculative parallel decode
-        crate::rapidgzip_decoder::decompress_rapidgzip(data, writer, self.num_threads)
+        // Try the ultra-fast LUT-based parallel decompress first
+        match crate::ultra_inflate::decompress_ultra_fast(data, writer, self.num_threads) {
+            Ok(bytes) => Ok(bytes),
+            Err(_) => {
+                // Fallback to rapidgzip decoder
+                crate::rapidgzip_decoder::decompress_rapidgzip(data, writer, self.num_threads)
+            }
+        }
     }
 
     /// Optimized sequential decompression

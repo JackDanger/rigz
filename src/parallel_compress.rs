@@ -257,14 +257,15 @@ fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compressio
         0xff, // OS (unknown)
     ]);
 
-    // XLEN: 6 bytes (2 byte ID + 2 byte len + 2 byte block size)
-    output.extend_from_slice(&[6, 0]);
+    // XLEN: 8 bytes (2 byte ID + 2 byte len + 4 byte block size)
+    output.extend_from_slice(&[8, 0]);
 
-    // Subfield: "RZ" + 2 bytes len + 2 bytes block size (placeholder)
+    // Subfield: "GZ" + 2 bytes len + 4 bytes block size (placeholder)
+    // Using 4 bytes allows block sizes up to 4GB
     output.extend_from_slice(&GZ_SUBFIELD_ID);
-    output.extend_from_slice(&[2, 0]); // Subfield data length
+    output.extend_from_slice(&[4, 0]); // Subfield data length (4 bytes)
     let block_size_offset = output.len();
-    output.extend_from_slice(&[0, 0]); // Placeholder for block size
+    output.extend_from_slice(&[0, 0, 0, 0]); // Placeholder for block size
 
     // Get or create compressor from thread-local cache
     let level = compression_level as i32;
@@ -308,14 +309,9 @@ fn compress_block_bgzf_libdeflate(output: &mut Vec<u8>, block: &[u8], compressio
     // Now write the total block size (including header and trailer)
     let total_block_size = output.len() - header_start;
 
-    // Block size is stored as (size - 1) to match BGZF convention
-    let block_size_minus_1 = if total_block_size <= 65536 {
-        (total_block_size - 1) as u16
-    } else {
-        0 // Overflow marker - decompressor will fall back to sequential
-    };
-    output[block_size_offset..block_size_offset + 2]
-        .copy_from_slice(&block_size_minus_1.to_le_bytes());
+    // Block size stored as u32 (no overflow possible for reasonable blocks)
+    output[block_size_offset..block_size_offset + 4]
+        .copy_from_slice(&(total_block_size as u32).to_le_bytes());
 }
 
 #[cfg(test)]

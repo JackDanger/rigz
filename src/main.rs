@@ -31,6 +31,7 @@ mod speculative_decompress;
 mod speculative_inflate;
 mod streaming_inflate;
 mod ultra_decompress;
+mod ultra_inflate;
 mod utils;
 
 use cli::GzippyArgs;
