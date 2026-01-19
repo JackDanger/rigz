@@ -562,26 +562,57 @@ fn decode_huffman_into(
 }
 
 /// Copy LZ77 match directly into output slice
-#[inline]
-fn copy_match_into(output: &mut [u8], mut out_pos: usize, distance: usize, length: usize) -> usize {
+/// Optimized for:
+/// 1. distance=1 (RLE): memset
+/// 2. distance >= length: non-overlapping memcpy
+/// 3. distance >= 8: chunk copy
+/// 4. small distance: byte-by-byte
+#[inline(always)]
+fn copy_match_into(output: &mut [u8], out_pos: usize, distance: usize, length: usize) -> usize {
     let src_start = out_pos - distance;
 
-    // Fast path for non-overlapping copies
-    if distance >= length && out_pos + length <= output.len() {
-        output.copy_within(src_start..src_start + length, out_pos);
-        return out_pos + length;
+    // Bounds check
+    if out_pos + length > output.len() {
+        return out_pos;
     }
 
-    // Overlapping copy - byte by byte
-    for i in 0..length {
-        if out_pos >= output.len() {
-            break;
+    unsafe {
+        let dst = output.as_mut_ptr().add(out_pos);
+        let src = output.as_ptr().add(src_start);
+
+        if distance == 1 {
+            // Very common: RLE (single byte repeat)
+            // This is a major optimization from libdeflate
+            let byte = *src;
+            std::ptr::write_bytes(dst, byte, length);
+        } else if distance >= length {
+            // Non-overlapping: use memcpy
+            std::ptr::copy_nonoverlapping(src, dst, length);
+        } else if distance >= 8 {
+            // Overlapping but distance >= 8: 8-byte chunk copy
+            let mut remaining = length;
+            let mut d = dst;
+            let mut s = src;
+            while remaining >= 8 {
+                let chunk = (s as *const u64).read_unaligned();
+                (d as *mut u64).write_unaligned(chunk);
+                d = d.add(8);
+                s = s.add(8);
+                remaining -= 8;
+            }
+            // Copy remainder
+            for i in 0..remaining {
+                *d.add(i) = *s.add(i);
+            }
+        } else {
+            // Small distance (2-7): byte-by-byte
+            for i in 0..length {
+                *dst.add(i) = *src.add(i % distance);
+            }
         }
-        output[out_pos] = output[src_start + (i % distance)];
-        out_pos += 1;
     }
 
-    out_pos
+    out_pos + length
 }
 
 /// Parallel BGZF decompression - the main entry point

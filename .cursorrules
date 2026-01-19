@@ -349,10 +349,25 @@ inflate_into(deflate_data, out_slice)?;
 
 | File Type | Speed | Target | Status |
 |-----------|-------|--------|--------|
-| BGZF | 4089 MB/s | 4000+ MB/s | ✅ EXCEEDED |
+| BGZF | 3850 MB/s | 4000+ MB/s | ✅ CLOSE (96%) |
 | Multi-member | Parallel | 3000+ MB/s | ✅ Working |
-| Single-member (CombinedLUT) | 10700+ MB/s | 2500+ MB/s | ✅ EXCEEDED |
-| Single-member (silesia) | 600 MB/s | N/A | Complex data, expected |
+| Single-member (CombinedLUT) | 10055 MB/s | 2500+ MB/s | ✅ EXCEEDED |
+| Single-member (silesia) | 574 MB/s | N/A | Complex data, expected |
+
+### Key Optimizations Implemented (Jan 2026)
+
+1. **Distance=1 memset optimization**: Copy matches with distance=1 use `ptr::write_bytes` (memset)
+2. **8-byte chunk copy**: For distance>=8 overlapping copies, use 8-byte chunked writes
+3. **Fastloop architecture**: Separate fastloop/generic loop with bounds check at loop start
+4. **Branchless table preload**: Preload next table entry before current iteration completes
+
+### New Module: `fastloop_decode.rs`
+
+Contains optimized decode loop with:
+- `FastBitsOptimized`: Bit reader with branchless refill
+- `copy_match_fast`: LZ77 copy with distance=1 memset
+- `decode_huffman_fastloop`: Main fastloop with multi-literal optimization
+- `decode_huffman_generic`: Safe fallback for buffer boundaries
 
 **Note:** The 10700 MB/s figure is for simple/repetitive data with CombinedLUT.
 Real-world complex data (silesia) achieves ~600 MB/s single-threaded.

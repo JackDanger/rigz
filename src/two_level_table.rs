@@ -277,7 +277,7 @@ impl<'a> FastBits<'a> {
         fb
     }
 
-    /// Refill to 56+ bits (only if needed)
+    /// Refill to 56+ bits using optimized technique from libdeflate
     /// When input exhausts, we track implicit zero bytes like libdeflate
     #[inline(always)]
     pub fn refill(&mut self) {
@@ -287,9 +287,11 @@ impl<'a> FastBits<'a> {
         }
 
         if self.pos + 8 <= self.data.len() {
+            // Fast path: load 8 bytes unconditionally (unaligned is fine)
             let bytes =
                 unsafe { (self.data.as_ptr().add(self.pos) as *const u64).read_unaligned() };
             self.buf |= bytes.to_le() << self.bits;
+            // Advance by how many complete bytes we can fit
             let consumed = (64 - self.bits) / 8;
             self.pos += consumed as usize;
             self.bits += consumed * 8;

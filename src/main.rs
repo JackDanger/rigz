@@ -17,6 +17,7 @@ mod decompression;
 mod error;
 mod fast_decode;
 mod fast_inflate;
+mod fastloop_decode;
 mod format;
 mod inflate_tables;
 mod isal;
