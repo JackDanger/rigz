@@ -62,6 +62,18 @@ jobs:
       - name: Build pigz
         run: make -C pigz
 
+      - name: Build igzip
+        continue-on-error: true
+        run: |
+          cd isa-l
+          mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          make -j$(nproc) igzip || true
+          if [ -f bin/igzip ]; then
+            cp bin/igzip /tmp/igzip-cli
+            echo "✓ igzip CLI built"
+          fi
+
       - name: Build rapidgzip
         continue-on-error: true
         run: |
@@ -80,6 +92,7 @@ jobs:
           cp target/release/gzippy /tmp/binaries/
           cp pigz/pigz /tmp/binaries/
           cp pigz/unpigz /tmp/binaries/
+          cp /tmp/igzip-cli /tmp/binaries/ 2>/dev/null || echo "igzip not available"
           cp /tmp/rapidgzip-cli /tmp/binaries/ 2>/dev/null || echo "rapidgzip not available"
           ls -la /tmp/binaries/
 
@@ -173,9 +186,27 @@ jobs:
           chmod +x ./bin/*
           mkdir -p results
 
+      - name: Debug artifact structure
+        run: |
+          echo "Artifact structure:"
+          find ./data -type f | head -20
+          ls -la ./data/ || true
+          ls -la ./data/test-100mb.txt 2>/dev/null || ls -la ./data/tmp/test-100mb.txt 2>/dev/null || echo "File not found in expected locations"
+
       - name: Run decompression benchmarks
         run: |
-          ORIGINAL="./data/tmp/test-100mb.txt"
+          # Find the test file (artifact path may vary)
+          if [ -f "./data/test-100mb.txt" ]; then
+            ORIGINAL="./data/test-100mb.txt"
+            COMPRESSED_DIR="./data/compressed"
+          elif [ -f "./data/tmp/test-100mb.txt" ]; then
+            ORIGINAL="./data/tmp/test-100mb.txt"
+            COMPRESSED_DIR="./data/tmp/compressed"
+          else
+            echo "ERROR: Could not find test file"
+            find ./data -name "*.txt" | head -5
+            exit 1
+          fi
           ORIGINAL_SIZE=$(stat -c%s "$ORIGINAL")
           
           # Adaptive benchmarking parameters
@@ -187,7 +218,7 @@ jobs:
           first=true
           
           # Test each compressed file
-          for gz_file in ./data/tmp/compressed/*.gz; do
+          for gz_file in ${COMPRESSED_DIR}/*.gz; do
             filename=$(basename "$gz_file" .gz)
             source=$(echo "$filename" | cut -d'-' -f1)
             level=$(echo "$filename" | cut -d'-' -f2 | tr -d 'L')
@@ -195,17 +226,28 @@ jobs:
             echo "=== Testing $filename ==="
             
             # Test each decompressor at different thread counts
-            for tool in gzippy pigz gzip rapidgzip; do
+            # Goal: gzippy must beat ALL tools (pigz, igzip, gzip, rapidgzip)
+            for tool in gzippy pigz igzip gzip rapidgzip; do
               for threads in 1 $(nproc); do
-                # Skip invalid combinations
+                # Skip invalid combinations (single-threaded only tools)
                 if [ "$tool" = "gzip" ] && [ "$threads" != "1" ]; then
                   continue
+                fi
+                if [ "$tool" = "igzip" ] && [ "$threads" != "1" ]; then
+                  continue  # igzip CLI is single-threaded
                 fi
                 
                 # Build command
                 case "$tool" in
                   gzippy)   cmd="./bin/gzippy -d -p$threads" ;;
                   pigz)     cmd="./bin/unpigz -p$threads" ;;
+                  igzip)
+                    if [ -x "./bin/igzip-cli" ]; then
+                      cmd="./bin/igzip-cli -d"
+                    else
+                      continue  # Skip if not available
+                    fi
+                    ;;
                   gzip)     cmd="gzip -d" ;;
                   rapidgzip)
                     if [ -x "./bin/rapidgzip-cli" ]; then
