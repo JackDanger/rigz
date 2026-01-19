@@ -187,26 +187,25 @@ fn decode_huffman_block(
         }
         bits.consume(code_len);
 
-        // Fast path: literal byte with multi-literal decode
+        // Fast path: literal byte with multi-literal decode (like libdeflate)
+        // Key insight: We peek at the next symbol BEFORE consuming bits.
+        // Only consume if it's a literal (< 256). This is safe because:
+        // 1. We peek without consuming, so we can bail if it's EOB or length
+        // 2. We don't speculatively decode - we check the actual next symbol
         if symbol < 256 {
             output.push(symbol as u8);
 
-            // Multi-literal decode: try up to 2 more literals (like libdeflate)
-            // This significantly reduces loop overhead for literal-heavy data
-            if bits.bits_available() >= 20 {
+            // Multi-literal decode: try up to 2 more literals
+            // We need at least 15 bits available to decode the next symbol
+            while bits.bits_available() >= 15 {
                 let (sym2, len2) = lit_len_table.decode(bits.buffer());
+                // Only consume if it's a valid literal (not EOB, not length code)
                 if len2 > 0 && sym2 < 256 {
                     bits.consume(len2);
                     output.push(sym2 as u8);
-
-                    // Third literal
-                    if bits.bits_available() >= 10 {
-                        let (sym3, len3) = lit_len_table.decode(bits.buffer());
-                        if len3 > 0 && sym3 < 256 {
-                            bits.consume(len3);
-                            output.push(sym3 as u8);
-                        }
-                    }
+                } else {
+                    // Not a literal - break out, main loop will handle it
+                    break;
                 }
             }
             continue;
