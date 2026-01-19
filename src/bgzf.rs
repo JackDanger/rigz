@@ -414,6 +414,28 @@ fn decode_huffman_into(
     use crate::combined_lut::{DIST_END_OF_BLOCK, DIST_LITERAL, DIST_SLOW_PATH};
     use crate::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
 
+    // Branch prediction hints (stable workaround for likely/unlikely)
+    // These help the compiler optimize hot paths by marking cold paths
+    #[cold]
+    #[inline(never)]
+    fn cold_path() {}
+
+    #[inline(always)]
+    fn likely(b: bool) -> bool {
+        if !b {
+            cold_path();
+        }
+        b
+    }
+
+    #[inline(always)]
+    fn unlikely(b: bool) -> bool {
+        if b {
+            cold_path();
+        }
+        b
+    }
+
     // Prefetch next output cache line (64 bytes ahead on x86_64)
     // This hides memory latency by loading data into L1 cache before it's needed
     #[inline(always)]
@@ -440,8 +462,8 @@ fn decode_huffman_into(
 
         let entry = combined_lut.decode(bits.buffer());
 
-        // Long code fallback
-        if entry.bits_to_skip == 0 {
+        // Long code fallback (rare - most codes fit in 12 bits)
+        if unlikely(entry.bits_to_skip == 0) {
             let (symbol, code_len) = lit_len_table.decode(bits.buffer());
             if code_len == 0 {
                 return Err(io::Error::new(
@@ -451,8 +473,9 @@ fn decode_huffman_into(
             }
             bits.consume(code_len);
 
-            if symbol < 256 {
-                if out_pos >= output.len() {
+            if likely(symbol < 256) {
+                // Literal byte - most common case
+                if unlikely(out_pos >= output.len()) {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
                         "Output buffer full",
@@ -462,13 +485,14 @@ fn decode_huffman_into(
                 out_pos += 1;
                 continue;
             }
-            if symbol == 256 {
+            if unlikely(symbol == 256) {
+                // End of block - rare
                 break;
             }
 
-            // Length code
+            // Length code (less common than literals)
             let len_idx = (symbol - 257) as usize;
-            if len_idx >= 29 {
+            if unlikely(len_idx >= 29) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Invalid length code",
@@ -480,7 +504,7 @@ fn decode_huffman_into(
                 LEN_START[len_idx] as usize + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
 
             let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
-            if dist_len == 0 || dist_sym >= 30 {
+            if unlikely(dist_len == 0 || dist_sym >= 30) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Invalid distance code",
@@ -492,7 +516,7 @@ fn decode_huffman_into(
             let distance = DIST_START[dist_sym as usize] as usize
                 + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
 
-            if distance > out_pos || distance == 0 {
+            if unlikely(distance > out_pos || distance == 0) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "Invalid distance",
@@ -558,7 +582,7 @@ fn decode_huffman_into(
                 let distance = DIST_START[dist_sym as usize] as usize
                     + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
 
-                if distance > out_pos || distance == 0 {
+                if unlikely(distance > out_pos || distance == 0) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "Invalid distance",
