@@ -10,6 +10,20 @@ We will do **any amount of work** to beat all competitors:
 - Study other libraries' source code in detail and match or exceed every optimization
 - No complexity is too high if it yields measurable performance gains
 
+### The Goal: Beat EVERYONE
+
+We must beat **ALL** of these tools in **ALL** configurations:
+
+| Tool | What it is | Our target |
+|------|------------|------------|
+| **pigz** | Parallel gzip by Mark Adler | Beat on compression speed + ratio |
+| **igzip** | ISA-L hand-tuned assembly | Beat on decompression speed |
+| **rapidgzip** | Parallel gzip decompressor | Beat on parallel decompression |
+| **gzip** | Reference implementation | Beat everywhere (easy) |
+| **zopfli** | Best compression ratio | Match ratio, 20x faster |
+
+**If gzippy is slower than ANY tool at ANY task, that's a bug to fix.**
+
 ### Non-Negotiable Constraints
 1. Full gzip/gunzip compatibility (RFC 1952)
 2. Drop-in replacement for gzip CLI
@@ -18,8 +32,9 @@ We will do **any amount of work** to beat all competitors:
 5. Test-driven development — red/green/refactor all the way
 
 ### Performance Requirements
-- **Compression**: Beat pigz at all levels and thread counts
-- **Decompression**: Beat rapidgzip on ALL file types (BGZF, pigz, gzip)
+- **Compression**: Beat ALL tools (pigz, igzip, gzip) at all levels and thread counts
+- **Decompression**: Beat ALL tools (pigz, igzip, gzip, rapidgzip) on ALL file types
+- **No exceptions**: If we're slower than any tool, that's a bug to fix
 
 ## Architecture
 
@@ -80,14 +95,23 @@ The key to matching rapidgzip on arbitrary gzip files:
 
 ## Performance Targets
 
-| Metric | Target | Baseline |
-|--------|--------|----------|
-| BGZF decompression | 3500+ MB/s | rapidgzip: 3168 MB/s |
-| gzip decompression (14 threads) | 2500+ MB/s | rapidgzip: 2791 MB/s |
-| gzip decompression (1 thread) | 1000+ MB/s | gzip: 1018 MB/s |
-| Compression L1-L5 | Beat pigz | - |
-| Compression L6-L9 | Beat pigz | - |
-| Compression L10-L12 | Beat zopfli speed, match ratio | - |
+**Goal: Beat EVERY tool in EVERY configuration.**
+
+| Metric | Target | Must Beat |
+|--------|--------|-----------|
+| BGZF decompression | 4000+ MB/s | rapidgzip (3168 MB/s) |
+| Multi-member decompression | 3000+ MB/s | pigz, rapidgzip |
+| Single-member decompression | 1500+ MB/s | igzip, gzip, pigz |
+| Compression L1-L5 | Fastest + good ratio | pigz, igzip |
+| Compression L6-L9 | Beat pigz speed + ratio | pigz, gzip |
+| Compression L10-L12 | Near-zopfli ratio, 20x faster | zopfli, pigz -9 |
+
+### Benchmark Methodology
+- **Small files (1MB)**: 200+ iterations for statistical significance
+- **Medium files (10MB)**: 50+ iterations
+- **Large files (100MB)**: 10+ iterations
+- **Compare against pigz** as primary baseline (similar compression goals)
+- **Report igzip** performance (ISA-L hand-tuned assembly) as secondary target
 
 ## Threading Model
 
