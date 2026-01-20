@@ -497,6 +497,53 @@ mod tests {
         assert_eq!(sub.subtable_extra_bits(), 4);
     }
 
+    /// Test distance table building
+    #[test]
+    fn test_build_distance_table() {
+        // Standard fixed distance codes: all 5 bits
+        let dist_lengths = vec![5u8; 32];
+
+        let table = ConsumeFirstTable::build(&dist_lengths).unwrap();
+
+        // All distance entries should be valid
+        // For distance table, symbols 0-29 are valid distance codes
+        // (30 and 31 are unused in deflate)
+        for idx in 0..32 {
+            // Find any entry that decodes to this symbol
+            let mut found = false;
+            for entry in table.main.iter() {
+                if entry.symbol() as usize == idx && entry.bits() > 0 {
+                    found = true;
+                    eprintln!(
+                        "[TEST] Distance {}: bits={}, is_literal={}",
+                        idx,
+                        entry.bits(),
+                        entry.is_literal()
+                    );
+                    break;
+                }
+            }
+            if idx < 30 {
+                assert!(found, "Distance symbol {} should be in table", idx);
+            }
+        }
+
+        // Test that we can look up distance symbols
+        // With 5-bit codes, the pattern should be straightforward
+        eprintln!("\n[TEST] Distance table lookup test:");
+        for dist_sym in 0..30 {
+            // The 5-bit reversed code for symbol 'dist_sym' should decode correctly
+            let bits_pattern = dist_sym as u64; // Simplified - actual patterns depend on Huffman
+            let entry = table.lookup_main(bits_pattern);
+            eprintln!(
+                "[TEST]   Pattern 0x{:03x} -> symbol={}, bits={}",
+                bits_pattern,
+                entry.symbol(),
+                entry.bits()
+            );
+        }
+    }
+
     #[test]
     fn test_build_fixed_huffman() {
         // Fixed Huffman code lengths

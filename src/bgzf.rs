@@ -639,19 +639,31 @@ fn decode_dynamic_into_turbo(
     let lit_len_lens = &code_lens[..hlit];
     let dist_lens = &code_lens[hlit..];
 
-    // Build tables - PackedLUT for turbo decode + TwoLevelTable for fallback
-    let lit_len_table = TwoLevelTable::build(lit_len_lens)?;
-    let dist_table = TwoLevelTable::build(dist_lens)?;
-    let packed_lut = PackedLUT::build(lit_len_lens, dist_lens)?;
+    // Try consume-first path (39.8% faster in benchmarks)
+    #[cfg(feature = "consume_first")]
+    {
+        use crate::consume_first_table::ConsumeFirstTable;
+        let cf_lit_table = ConsumeFirstTable::build(lit_len_lens)?;
+        let cf_dist_table = ConsumeFirstTable::build(dist_lens)?;
+        decode_huffman_consume_first(bits, output, out_pos, &cf_lit_table, &cf_dist_table)
+    }
 
-    decode_huffman_turbo(
-        bits,
-        output,
-        out_pos,
-        &packed_lut,
-        &lit_len_table,
-        &dist_table,
-    )
+    // Default: PackedLUT for turbo decode + TwoLevelTable for fallback
+    #[cfg(not(feature = "consume_first"))]
+    {
+        let lit_len_table = TwoLevelTable::build(lit_len_lens)?;
+        let dist_table = TwoLevelTable::build(dist_lens)?;
+        let packed_lut = PackedLUT::build(lit_len_lens, dist_lens)?;
+
+        decode_huffman_turbo(
+            bits,
+            output,
+            out_pos,
+            &packed_lut,
+            &lit_len_table,
+            &dist_table,
+        )
+    }
 }
 
 /// Public version of inflate_into for use by other modules
@@ -1287,73 +1299,86 @@ fn decode_huffman_consume_first(
     lit_table: &crate::consume_first_table::ConsumeFirstTable,
     dist_table: &crate::consume_first_table::ConsumeFirstTable,
 ) -> io::Result<usize> {
+    use crate::consume_first_table::CFEntry;
     use crate::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
 
     let out_end = output.len();
     let fastloop_end = out_end.saturating_sub(320);
 
+    // Helper to resolve entry (handles subtables)
+    #[inline(always)]
+    fn resolve_entry(
+        bits: &mut crate::two_level_table::TurboBits,
+        table: &crate::consume_first_table::ConsumeFirstTable,
+    ) -> CFEntry {
+        let entry = table.lookup_main(bits.buffer());
+        bits.consume(entry.bits());
+
+        if entry.is_subtable() {
+            let sub_entry = table.lookup_sub(entry, bits.buffer());
+            bits.consume(sub_entry.bits());
+            sub_entry
+        } else {
+            entry
+        }
+    }
+
     // === FASTLOOP with consume-first pattern ===
     while out_pos < fastloop_end {
         bits.ensure(56);
 
-        // Look up entry
-        let entry = lit_table.lookup_main(bits.buffer());
+        let entry = resolve_entry(bits, lit_table);
 
-        // CONSUME FIRST - bits is ALWAYS > 0
-        bits.consume(entry.bits());
-
-        // Check type AFTER consuming (39.8% faster!)
         if entry.is_literal() {
             output[out_pos] = entry.symbol() as u8;
             out_pos += 1;
 
-            // Inline 2 more literals like libdeflate
-            let e2 = lit_table.lookup_main(bits.buffer());
-            bits.consume(e2.bits());
+            // Try 2 more literals
+            bits.ensure(32);
+            let e2 = resolve_entry(bits, lit_table);
             if e2.is_literal() {
                 output[out_pos] = e2.symbol() as u8;
                 out_pos += 1;
 
-                let e3 = lit_table.lookup_main(bits.buffer());
-                bits.consume(e3.bits());
+                let e3 = resolve_entry(bits, lit_table);
                 if e3.is_literal() {
                     output[out_pos] = e3.symbol() as u8;
                     out_pos += 1;
 
-                    // Continue with tight literal loop
+                    // Tight literal loop
                     while bits.has_bits(24) {
-                        let e = lit_table.lookup_main(bits.buffer());
-                        bits.consume(e.bits());
-                        if !e.is_literal() {
-                            // Handle non-literal inline
-                            if e.is_eob() {
-                                return Ok(out_pos);
-                            }
-                            if e.is_length() {
-                                let len_idx = (e.symbol() - 257) as usize;
-                                bits.ensure(16);
-                                let length = LEN_START[len_idx] as usize
-                                    + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
+                        let e = resolve_entry(bits, lit_table);
+                        if e.is_literal() {
+                            output[out_pos] = e.symbol() as u8;
+                            out_pos += 1;
+                        } else if e.is_eob() {
+                            return Ok(out_pos);
+                        } else if e.is_length() {
+                            let len_idx = (e.symbol() - 257) as usize;
+                            bits.ensure(16);
+                            let length = LEN_START[len_idx] as usize
+                                + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
 
-                                let d = dist_table.lookup_main(bits.buffer());
-                                bits.consume(d.bits());
-                                let dist_sym = d.symbol();
-                                bits.ensure(16);
-                                let distance = DIST_START[dist_sym as usize] as usize
-                                    + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+                            let d = resolve_entry(bits, dist_table);
+                            let dist_sym = d.symbol();
+                            bits.ensure(16);
+                            let distance = DIST_START[dist_sym as usize] as usize
+                                + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
 
-                                if distance == 0 || distance > out_pos {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        "Invalid distance",
-                                    ));
-                                }
-                                out_pos = copy_match_into(output, out_pos, distance, length);
+                            if distance == 0 || distance > out_pos {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "Invalid distance: {} at out_pos={}",
+                                        distance, out_pos
+                                    ),
+                                ));
                             }
+                            out_pos = copy_match_into(output, out_pos, distance, length);
+                            break;
+                        } else {
                             break;
                         }
-                        output[out_pos] = e.symbol() as u8;
-                        out_pos += 1;
                     }
                     continue;
                 }
@@ -1367,8 +1392,7 @@ fn decode_huffman_consume_first(
                     let length = LEN_START[len_idx] as usize
                         + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
 
-                    let d = dist_table.lookup_main(bits.buffer());
-                    bits.consume(d.bits());
+                    let d = resolve_entry(bits, dist_table);
                     let dist_sym = d.symbol();
                     bits.ensure(16);
                     let distance = DIST_START[dist_sym as usize] as usize
@@ -1377,7 +1401,7 @@ fn decode_huffman_consume_first(
                     if distance == 0 || distance > out_pos {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            "Invalid distance",
+                            format!("Invalid distance: {} at out_pos={}", distance, out_pos),
                         ));
                     }
                     out_pos = copy_match_into(output, out_pos, distance, length);
@@ -1394,8 +1418,7 @@ fn decode_huffman_consume_first(
                 let length = LEN_START[len_idx] as usize
                     + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
 
-                let d = dist_table.lookup_main(bits.buffer());
-                bits.consume(d.bits());
+                let d = resolve_entry(bits, dist_table);
                 let dist_sym = d.symbol();
                 bits.ensure(16);
                 let distance = DIST_START[dist_sym as usize] as usize
@@ -1404,7 +1427,7 @@ fn decode_huffman_consume_first(
                 if distance == 0 || distance > out_pos {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        "Invalid distance",
+                        format!("Invalid distance: {} at out_pos={}", distance, out_pos),
                     ));
                 }
                 out_pos = copy_match_into(output, out_pos, distance, length);
@@ -1412,55 +1435,35 @@ fn decode_huffman_consume_first(
             continue;
         }
 
-        // Entry was not literal
         if entry.is_eob() {
             return Ok(out_pos);
         }
 
-        if entry.is_subtable() {
-            let sub_entry = lit_table.lookup_sub(entry, bits.buffer());
-            bits.consume(sub_entry.bits());
-
-            if sub_entry.is_literal() {
-                output[out_pos] = sub_entry.symbol() as u8;
-                out_pos += 1;
-                continue;
-            }
-            if sub_entry.is_eob() {
-                return Ok(out_pos);
-            }
-            let len_idx = (sub_entry.symbol() - 257) as usize;
-            bits.ensure(16);
-            let length =
-                LEN_START[len_idx] as usize + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
-
-            let d = dist_table.lookup_main(bits.buffer());
-            bits.consume(d.bits());
-            let dist_sym = d.symbol();
-            bits.ensure(16);
-            let distance = DIST_START[dist_sym as usize] as usize
-                + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
-
-            if distance == 0 || distance > out_pos {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid distance",
-                ));
-            }
-            out_pos = copy_match_into(output, out_pos, distance, length);
-            continue;
-        }
-
         // Length code
         if entry.is_length() {
-            let len_idx = (entry.symbol() - 257) as usize;
+            let len_sym = entry.symbol();
+            if !(257..=285).contains(&len_sym) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Invalid length symbol: {} at out_pos={}", len_sym, out_pos),
+                ));
+            }
+            let len_idx = (len_sym - 257) as usize;
             bits.ensure(16);
             let length =
                 LEN_START[len_idx] as usize + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
 
-            let d = dist_table.lookup_main(bits.buffer());
-            bits.consume(d.bits());
+            let d = resolve_entry(bits, dist_table);
             let dist_sym = d.symbol();
+            if dist_sym >= 30 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "Invalid distance symbol: {} at out_pos={}",
+                        dist_sym, out_pos
+                    ),
+                ));
+            }
             bits.ensure(16);
             let distance = DIST_START[dist_sym as usize] as usize
                 + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
@@ -1468,7 +1471,7 @@ fn decode_huffman_consume_first(
             if distance == 0 || distance > out_pos {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "Invalid distance",
+                    format!("Invalid distance: {} at out_pos={}", distance, out_pos),
                 ));
             }
             out_pos = copy_match_into(output, out_pos, distance, length);
@@ -1479,8 +1482,7 @@ fn decode_huffman_consume_first(
     loop {
         bits.ensure(32);
 
-        let entry = lit_table.lookup_main(bits.buffer());
-        bits.consume(entry.bits());
+        let entry = resolve_entry(bits, lit_table);
 
         if entry.is_literal() {
             if out_pos >= out_end {
@@ -1495,33 +1497,12 @@ fn decode_huffman_consume_first(
             return Ok(out_pos);
         }
 
-        if entry.is_subtable() {
-            let sub_entry = lit_table.lookup_sub(entry, bits.buffer());
-            bits.consume(sub_entry.bits());
-
-            if sub_entry.is_literal() {
-                if out_pos >= out_end {
-                    return Err(io::Error::new(io::ErrorKind::WriteZero, "Output full"));
-                }
-                output[out_pos] = sub_entry.symbol() as u8;
-                out_pos += 1;
-                continue;
-            }
-            if sub_entry.is_eob() {
-                return Ok(out_pos);
-            }
-        }
-
-        let len_symbol = if entry.is_length() {
-            entry.symbol()
-        } else {
-            lit_table.lookup_sub(entry, bits.buffer()).symbol()
-        };
-
+        // Length code
+        let len_symbol = entry.symbol();
         if !(257..=285).contains(&len_symbol) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Invalid length code",
+                format!("Invalid length code: {}", len_symbol),
             ));
         }
 
@@ -1530,8 +1511,7 @@ fn decode_huffman_consume_first(
         let length =
             LEN_START[len_idx] as usize + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
 
-        let d = dist_table.lookup_main(bits.buffer());
-        bits.consume(d.bits());
+        let d = resolve_entry(bits, dist_table);
         let dist_sym = d.symbol();
         bits.ensure(16);
         let distance = DIST_START[dist_sym as usize] as usize
@@ -1540,7 +1520,7 @@ fn decode_huffman_consume_first(
         if distance == 0 || distance > out_pos {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Invalid distance",
+                format!("Invalid distance: {} at out_pos={}", distance, out_pos),
             ));
         }
         if out_pos + length > out_end {
@@ -2814,12 +2794,13 @@ fn copy_match_into(output: &mut [u8], out_pos: usize, distance: usize, length: u
                 s = s.add(distance);
                 d = d.add(distance);
             }
-        } else {
+        } else if distance > 0 {
             // Very short copy with small distance: byte-by-byte is fine
             for i in 0..length {
                 *dst.add(i) = *src.add(i % distance);
             }
         }
+        // distance == 0 is invalid, but we don't panic here - just skip
     }
 
     out_pos + length
@@ -5201,6 +5182,70 @@ mod optimization_tests {
         // Verify libdeflate matches original
         assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
         eprintln!("[TEST]   ✓ libdeflate matches original");
+    }
+
+    /// Debug consume-first entry types
+    #[test]
+    fn test_consume_first_entry_debug() {
+        use crate::consume_first_table::ConsumeFirstTable;
+
+        // Fixed Huffman code lengths
+        let mut lit_len_lengths = vec![0u8; 288];
+        lit_len_lengths[..144].fill(8);
+        lit_len_lengths[144..256].fill(9);
+        lit_len_lengths[256] = 7; // EOB
+        lit_len_lengths[257..280].fill(7); // Length codes
+        lit_len_lengths[280..288].fill(8);
+
+        let lit_table = ConsumeFirstTable::build(&lit_len_lengths).unwrap();
+
+        eprintln!("\n[DEBUG] ConsumeFirstTable entry types:");
+
+        // Check that literals are identified correctly
+        let mut literal_count = 0;
+        let mut length_count = 0;
+        let mut eob_count = 0;
+        let mut subtable_count = 0;
+
+        for pattern in 0..2048u64 {
+            let entry = lit_table.lookup_main(pattern);
+            if entry.is_literal() {
+                literal_count += 1;
+            } else if entry.is_length() {
+                length_count += 1;
+            } else if entry.is_eob() {
+                eob_count += 1;
+            } else if entry.is_subtable() {
+                subtable_count += 1;
+            }
+        }
+
+        eprintln!("[DEBUG]   Literals: {}", literal_count);
+        eprintln!("[DEBUG]   Lengths: {}", length_count);
+        eprintln!("[DEBUG]   EOB: {}", eob_count);
+        eprintln!("[DEBUG]   Subtables: {}", subtable_count);
+
+        // With fixed Huffman, we should have:
+        // - 8-bit literals: symbols 0-143 (but we have 11-bit table, so 2^(11-8) * 144 = 1152 entries)
+        // - 9-bit literals: symbols 144-255 (2^(11-9) * 112 = 448 entries)
+        // - 7-bit EOB (symbol 256): 2^(11-7) * 1 = 16 entries
+        // - 7-bit lengths (257-279): 2^(11-7) * 23 = 368 entries
+        // - 8-bit lengths (280-285): 2^(11-8) * 6 = 48 entries (but only 280-285 are valid)
+
+        // Check first few entries
+        for pattern in 0u64..16 {
+            let entry = lit_table.lookup_main(pattern);
+            eprintln!(
+                "[DEBUG]   Pattern {:3}: sym={:3}, bits={}, lit={}, len={}, eob={}, sub={}",
+                pattern,
+                entry.symbol(),
+                entry.bits(),
+                entry.is_literal(),
+                entry.is_length(),
+                entry.is_eob(),
+                entry.is_subtable()
+            );
+        }
     }
 
     /// Benchmark consume-first decode vs current turbo decode

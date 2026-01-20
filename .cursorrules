@@ -616,3 +616,36 @@ Consume-first table throughput: 1,003.9 M symbols/sec
 1. Build `ConsumeFirstTable` instead of `PackedLUT` in table construction
 2. Update `decode_huffman_turbo` to use consume-first pattern
 3. Expect ~40% speedup → should exceed libdeflate
+
+## Testing Best Practices
+
+### ALWAYS use timeouts for cargo test
+
+Tests can hang due to infinite loops in decode paths. ALWAYS use timeouts:
+
+```bash
+# Good - with timeout (30 seconds max)
+timeout 30 cargo test --release test_name -- --nocapture 2>&1 | tail -20
+
+# Bad - can hang forever
+cargo test --release test_name -- --nocapture
+```
+
+### Test command patterns
+
+```bash
+# Single test with timeout
+timeout 30 cargo test --release test_specific_test -- --nocapture 2>&1 | tail -20
+
+# All tests with timeout (use longer timeout)
+timeout 120 cargo test --release 2>&1 | tail -10
+
+# Tests with specific feature
+timeout 30 cargo test --release --features consume_first test_name -- --nocapture 2>&1 | tail -20
+```
+
+### Known causes of test hangs
+
+1. **Infinite decode loops**: Corrupted bit buffer state causes decode to never find EOB
+2. **Subtable bugs**: Not handling subtable entries causes wrong bit consumption
+3. **consume_first feature**: New experimental path, may have bugs - test carefully
