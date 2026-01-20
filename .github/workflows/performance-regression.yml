@@ -9,18 +9,18 @@
 #
 # Performance expectations:
 # - vs pigz/gzip: MUST be faster (ratio > 1.0)
-# - vs rapidgzip: Must be within ±1% (ratio 0.99-1.01)
-# - vs igzip: MUST be >= 90% speed (0.90x)
+# - vs rapidgzip: Must be within ±1% (ratio >= 0.99)
+# - vs igzip: MUST be >= 90% speed (ratio >= 0.90)
 #
 # NOTE: Thread counts and compression levels are tested in ci.yml (edge-cases)
 # =============================================================================
+
 name: Performance Guards
 
 on:
-  push:
-    branches: ["*"]
   pull_request:
-    branches: ["*"]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -29,350 +29,14 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_HOME: ~/.cargo
+  CARGO_INCREMENTAL: 0
 
 jobs:
-  # ============================================================================
-  # Pure Rust Performance Advantages - These MUST be maintained
-  # ============================================================================
-  bgzf-parallel:
-    name: "Guard: BGZF faster than pigz"
+  # Build all tools once, share via cache
+  build:
+    name: Build Tools
     runs-on: ubuntu-latest
-    
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential zlib1g-dev
-
-      - name: Build tools
-        run: |
-          cargo build --release
-          make -C pigz
-
-      - name: Compare BGZF decompression
-        run: |
-          echo "## BGZF: gzippy vs pigz" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Adaptive benchmarking parameters
-          MIN_TRIALS=10
-          MAX_TRIALS=30
-          TARGET_CV=0.05
-          
-          # Create test data
-          python3 -c "
-          import random
-          random.seed(42)
-          with open('/tmp/test.txt', 'w') as f:
-              for _ in range(200000):
-                  f.write(''.join(random.choices('abcdefghij', k=100)) + '\n')
-          "
-          
-          # Compress with gzippy (creates BGZF-compatible output)
-          ./target/release/gzippy -1 -c /tmp/test.txt > /tmp/test.gz
-          SIZE=$(stat -c%s /tmp/test.txt)
-          
-          # Adaptive benchmark function
-          benchmark_tool() {
-            local cmd="$1"
-            local times=""
-            local trial=0
-            
-            # Warmup
-            eval "$cmd" > /dev/null 2>&1
-            
-            while [ $trial -lt $MAX_TRIALS ]; do
-              trial=$((trial + 1))
-              START=$(date +%s.%N)
-              eval "$cmd" > /dev/null
-              END=$(date +%s.%N)
-              t=$(echo "$END - $START" | bc -l)
-              times="$times $t"
-              
-              if [ $trial -ge $MIN_TRIALS ]; then
-                cv=$(echo "$times" | python3 -c "
-          import sys, statistics
-          times = [float(x) for x in sys.stdin.read().split() if x]
-          mean = statistics.mean(times)
-          stdev = statistics.stdev(times) if len(times) > 1 else 0
-          print(f'{stdev/mean:.4f}' if mean > 0 else '1')
-          ")
-                if python3 -c "exit(0 if $cv < $TARGET_CV else 1)"; then
-                  break
-                fi
-              fi
-            done
-            
-            echo "$times" | python3 -c "
-          import sys, statistics
-          times = [float(x) for x in sys.stdin.read().split() if x]
-          mean = statistics.mean(times)
-          print(f'{mean:.6f} {len(times)}')"
-          }
-          
-          # Test gzippy
-          read GZIPPY_TIME GZIPPY_TRIALS <<< $(benchmark_tool "./target/release/gzippy -d < /tmp/test.gz > /tmp/out.txt")
-          GZIPPY_SPEED=$(echo "$SIZE / $GZIPPY_TIME / 1000000" | bc -l)
-          
-          # Test pigz
-          read PIGZ_TIME PIGZ_TRIALS <<< $(benchmark_tool "./pigz/unpigz -c /tmp/test.gz > /tmp/out.txt")
-          PIGZ_SPEED=$(echo "$SIZE / $PIGZ_TIME / 1000000" | bc -l)
-          
-          # Verify correctness
-          ./target/release/gzippy -d < /tmp/test.gz > /tmp/out.txt
-          diff /tmp/test.txt /tmp/out.txt
-          
-          RATIO=$(echo "$GZIPPY_SPEED / $PIGZ_SPEED" | bc -l)
-          
-          echo "| Tool | Speed (MB/s) | Trials |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
-          printf "| gzippy | %.0f | %d |\n" "$GZIPPY_SPEED" "$GZIPPY_TRIALS" >> $GITHUB_STEP_SUMMARY
-          printf "| pigz | %.0f | %d |\n" "$PIGZ_SPEED" "$PIGZ_TRIALS" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          printf "**Ratio**: gzippy is %.2fx of pigz\n" "$RATIO" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Must be faster than pigz (ratio > 1.0 required)
-          if awk "BEGIN {exit !($RATIO >= 1.0)}"; then
-            echo "✅ **PASS**: gzippy is faster than pigz on BGZF" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ **FAIL**: gzippy slower than pigz on BGZF (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
-            echo "   We must always beat pigz. This is a regression." >> $GITHUB_STEP_SUMMARY
-            exit 1
-          fi
-
-  multi-member-parallel:
-    name: "Guard: Multi-member faster than pigz"
-    runs-on: ubuntu-latest
-    
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential zlib1g-dev
-
-      - name: Build tools
-        run: |
-          cargo build --release
-          make -C pigz
-
-      - name: Compare multi-member decompression
-        run: |
-          echo "## Multi-member: gzippy vs pigz" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Adaptive benchmarking parameters
-          MIN_TRIALS=10
-          MAX_TRIALS=30
-          TARGET_CV=0.05
-          
-          # Create test data
-          python3 -c "
-          import random
-          random.seed(42)
-          with open('/tmp/test.txt', 'w') as f:
-              for _ in range(100000):
-                  f.write(''.join(random.choices('abcdefghij', k=100)) + '\n')
-          "
-          
-          # Compress with pigz (creates multi-member gzip)
-          ./pigz/pigz -p4 -c /tmp/test.txt > /tmp/test-pigz.gz
-          SIZE=$(stat -c%s /tmp/test.txt)
-          
-          # Adaptive benchmark function
-          benchmark_tool() {
-            local cmd="$1"
-            local times=""
-            local trial=0
-            
-            eval "$cmd" > /dev/null 2>&1  # warmup
-            
-            while [ $trial -lt $MAX_TRIALS ]; do
-              trial=$((trial + 1))
-              START=$(date +%s.%N)
-              eval "$cmd" > /dev/null
-              END=$(date +%s.%N)
-              t=$(echo "$END - $START" | bc -l)
-              times="$times $t"
-              
-              if [ $trial -ge $MIN_TRIALS ]; then
-                cv=$(echo "$times" | python3 -c "
-          import sys, statistics
-          times = [float(x) for x in sys.stdin.read().split() if x]
-          mean = statistics.mean(times)
-          stdev = statistics.stdev(times) if len(times) > 1 else 0
-          print(f'{stdev/mean:.4f}' if mean > 0 else '1')
-          ")
-                if python3 -c "exit(0 if $cv < $TARGET_CV else 1)"; then
-                  break
-                fi
-              fi
-            done
-            
-            echo "$times" | python3 -c "
-          import sys, statistics
-          times = [float(x) for x in sys.stdin.read().split() if x]
-          mean = statistics.mean(times)
-          print(f'{mean:.6f} {len(times)}')"
-          }
-          
-          # Test gzippy
-          read GZIPPY_TIME GZIPPY_TRIALS <<< $(benchmark_tool "./target/release/gzippy -d < /tmp/test-pigz.gz > /tmp/out.txt")
-          GZIPPY_SPEED=$(echo "$SIZE / $GZIPPY_TIME / 1000000" | bc -l)
-          
-          # Test pigz
-          read PIGZ_TIME PIGZ_TRIALS <<< $(benchmark_tool "./pigz/unpigz -c /tmp/test-pigz.gz > /tmp/out.txt")
-          PIGZ_SPEED=$(echo "$SIZE / $PIGZ_TIME / 1000000" | bc -l)
-          
-          # Verify correctness
-          ./target/release/gzippy -d < /tmp/test-pigz.gz > /tmp/out.txt
-          diff /tmp/test.txt /tmp/out.txt
-          
-          RATIO=$(echo "$GZIPPY_SPEED / $PIGZ_SPEED" | bc -l)
-          
-          echo "| Tool | Speed (MB/s) | Trials |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
-          printf "| gzippy | %.0f | %d |\n" "$GZIPPY_SPEED" "$GZIPPY_TRIALS" >> $GITHUB_STEP_SUMMARY
-          printf "| pigz | %.0f | %d |\n" "$PIGZ_SPEED" "$PIGZ_TRIALS" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          printf "**Ratio**: gzippy is %.2fx of pigz\n" "$RATIO" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Must be faster than pigz (ratio > 1.0 required)
-          if awk "BEGIN {exit !($RATIO >= 1.0)}"; then
-            echo "✅ **PASS**: gzippy is faster than pigz on multi-member" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ **FAIL**: gzippy slower than pigz on multi-member (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
-            echo "   We must always beat pigz. This is a regression." >> $GITHUB_STEP_SUMMARY
-            exit 1
-          fi
-
-  single-member-gzip:
-    name: "Guard: Single-member faster than gzip"
-    runs-on: ubuntu-latest
-    
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Compare single-member decompression
-        run: |
-          echo "## Single-member: gzippy vs gzip" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Adaptive benchmarking parameters
-          MIN_TRIALS=10
-          MAX_TRIALS=30
-          TARGET_CV=0.05
-          
-          # Create test data
-          python3 -c "
-          import random
-          random.seed(42)
-          with open('/tmp/test.txt', 'w') as f:
-              for _ in range(100000):
-                  f.write(''.join(random.choices('abcdefghij', k=100)) + '\n')
-          "
-          
-          # Compress with gzip (single-member)
-          gzip -c /tmp/test.txt > /tmp/test-gzip.gz
-          SIZE=$(stat -c%s /tmp/test.txt)
-          
-          cargo build --release
-          
-          # Adaptive benchmark function
-          benchmark_tool() {
-            local cmd="$1"
-            local times=""
-            local trial=0
-            
-            eval "$cmd" > /dev/null 2>&1  # warmup
-            
-            while [ $trial -lt $MAX_TRIALS ]; do
-              trial=$((trial + 1))
-              START=$(date +%s.%N)
-              eval "$cmd" > /dev/null
-              END=$(date +%s.%N)
-              t=$(echo "$END - $START" | bc -l)
-              times="$times $t"
-              
-              if [ $trial -ge $MIN_TRIALS ]; then
-                cv=$(echo "$times" | python3 -c "
-          import sys, statistics
-          times = [float(x) for x in sys.stdin.read().split() if x]
-          mean = statistics.mean(times)
-          stdev = statistics.stdev(times) if len(times) > 1 else 0
-          print(f'{stdev/mean:.4f}' if mean > 0 else '1')
-          ")
-                if python3 -c "exit(0 if $cv < $TARGET_CV else 1)"; then
-                  break
-                fi
-              fi
-            done
-            
-            echo "$times" | python3 -c "
-          import sys, statistics
-          times = [float(x) for x in sys.stdin.read().split() if x]
-          mean = statistics.mean(times)
-          print(f'{mean:.6f} {len(times)}')"
-          }
-          
-          # Test gzippy
-          read GZIPPY_TIME GZIPPY_TRIALS <<< $(benchmark_tool "./target/release/gzippy -d < /tmp/test-gzip.gz > /tmp/out.txt")
-          GZIPPY_SPEED=$(echo "$SIZE / $GZIPPY_TIME / 1000000" | bc -l)
-          
-          # Test gzip
-          read GZIP_TIME GZIP_TRIALS <<< $(benchmark_tool "gzip -d -c /tmp/test-gzip.gz > /tmp/out.txt")
-          GZIP_SPEED=$(echo "$SIZE / $GZIP_TIME / 1000000" | bc -l)
-          
-          # Verify correctness
-          ./target/release/gzippy -d < /tmp/test-gzip.gz > /tmp/out.txt
-          diff /tmp/test.txt /tmp/out.txt
-          
-          RATIO=$(echo "$GZIPPY_SPEED / $GZIP_SPEED" | bc -l)
-          
-          echo "| Tool | Speed (MB/s) | Trials |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
-          printf "| gzippy | %.0f | %d |\n" "$GZIPPY_SPEED" "$GZIPPY_TRIALS" >> $GITHUB_STEP_SUMMARY
-          printf "| gzip | %.0f | %d |\n" "$GZIP_SPEED" "$GZIP_TRIALS" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          printf "**Ratio**: gzippy is %.2fx of gzip\n" "$RATIO" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Must be faster than gzip (ratio > 1.0 required)
-          if awk "BEGIN {exit !($RATIO >= 1.0)}"; then
-            echo "✅ **PASS**: gzippy is faster than gzip" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "❌ **FAIL**: gzippy slower than gzip (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
-            echo "   We must always beat gzip. This is a regression." >> $GITHUB_STEP_SUMMARY
-            exit 1
-          fi
-
-  # ============================================================================
-  # Guard: Must beat rapidgzip on multi-member files
-  # ============================================================================
-  vs-rapidgzip:
-    name: "Guard: Within 1% of rapidgzip (multi-member)"
-    runs-on: ubuntu-latest
-    
     steps:
       - uses: actions/checkout@v4
         with:
@@ -386,383 +50,260 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Build tools
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-guards-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build gzippy
+        run: cargo build --release
+
+      - name: Build pigz
+        run: make -C pigz
+
+      - name: Build rapidgzip
         run: |
-          cargo build --release
-          make -C pigz
-          
-          # Build rapidgzip
           cd rapidgzip/librapidarchive
           mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_ISAL=OFF
-          make -j$(nproc) rapidgzip || echo "rapidgzip build failed"
+          make -j$(nproc) rapidgzip || echo "rapidgzip build failed (optional)"
 
-      - name: Compare gzippy vs rapidgzip
+      - name: Build igzip
         run: |
-          echo "## gzippy vs rapidgzip (Multi-member)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Adaptive benchmarking parameters
-          MIN_TRIALS=10
-          MAX_TRIALS=30
-          TARGET_CV=0.05
-          
-          # Create test data
-          python3 -c "
-          import random
-          random.seed(42)
-          with open('/tmp/test.txt', 'w') as f:
-              for _ in range(200000):
-                  f.write(''.join(random.choices('abcdefghij', k=100)) + '\n')
-          "
-          
-          # Compress with pigz (creates multi-member gzip)
-          ./pigz/pigz -p4 -c /tmp/test.txt > /tmp/test-pigz.gz
-          SIZE=$(stat -c%s /tmp/test.txt)
-          CORES=$(nproc)
-          
-          # Adaptive benchmark function
-          benchmark_tool() {
-            local cmd="$1"
-            local times=""
-            local trial=0
-            
-            eval "$cmd" > /dev/null 2>&1  # warmup
-            
-            while [ $trial -lt $MAX_TRIALS ]; do
-              trial=$((trial + 1))
-              START=$(date +%s.%N)
-              eval "$cmd" > /dev/null 2>&1
-              END=$(date +%s.%N)
-              t=$(echo "$END - $START" | bc -l)
-              times="$times $t"
-              
-              if [ $trial -ge $MIN_TRIALS ]; then
-                cv=$(echo "$times" | python3 -c "
-          import sys, statistics
-          times = [float(x) for x in sys.stdin.read().split() if x]
-          mean = statistics.mean(times)
-          stdev = statistics.stdev(times) if len(times) > 1 else 0
-          print(f'{stdev/mean:.4f}' if mean > 0 else '1')
-          ")
-                if python3 -c "exit(0 if $cv < $TARGET_CV else 1)"; then
-                  break
-                fi
-              fi
-            done
-            
-            echo "$times" | python3 -c "
-          import sys, statistics
-          times = [float(x) for x in sys.stdin.read().split() if x]
-          mean = statistics.mean(times)
-          print(f'{mean:.6f} {len(times)}')"
-          }
-          
-          # Test gzippy
-          read GZIPPY_TIME GZIPPY_TRIALS <<< $(benchmark_tool "./target/release/gzippy -d < /tmp/test-pigz.gz > /tmp/out.txt")
-          GZIPPY_SPEED=$(echo "$SIZE / $GZIPPY_TIME / 1000000" | bc -l)
-          
-          # Test rapidgzip (if available)
-          RAPIDGZIP_BIN="rapidgzip/librapidarchive/build/tools/rapidgzip"
-          if [ -x "$RAPIDGZIP_BIN" ]; then
-            read RAPIDGZIP_TIME RAPIDGZIP_TRIALS <<< $(benchmark_tool "$RAPIDGZIP_BIN -d -P $CORES < /tmp/test-pigz.gz > /tmp/out.txt")
-            RAPIDGZIP_SPEED=$(echo "$SIZE / $RAPIDGZIP_TIME / 1000000" | bc -l)
-            
-            RATIO=$(echo "$GZIPPY_SPEED / $RAPIDGZIP_SPEED" | bc -l)
-            
-            echo "| Tool | Speed (MB/s) | Trials |" >> $GITHUB_STEP_SUMMARY
-            echo "|------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
-            printf "| gzippy | %.0f | %d |\n" "$GZIPPY_SPEED" "$GZIPPY_TRIALS" >> $GITHUB_STEP_SUMMARY
-            printf "| rapidgzip | %.0f | %d |\n" "$RAPIDGZIP_SPEED" "$RAPIDGZIP_TRIALS" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            printf "**Ratio**: gzippy is %.2fx of rapidgzip\n" "$RATIO" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            
-            # Must be within ±1% of rapidgzip (0.99-1.01)
-            if awk "BEGIN {exit !($RATIO >= 0.99)}"; then
-              echo "✅ **PASS**: gzippy matches rapidgzip (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "❌ **FAIL**: gzippy is >1% slower than rapidgzip (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
-              echo "   Expected: within ±1% of rapidgzip speed" >> $GITHUB_STEP_SUMMARY
-              exit 1
-            fi
-          else
-            echo "⚠️ rapidgzip not available, skipping comparison" >> $GITHUB_STEP_SUMMARY
-            printf "gzippy speed: %.0f MB/s\n" "$GZIPPY_SPEED" >> $GITHUB_STEP_SUMMARY
-          fi
-
-  # ============================================================================
-  # Guard: Must beat rapidgzip on single-member (gzip) files too
-  # ============================================================================
-  vs-rapidgzip-single:
-    name: "Guard: Within 1% of rapidgzip (single-member)"
-    runs-on: ubuntu-latest
-    
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake nasm zlib1g-dev
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build tools
-        run: |
-          cargo build --release
-          
-          # Build rapidgzip
-          cd rapidgzip/librapidarchive
-          mkdir -p build && cd build
-          cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_ISAL=OFF
-          make -j$(nproc) rapidgzip || echo "rapidgzip build failed"
-
-      - name: Compare on single-member gzip file
-        run: |
-          echo "## gzippy vs rapidgzip (Single-member)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Adaptive benchmarking parameters
-          MIN_TRIALS=10
-          MAX_TRIALS=30
-          TARGET_CV=0.05
-          
-          # Create test data
-          python3 -c "
-          import random
-          random.seed(42)
-          with open('/tmp/test.txt', 'w') as f:
-              for _ in range(200000):
-                  f.write(''.join(random.choices('abcdefghij', k=100)) + '\n')
-          "
-          
-          # Compress with standard gzip (creates single-member)
-          gzip -c /tmp/test.txt > /tmp/test-gzip.gz
-          SIZE=$(stat -c%s /tmp/test.txt)
-          CORES=$(nproc)
-          
-          # Adaptive benchmark function
-          benchmark_tool() {
-            local cmd="$1"
-            local times=""
-            local trial=0
-            
-            eval "$cmd" > /dev/null 2>&1  # warmup
-            
-            while [ $trial -lt $MAX_TRIALS ]; do
-              trial=$((trial + 1))
-              START=$(date +%s.%N)
-              eval "$cmd" > /dev/null 2>&1
-              END=$(date +%s.%N)
-              t=$(echo "$END - $START" | bc -l)
-              times="$times $t"
-              
-              if [ $trial -ge $MIN_TRIALS ]; then
-                cv=$(echo "$times" | python3 -c "
-          import sys, statistics
-          times = [float(x) for x in sys.stdin.read().split() if x]
-          mean = statistics.mean(times)
-          stdev = statistics.stdev(times) if len(times) > 1 else 0
-          print(f'{stdev/mean:.4f}' if mean > 0 else '1')
-          ")
-                if python3 -c "exit(0 if $cv < $TARGET_CV else 1)"; then
-                  break
-                fi
-              fi
-            done
-            
-            echo "$times" | python3 -c "
-          import sys, statistics
-          times = [float(x) for x in sys.stdin.read().split() if x]
-          mean = statistics.mean(times)
-          print(f'{mean:.6f} {len(times)}')"
-          }
-          
-          # Test gzippy
-          read GZIPPY_TIME GZIPPY_TRIALS <<< $(benchmark_tool "./target/release/gzippy -d < /tmp/test-gzip.gz > /tmp/out.txt")
-          GZIPPY_SPEED=$(echo "$SIZE / $GZIPPY_TIME / 1000000" | bc -l)
-          
-          # Test rapidgzip (if available)
-          RAPIDGZIP_BIN="rapidgzip/librapidarchive/build/tools/rapidgzip"
-          if [ -x "$RAPIDGZIP_BIN" ]; then
-            read RAPIDGZIP_TIME RAPIDGZIP_TRIALS <<< $(benchmark_tool "$RAPIDGZIP_BIN -d -P $CORES < /tmp/test-gzip.gz > /tmp/out.txt")
-            RAPIDGZIP_SPEED=$(echo "$SIZE / $RAPIDGZIP_TIME / 1000000" | bc -l)
-            
-            RATIO=$(echo "$GZIPPY_SPEED / $RAPIDGZIP_SPEED" | bc -l)
-            
-            echo "| Tool | Speed (MB/s) | Trials |" >> $GITHUB_STEP_SUMMARY
-            echo "|------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
-            printf "| gzippy | %.0f | %d |\n" "$GZIPPY_SPEED" "$GZIPPY_TRIALS" >> $GITHUB_STEP_SUMMARY
-            printf "| rapidgzip | %.0f | %d |\n" "$RAPIDGZIP_SPEED" "$RAPIDGZIP_TRIALS" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            printf "**Ratio**: gzippy is %.2fx of rapidgzip\n" "$RATIO" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            
-            # Must be within ±1% of rapidgzip (0.99-1.01)
-            if awk "BEGIN {exit !($RATIO >= 0.99)}"; then
-              echo "✅ **PASS**: gzippy matches rapidgzip on single-member (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "❌ **FAIL**: gzippy is >1% slower than rapidgzip (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
-              echo "   Expected: within ±1% of rapidgzip speed" >> $GITHUB_STEP_SUMMARY
-              exit 1
-            fi
-          else
-            echo "⚠️ rapidgzip not available, skipping comparison" >> $GITHUB_STEP_SUMMARY
-            printf "gzippy speed: %.0f MB/s\n" "$GZIPPY_SPEED" >> $GITHUB_STEP_SUMMARY
-          fi
-
-  # ============================================================================
-  # Guard: Must beat igzip on single-threaded decompression
-  # ============================================================================
-  vs-igzip:
-    name: "Guard: Faster than igzip (single-threaded)"
-    runs-on: ubuntu-latest
-    
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: true
-
-      - name: Install dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake nasm zlib1g-dev
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Build tools
-        run: |
-          cargo build --release
-          
-          # Build igzip
           cd isa-l
           mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc) igzip || echo "igzip build failed"
+          make -j$(nproc) igzip || echo "igzip build failed (optional)"
 
-      - name: Compare gzippy vs igzip
-        run: |
-          echo "## gzippy vs igzip (Single-threaded)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          # Adaptive benchmarking parameters
-          MIN_TRIALS=10
-          MAX_TRIALS=30
-          TARGET_CV=0.05
-          
-          # Create test data
-          python3 -c "
-          import random
-          random.seed(42)
-          with open('/tmp/test.txt', 'w') as f:
-              for _ in range(200000):
-                  f.write(''.join(random.choices('abcdefghij', k=100)) + '\n')
-          "
-          
-          # Compress with gzip
-          gzip -c /tmp/test.txt > /tmp/test.gz
-          SIZE=$(stat -c%s /tmp/test.txt)
-          
-          # Adaptive benchmark function
-          benchmark_tool() {
-            local cmd="$1"
-            local times=""
-            local trial=0
-            
-            eval "$cmd" > /dev/null 2>&1  # warmup
-            
-            while [ $trial -lt $MAX_TRIALS ]; do
-              trial=$((trial + 1))
-              START=$(date +%s.%N)
-              eval "$cmd" > /dev/null 2>&1
-              END=$(date +%s.%N)
-              t=$(echo "$END - $START" | bc -l)
-              times="$times $t"
-              
-              if [ $trial -ge $MIN_TRIALS ]; then
-                cv=$(echo "$times" | python3 -c "
-          import sys, statistics
-          times = [float(x) for x in sys.stdin.read().split() if x]
-          mean = statistics.mean(times)
-          stdev = statistics.stdev(times) if len(times) > 1 else 0
-          print(f'{stdev/mean:.4f}' if mean > 0 else '1')
-          ")
-                if python3 -c "exit(0 if $cv < $TARGET_CV else 1)"; then
-                  break
-                fi
-              fi
-            done
-            
-            echo "$times" | python3 -c "
-          import sys, statistics
-          times = [float(x) for x in sys.stdin.read().split() if x]
-          mean = statistics.mean(times)
-          print(f'{mean:.6f} {len(times)}')"
-          }
-          
-          # Test gzippy (single-threaded)
-          read GZIPPY_TIME GZIPPY_TRIALS <<< $(benchmark_tool "./target/release/gzippy -d -p1 < /tmp/test.gz > /tmp/out.txt")
-          GZIPPY_SPEED=$(echo "$SIZE / $GZIPPY_TIME / 1000000" | bc -l)
-          
-          # Test igzip (if available)
-          IGZIP_BIN="isa-l/build/bin/igzip"
-          if [ -x "$IGZIP_BIN" ]; then
-            read IGZIP_TIME IGZIP_TRIALS <<< $(benchmark_tool "$IGZIP_BIN -d < /tmp/test.gz > /tmp/out.txt")
-            IGZIP_SPEED=$(echo "$SIZE / $IGZIP_TIME / 1000000" | bc -l)
-            
-            RATIO=$(echo "$GZIPPY_SPEED / $IGZIP_SPEED" | bc -l)
-            
-            echo "| Tool | Speed (MB/s) | Trials |" >> $GITHUB_STEP_SUMMARY
-            echo "|------|-------------|--------|" >> $GITHUB_STEP_SUMMARY
-            printf "| gzippy (1 thread) | %.0f | %d |\n" "$GZIPPY_SPEED" "$GZIPPY_TRIALS" >> $GITHUB_STEP_SUMMARY
-            printf "| igzip | %.0f | %d |\n" "$IGZIP_SPEED" "$IGZIP_TRIALS" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            printf "**Ratio**: gzippy is %.2fx of igzip\n" "$RATIO" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            
-            # Must be at least 90% of igzip speed (igzip is hand-tuned assembly)
-            if awk "BEGIN {exit !($RATIO >= 0.90)}"; then
-              echo "✅ **PASS**: gzippy competitive with igzip (≥90%)" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "❌ **FAIL**: gzippy too slow vs igzip (${RATIO}x, need ≥0.90)" >> $GITHUB_STEP_SUMMARY
-              exit 1
-            fi
-          else
-            echo "⚠️ igzip not available, skipping comparison" >> $GITHUB_STEP_SUMMARY
-            printf "gzippy speed: %.0f MB/s\n" "$GZIPPY_SPEED" >> $GITHUB_STEP_SUMMARY
-          fi
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-tools
+          path: |
+            target/release/gzippy
+            pigz/pigz
+            pigz/unpigz
+            rapidgzip/librapidarchive/build/tools/rapidgzip
+            isa-l/build/bin/igzip
+          retention-days: 1
 
   # ============================================================================
-  # Summary of all performance regression tests
+  # Guard: BGZF decompression vs pigz
+  # ============================================================================
+  bgzf:
+    name: "Guard: BGZF faster than pigz"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download tools
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-tools
+          path: tools
+
+      - name: Setup tools
+        run: |
+          chmod +x tools/target/release/gzippy
+          chmod +x tools/pigz/pigz tools/pigz/unpigz
+
+      - name: Run benchmark
+        run: |
+          python3 scripts/benchmark_guard.py \
+            --type bgzf \
+            --gzippy tools/target/release/gzippy \
+            --pigz tools/pigz/pigz \
+            --unpigz tools/pigz/unpigz
+
+  # ============================================================================
+  # Guard: Multi-member decompression vs pigz
+  # ============================================================================
+  multi-member:
+    name: "Guard: Multi-member faster than pigz"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download tools
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-tools
+          path: tools
+
+      - name: Setup tools
+        run: |
+          chmod +x tools/target/release/gzippy
+          chmod +x tools/pigz/pigz tools/pigz/unpigz
+
+      - name: Run benchmark
+        run: |
+          python3 scripts/benchmark_guard.py \
+            --type multi-member \
+            --gzippy tools/target/release/gzippy \
+            --pigz tools/pigz/pigz \
+            --unpigz tools/pigz/unpigz
+
+  # ============================================================================
+  # Guard: Single-member decompression vs gzip
+  # ============================================================================
+  single-member:
+    name: "Guard: Single-member faster than gzip"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download tools
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-tools
+          path: tools
+
+      - name: Setup tools
+        run: chmod +x tools/target/release/gzippy
+
+      - name: Run benchmark
+        run: |
+          python3 scripts/benchmark_guard.py \
+            --type single-member \
+            --gzippy tools/target/release/gzippy
+
+  # ============================================================================
+  # Guard: vs rapidgzip on multi-member files
+  # ============================================================================
+  vs-rapidgzip-multi:
+    name: "Guard: Within 1% of rapidgzip (multi-member)"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download tools
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-tools
+          path: tools
+
+      - name: Setup tools
+        run: |
+          chmod +x tools/target/release/gzippy
+          chmod +x tools/pigz/pigz tools/pigz/unpigz
+          [ -f tools/rapidgzip/librapidarchive/build/tools/rapidgzip ] && chmod +x tools/rapidgzip/librapidarchive/build/tools/rapidgzip || true
+
+      - name: Run benchmark
+        run: |
+          RAPIDGZIP=""
+          if [ -f tools/rapidgzip/librapidarchive/build/tools/rapidgzip ]; then
+            RAPIDGZIP="--rapidgzip tools/rapidgzip/librapidarchive/build/tools/rapidgzip"
+          fi
+          python3 scripts/benchmark_guard.py \
+            --type rapidgzip-multi \
+            --gzippy tools/target/release/gzippy \
+            --pigz tools/pigz/pigz \
+            $RAPIDGZIP
+
+  # ============================================================================
+  # Guard: vs rapidgzip on single-member files
+  # ============================================================================
+  vs-rapidgzip-single:
+    name: "Guard: Within 1% of rapidgzip (single-member)"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download tools
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-tools
+          path: tools
+
+      - name: Setup tools
+        run: |
+          chmod +x tools/target/release/gzippy
+          [ -f tools/rapidgzip/librapidarchive/build/tools/rapidgzip ] && chmod +x tools/rapidgzip/librapidarchive/build/tools/rapidgzip || true
+
+      - name: Run benchmark
+        run: |
+          RAPIDGZIP=""
+          if [ -f tools/rapidgzip/librapidarchive/build/tools/rapidgzip ]; then
+            RAPIDGZIP="--rapidgzip tools/rapidgzip/librapidarchive/build/tools/rapidgzip"
+          fi
+          python3 scripts/benchmark_guard.py \
+            --type rapidgzip-single \
+            --gzippy tools/target/release/gzippy \
+            $RAPIDGZIP
+
+  # ============================================================================
+  # Guard: vs igzip on single-threaded decompression
+  # ============================================================================
+  vs-igzip:
+    name: "Guard: >= 90% of igzip (single-threaded)"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download tools
+        uses: actions/download-artifact@v4
+        with:
+          name: benchmark-tools
+          path: tools
+
+      - name: Setup tools
+        run: |
+          chmod +x tools/target/release/gzippy
+          [ -f tools/isa-l/build/bin/igzip ] && chmod +x tools/isa-l/build/bin/igzip || true
+
+      - name: Run benchmark
+        run: |
+          IGZIP=""
+          if [ -f tools/isa-l/build/bin/igzip ]; then
+            IGZIP="--igzip tools/isa-l/build/bin/igzip"
+          fi
+          python3 scripts/benchmark_guard.py \
+            --type igzip \
+            --gzippy tools/target/release/gzippy \
+            $IGZIP
+
+  # ============================================================================
+  # Summary of all performance guard results
   # ============================================================================
   summary:
     name: Guards Summary
+    needs: [bgzf, multi-member, single-member, vs-rapidgzip-multi, vs-rapidgzip-single, vs-igzip]
     runs-on: ubuntu-latest
-    needs: [bgzf-parallel, multi-member-parallel, single-member-gzip, vs-rapidgzip, vs-rapidgzip-single, vs-igzip]
     if: always()
-    
     steps:
-      - name: Generate overall summary
+      - name: Check results
         run: |
-          echo "## 🏁 Performance Guards Summary" >> $GITHUB_STEP_SUMMARY
+          echo "## Performance Guards Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "These guards enforce hard performance thresholds. CI fails on regression." >> $GITHUB_STEP_SUMMARY
+          echo "| Guard | Target | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| BGZF vs pigz | Must be faster (>1.0x) | ${{ needs.bgzf.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Multi-member vs pigz | Must be faster (>1.0x) | ${{ needs.multi-member.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Single-member vs gzip | Must be faster (>1.0x) | ${{ needs.single-member.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| vs rapidgzip (multi) | Within ±1% (>=0.99x) | ${{ needs.vs-rapidgzip-multi.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| vs rapidgzip (single) | Within ±1% (>=0.99x) | ${{ needs.vs-rapidgzip-single.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| vs igzip | >= 90% speed (>=0.90x) | ${{ needs.vs-igzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Guard | Threshold | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|-----------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| BGZF vs pigz | Must be faster (>1.0x) | ${{ needs.bgzf-parallel.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Multi-member vs pigz | Must be faster (>1.0x) | ${{ needs.multi-member-parallel.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Single-member vs gzip | Must be faster (>1.0x) | ${{ needs.single-member-gzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| vs rapidgzip (multi) | Within ±1% (0.99x) | ${{ needs.vs-rapidgzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| vs rapidgzip (single) | Within ±1% (0.99x) | ${{ needs.vs-rapidgzip-single.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| vs igzip | >= 90% speed (0.90x) | ${{ needs.vs-igzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Note**: Thread counts and compression levels are tested for correctness" >> $GITHUB_STEP_SUMMARY
-          echo "in the Build & Test workflow (edge-cases job)." >> $GITHUB_STEP_SUMMARY
+          
+          # Fail if any guard failed
+          if [ "${{ needs.bgzf.result }}" != "success" ] || \
+             [ "${{ needs.multi-member.result }}" != "success" ] || \
+             [ "${{ needs.single-member.result }}" != "success" ] || \
+             [ "${{ needs.vs-rapidgzip-multi.result }}" != "success" ] || \
+             [ "${{ needs.vs-rapidgzip-single.result }}" != "success" ] || \
+             [ "${{ needs.vs-igzip.result }}" != "success" ]; then
+            echo "❌ **Some guards failed. See individual job logs.**" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          
+          echo "✅ **All performance guards passed!**" >> $GITHUB_STEP_SUMMARY
