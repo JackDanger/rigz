@@ -90,7 +90,24 @@ Layer all optimizations together:
 |------|---------|------------|-----------------|-------------|
 | Jan 2026 | v1 | 618 MB/s | 45% | Initial libdeflate-compatible decode |
 | Jan 2026 | v2 | 773 MB/s | 55.6% | Unsafe optimizations (unchecked, pointers) |
-| Jan 2026 | v3 | TBD | TBD | Double-literal cache |
+| Jan 2026 | v3 | 778 MB/s | 55% | Double-literal cache built (not yet integrated) |
+
+## Lessons Learned
+
+### Preload-Before-Write Complexity
+The libdeflate preload pattern (preload next entry before writing current) is complex to 
+implement correctly in Rust due to control flow:
+- When entry2/entry3 are non-literals, we need to fall through to length handling
+- But saved_bitbuf must be preserved from the right point for extra bit extraction
+- The attempt caused "Invalid distance" errors due to incorrect saved_bitbuf state
+
+**Solution**: Keep the simpler unrolled loop that doesn't fall through, or restructure
+the entire decode loop to match libdeflate's exact control flow.
+
+### Double-Literal Cache Limitations
+- 16-bit cache = 256KB, only beneficial for fixed Huffman blocks
+- Dynamic blocks would need per-block cache building (expensive)
+- 31% double-literal hit rate on fixed Huffman is promising but silesia is mostly dynamic
 
 ## Reference Implementations
 
