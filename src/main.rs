@@ -17,6 +17,7 @@ mod decompression;
 mod error;
 mod fast_inflate;
 mod format;
+mod hyper_parallel;
 mod inflate_tables;
 mod isal;
 mod libdeflate_ext;
