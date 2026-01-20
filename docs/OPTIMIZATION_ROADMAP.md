@@ -1,405 +1,267 @@
-# Optimization Roadmap: Beating libdeflate
+# gzippy Optimization Roadmap
 
-**Current Status**: 667 MB/s (54% of libdeflate's 1239 MB/s)
-**Target**: 1400+ MB/s (115% of libdeflate)
+**Mission: Exceed the performance of ALL existing decompression tools.**
 
-## Key Discoveries (Jan 2026)
+## Current Status (Jan 2026)
 
-From profiling and analysis:
+| Metric | gzippy | libdeflate | rapidgzip | Target |
+|--------|--------|------------|-----------|--------|
+| Single-thread silesia | ~630 MB/s | 1,200 MB/s | 720 MB/s (ISA-L) | **1,400+ MB/s** |
+| BGZF parallel (8T) | 3,770 MB/s | N/A | N/A | **5,000+ MB/s** |
+| Ratio vs libdeflate | 52% | 100% | 60% | **115%** |
 
-1. **Slow path is rarely hit** - Our LUT pre-computes length+distance for most matches
-2. **Entry format limitation** - Current format doesn't store codeword length separately from total bits, limiting saved_bitbuf optimization
-3. **Unconditional copy is risky** - Requires guaranteed buffer margin; broke tests when attempted
-4. **Profile data shows**:
-   - 2792 dynamic blocks, 10 stored, 0 fixed (silesia)
-   - 3.13x compression ratio
-   - Most time in fastloop, not slow path
-5. **DecodeTrace infrastructure exists** but isn't connected to decode loop
+## Competitive Intelligence
 
-### Optimizations Attempted
+### libdeflate Key Optimizations (from source analysis)
 
-| Change | Result | Learning |
-|--------|--------|----------|
-| Literal loop preloading | +0.7% (53.8→54.5%) | Small win, keep it |
-| Pattern-based small distance copy | **BROKE TESTS** | Can't pre-build pattern when distance<8 |
-| Simplified slow path to use copy_match_into | Neutral | Slow path rarely hit |
-| 5-word unconditional copy (d>=8) | **55.4%** then **BROKE TESTS** | Works in fastloop only, needs margin |
-| Loop unrolling (4x 8-byte) | 50.5% | Not better than simple loop |
-| Tracing overhead optimization | 52.3% | #[cold] nested function helps |
+| Optimization | Description | Our Status |
+|--------------|-------------|------------|
+| **64-bit bitbuffer** | Word-sized buffer, refill every ~56 bits | ✅ Implemented |
+| **Branchless refill** | `bitsleft \|= MAX_BITSLEFT & ~7` single instruction | ⚠️ Partial |
+| **Consume-first pattern** | Consume bits unconditionally, then branch | ❌ Blocked by table design |
+| **Subtables (never BITS=0)** | Every entry is valid, enables consume-first | ❌ We use BITS=0 markers |
+| **11-bit primary table** | 2KB table fits L1 cache | ⚠️ We use 12-bit (4KB) |
+| **BMI2 on x86_64** | `_bzhi_u64()` for bit extraction | ❌ Not using |
+| **5-word unconditional copy** | 40 bytes written unconditionally | ❌ Tested, SLOWER for us |
+| **RLE special case (d=1)** | `memset()` for single-byte repeat | ✅ Implemented |
+| **Word-at-a-time copy** | 8-byte chunks for d≥8 | ✅ Implemented |
+| **Stride copy for d=2-7** | Overlapping word writes | ✅ Implemented (3.78x faster) |
+| **bitsleft -= entry** | Subtract full u32, bits in low byte | ⚠️ Partial |
+| **Entry preloading** | Load next entry before processing current | ✅ Implemented |
+| **Fastloop/generic split** | Fastloop with margin, generic near edges | ✅ Implemented |
+| **Inline macros** | C macros eliminate function call overhead | ❌ Rust uses functions |
 
-### Data-Driven Insights (from tracing)
+### rapidgzip Key Optimizations (from source analysis)
 
-**Distance Distribution (17.5M matches in silesia):**
-- d=1 (RLE): 0.1% - Already optimized with memset
-- d=2-7: 0.7% - Byte-by-byte (only 130K matches, not worth optimizing)
-- d=8-39: 7.8% - Chunk copy with potential for libdeflate-style stride copy
-- d>=40: **91.3%** - Uses memcpy when d>=length (which is often)
+| Optimization | Description | Our Status |
+|--------------|-------------|------------|
+| **10-11 bit LUT** | Optimal for L1 cache (their benchmarks) | ⚠️ We use 12-bit |
+| **ISA-L integration** | Uses Intel's hand-optimized assembly | ❌ Not integrated |
+| **Marker-based parallel** | `uint16_t` output, markers for back-refs | ✅ Implemented |
+| **Speculative decode** | Decode without knowing window, resolve later | ✅ Implemented |
+| **Multi-cached decoder** | Cache multiple symbols per lookup | ❌ Not implemented |
+| **Double-literal cache** | Cache two consecutive literals | ❌ Not implemented |
+| **Window memcpy optimization** | For large uncompressed blocks | ✅ Implemented |
+| **Static Huffman table cache** | Avoid rebuilding fixed Huffman | ✅ Implemented |
+| **Thread pool parallelism** | Lock-free work distribution | ✅ Implemented |
 
-**Length Distribution:**
-- len 3-8: 70.7% - Most matches are short
-- len 9-32: 24.5%
-- len 33+: 4.8%
+## Gap Analysis: Why We're at 52%
 
-**Key Insight**: 91% of matches have d>=40. For most of these (when len<=d), 
-we already use memcpy. The remaining gap is in the decode loop itself, not the copy function.
+### What We've Ruled Out as Bottlenecks
 
-### What DOESN'T Work (Tested Jan 2026)
+| Component | Test Result | Conclusion |
+|-----------|-------------|------------|
+| Table size (10/11/12 bit) | <2% difference | NOT bottleneck |
+| Copy function performance | All paths 4000+ MB/s | NOT bottleneck |
+| Table lookup speed | 3,250 M lookups/s | NOT bottleneck |
 
-| Attempted | Result | Why |
-|-----------|--------|-----|
-| `saved_bitbuf` pattern | N/A | LUT pre-computes all matches, no extra bits to read |
-| Unconditional 5-word copy | **48% (slower!)** | Matches avg 10.5 bytes, writing 40 wastes bandwidth |
-| Loop unrolling | 50.5% | No improvement over simple loop |
-| `wrapping_sub` vs `saturating_sub` | 47.9% | Counter-intuitively worse |
+### What IS the Bottleneck
 
-### What DOES Work (Tested Jan 2026)
+| Issue | Impact | Fix Difficulty |
+|-------|--------|----------------|
+| **Table design (BITS=0 entries)** | 12% (blocks consume-first) | HIGH |
+| **No subtables** | Can't use libdeflate's pattern | HIGH |
+| **Function call overhead** | 5-10% (Rust vs C inline) | MEDIUM |
+| **Branch prediction** | 5-10% (nested conditionals) | MEDIUM |
+| **No BMI2 intrinsics** | 5% on supported CPUs | LOW |
 
-| Optimization | Before | After | Gain |
-|--------------|--------|-------|------|
-| Short distance copy (d=2-7) | 1,088 MB/s | 4,109 MB/s | **3.78x** |
+## Roadmap to Exceed All Tools
 
-**Key Insight**: Short distance copy was 5x slower than other paths due to `i % distance`
-modulo. Implemented libdeflate's word-at-a-time + stride approach.
+### Phase 1: Foundation (Target: 70% of libdeflate)
 
-### Current Path Benchmarks (Jan 2026)
+#### 1.1 Subtable Implementation
+**Goal**: Eliminate BITS=0 entries, enable consume-first pattern
 
-| Decode Path | Speed | Status |
-|-------------|-------|--------|
-| Pure Literals | 10,000+ MB/s | ✅ Fast |
-| RLE (d=1) | 6,221 MB/s | ✅ Fast |
-| Long Distance (d>=40) | 4,449 MB/s | ✅ Fast |
-| Short Distance (d=2-7) | 4,109 MB/s | ✅ Fixed |
+Currently our table has `BITS=0` for codes that don't fit in 12 bits. libdeflate uses
+actual subtables instead, ensuring every primary entry is valid.
 
-### Micro-benchmark Results (Jan 2026)
-
-| Component | Speed | Finding |
-|-----------|-------|---------|
-| Table lookup | 3250 M/sec | NOT bottleneck (<2% between 10/11/12 bit) |
-| Consume-first pattern | 12% faster | Can't use - our table has BITS=0 entries |
-
-**Key insight**: libdeflate's table NEVER has invalid entries (BITS=0). They use
-subtables for long codes. Our table has BITS=0 for subtable pointers, which means
-we must check-then-consume, not consume-then-check.
-
-### Where the Gap Actually Is
-
-All copy paths are now optimized. The remaining ~50% gap to libdeflate is:
-1. **Table entry format** - libdeflate uses subtables, never BITS=0, enabling consume-first
-2. **Inline macros** - libdeflate uses C macros, we use function calls
-3. **BMI2 intrinsics** - libdeflate uses bzhi/pext on x86_64
-4. **Compiler differences** - C with -O3 vs Rust with LTO
-
-### What Actually Helps
-
-1. **Entry preloading in literal loop** - Preload next entry BEFORE processing current (small but real gain)
-2. **3-literal chain decode** - Already implemented, helps a lot
-3. **RLE (distance=1) memset** - Already implemented, common case
-4. **Conditional refill (ensure())** - Already implemented
-
-## Gap Analysis
-
-### What libdeflate Does That We Don't
-
-| Optimization | libdeflate | gzippy | Impact | Status |
-|--------------|-----------|--------|--------|--------|
-| `saved_bitbuf` for extra bits | ✅ | ❌ | 10-15% | Tests written |
-| `bitsleft -= entry` (full u32) | ✅ | ✅ | Done | ✅ Implemented |
-| Entry preloading before copy | ✅ | ⚠️ | 5-10% | Partial |
-| 5-word unconditional copy | ✅ | ❌ | 5-8% | Needs margin |
-| RLE (offset=1) memset | ✅ | ✅ | 3-5% | ✅ Implemented |
-| JIT table rebuild avoidance | ✅ | ❌ | 5-10% | Not started |
-| BMI2 intrinsics (x86_64) | ✅ | ❌ | 5-10% | Tests written |
-| 11-bit litlen table | ✅ | ❌ 12-bit | 2-3% | Not started |
-| Subtable for long codes | ✅ | ✅ L2 | 3-5% | ✅ Implemented |
-| Preload slack (conditional refill) | ✅ | ✅ | 2-3% | ✅ Implemented |
-
-**Remaining potential gain: 30-50%** (gets us to 85-105% of libdeflate)
-
----
-
-## Phase 1: saved_bitbuf Pattern (10-15% gain)
-
-### The Problem
-When decoding length/distance pairs, libdeflate saves the bitbuf BEFORE consuming:
-```c
-saved_bitbuf = bitbuf;
-bitbuf >>= (u8)entry;
-bitsleft -= entry;
-
-// Later, extract extra bits from saved_bitbuf:
-length = entry >> 16;
-length += EXTRACT_VARBITS8(saved_bitbuf, entry) >> (u8)(entry >> 8);
-```
-
-This avoids separate `bits.read(extra_bits)` calls, which require:
-1. Masking to extract bits
-2. Shifting the buffer
-3. Updating bitsleft
-
-### The Fix
-Add `saved_bitbuf` to our entry consumption:
+**Implementation**:
 ```rust
-// Before: 
-bits.consume_entry(entry);
-let extra = bits.read(extra_bits);
-let length = base + extra;
+// Current: BITS=0 signals "use fallback"
+if entry & BITS_MASK == 0 { slow_path() }
 
-// After:
-let saved = bits.buffer();
-bits.consume_entry(entry);  // Just shifts, doesn't read extra
-let length = (entry >> 16) + ((saved >> shift_from_entry) & mask);
+// Target: Subtable pointer in entry
+if entry & SUBTABLE_FLAG {
+    let subtable_idx = (entry >> 16) as usize;
+    let extra_bits = (entry >> 8) & 0x3F;
+    entry = subtable[subtable_idx + (bits & ((1 << extra_bits) - 1))];
+}
 ```
 
-### Implementation
-1. Modify `TurboBits::consume_entry()` to not touch extra bits
-2. Add helper `extract_extra(saved_buf, entry) -> u32`
-3. Pack extra bit count and shift into entry format
+**Micro-benchmark**: `bench_subtable_vs_fallback`
 
----
+#### 1.2 Consume-First Pattern
+**Goal**: 12% speedup in decode loop
 
-## Phase 2: Unconditional 5-Word Copy (5-8% gain)
-
-### The Problem
-libdeflate unconditionally copies 5 machine words (40 bytes on x64):
-```c
-store_word_unaligned(load_word_unaligned(src), dst);
-src += WORDBYTES; dst += WORDBYTES;  // Repeat 5x
-while (dst < out_next) { ... }  // Only loop if length > 40
-```
-
-Our code uses bounds-checked loops even for small matches.
-
-### The Fix
+Once subtables are implemented, restructure decode loop:
 ```rust
-// Unconditional 5-word copy (40 bytes)
-unsafe {
-    let s = output.as_ptr().add(src_start);
-    let d = output.as_mut_ptr().add(out_pos);
-    ptr::copy_nonoverlapping(s, d, 8);
-    ptr::copy_nonoverlapping(s.add(8), d.add(8), 8);
-    ptr::copy_nonoverlapping(s.add(16), d.add(16), 8);
-    ptr::copy_nonoverlapping(s.add(24), d.add(24), 8);
-    ptr::copy_nonoverlapping(s.add(32), d.add(32), 8);
-}
-if length > 40 {
-    // Continue with loop for remaining bytes
-}
+// Before (check-first):
+if is_literal(entry) { consume(entry); process_literal(); }
+else { consume(entry); process_match(); }
+
+// After (consume-first):
+consume(entry);  // Unconditional
+if is_literal(entry) { process_literal(); }
+else { process_match(); }
 ```
 
----
+**Micro-benchmark**: `bench_branch_pattern` (already shows 12% potential)
 
-## Phase 3: JIT Table Caching (5-10% gain)
+### Phase 2: Bit Operations (Target: 80% of libdeflate)
 
-### The Problem
-For each dynamic block, we rebuild Huffman tables from scratch. libdeflate:
-1. Caches static code tables
-2. Uses a `static_codes_loaded` flag
-3. For dynamic blocks with similar structure, can skip some work
+#### 2.1 Branchless Refill Optimization
+**Goal**: Single-instruction bitsleft update
 
-### The Fix: JIT Table Fingerprinting
 ```rust
-struct TableCache {
-    fingerprint: u64,  // Hash of code lengths
-    litlen_table: PackedLUT,
-    dist_table: TwoLevelTable,
-}
+// Current: Multiple operations
+self.bits = self.bits.saturating_sub(n);
+self.refill_if_needed();
 
-fn decode_dynamic_block(bits: &mut TurboBits, cache: &mut TableCache) {
-    let code_lengths = read_code_lengths(bits);
-    let fingerprint = hash_code_lengths(&code_lengths);
-    
-    if fingerprint == cache.fingerprint {
-        // Reuse cached tables - skip expensive build!
-        return decode_with_tables(bits, &cache.litlen_table, &cache.dist_table);
-    }
-    
-    // Build new tables and cache them
-    cache.litlen_table = PackedLUT::build(&code_lengths.litlen);
-    cache.dist_table = TwoLevelTable::build(&code_lengths.dist);
-    cache.fingerprint = fingerprint;
-}
+// Target: libdeflate pattern
+self.bits |= (BITBUF_NBITS - 1) & !7;  // Single OR instruction
 ```
 
-**Key insight**: Many gzip files (especially from same compressor) have identical or similar Huffman tables across blocks.
+**Micro-benchmark**: `bench_refill_patterns`
 
----
+#### 2.2 Entry Subtraction Optimization
+**Goal**: Subtract full entry instead of masked bits
 
-## Phase 4: BMI2 Intrinsics for x86_64 (5-10% gain)
-
-### Key BMI2 Instructions
-| Instruction | Use Case |
-|-------------|----------|
-| `shrx` | Variable shift without moving to CL register |
-| `bzhi` | Zero high bits (extract N low bits) |
-| `pext` | Parallel bit extract |
-
-### Current vs. BMI2
 ```rust
-// Current (3-4 instructions)
-let bits_to_consume = (entry & 0xFF) as u32;
-self.buf >>= bits_to_consume;
-self.bits -= bits_to_consume;
+// Current:
+bits.consume((entry & BITS_MASK) as u32);
 
-// BMI2 (1-2 instructions)
-use core::arch::x86_64::{_shrx_u64, _bzhi_u64};
-self.buf = _shrx_u64(self.buf, entry as u64);  // entry contains shift amount
+// Target:
+bits.consume_entry_raw(entry);  // Bits in low byte, subtract full u32
 ```
 
-### Implementation
+**Micro-benchmark**: `bench_entry_subtraction`
+
+### Phase 3: Architecture-Specific (Target: 90% of libdeflate)
+
+#### 3.1 BMI2 Intrinsics (x86_64)
+**Goal**: 5% speedup on modern Intel/AMD
+
 ```rust
-#[cfg(target_arch = "x86_64")]
-mod bmi2 {
-    #[target_feature(enable = "bmi2")]
-    pub unsafe fn decode_loop_bmi2(...) {
-        // Use _shrx_u64, _bzhi_u64 for critical operations
-    }
-}
-
-// Runtime dispatch
-if is_x86_feature_detected!("bmi2") {
-    unsafe { bmi2::decode_loop_bmi2(...) }
-} else {
-    decode_loop_generic(...)
+#[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+fn extract_bits(word: u64, count: u32) -> u64 {
+    unsafe { std::arch::x86_64::_bzhi_u64(word, count) }
 }
 ```
 
----
+**Micro-benchmark**: `bench_bit_extraction` (already implemented)
 
-## Phase 5: Optimal Table Size (2-3% gain)
+#### 3.2 NEON Optimizations (aarch64)
+**Goal**: 5% speedup on ARM
 
-### The Problem
-We use 12-bit primary table (4096 entries = 16KB).
-libdeflate uses 11-bit (2048 entries = 8KB) + subtables.
+- Use NEON for bulk memory operations
+- Optimize copy paths with vector instructions
 
-8KB fits better in L1 cache (32KB typical).
+**Micro-benchmark**: `bench_simd_copy`
 
-### The Fix
+### Phase 4: Advanced Optimizations (Target: 100%+ of libdeflate)
+
+#### 4.1 Multi-Symbol Decode
+**Goal**: Decode 2-3 symbols per table lookup
+
+rapidgzip's `HuffmanCodingShortBitsMultiCached` achieves this. Entry format:
+```
+Entry = [Symbol1:8][Bits1:4][Symbol2:8][Bits2:4][Flags:8]
+```
+
+**Micro-benchmark**: `bench_multi_symbol_decode`
+
+#### 4.2 JIT Table Cache
+**Goal**: Avoid rebuilding identical Huffman tables
+
+Fingerprint code lengths, cache built tables:
 ```rust
-const LITLEN_TABLEBITS: u32 = 11;
-const TABLE_SIZE: usize = 1 << LITLEN_TABLEBITS;  // 2048
-
-struct PackedLUT {
-    primary: [PackedEntry; TABLE_SIZE],  // 8KB
-    subtables: Vec<PackedEntry>,         // Overflow for 12-15 bit codes
-}
-
-fn decode(&self, bits: u64) -> PackedEntry {
-    let entry = self.primary[(bits & 0x7FF) as usize];
-    if entry.needs_subtable() {
-        let subtable_idx = entry.subtable_index();
-        let extra_bits = (bits >> 11) & entry.subtable_mask();
-        return self.subtables[subtable_idx + extra_bits as usize];
-    }
-    entry
+fn get_or_build_table(code_lengths: &[u8]) -> &PackedLUT {
+    let fingerprint = hash(code_lengths);
+    TABLE_CACHE.get_or_insert(fingerprint, || build_table(code_lengths))
 }
 ```
 
----
+**Micro-benchmark**: `bench_table_build_vs_cache`
 
-## Phase 6: Preload Slack & Refill Optimization (2-3% gain)
+#### 4.3 Speculative Decode with Work Stealing
+**Goal**: Better load balancing for parallel decode
 
-### The Problem
-We call `bits.ensure(56)` every iteration. libdeflate calculates exactly
-how many bits are preloadable vs. consumable and only refills when needed.
+- Divide input into chunks
+- Workers speculatively decode
+- Work stealing for uneven chunk sizes
 
-### The Concept
-```
-CONSUMABLE_NBITS = 56 (can be consumed after refill)
-PRELOADABLE_NBITS = 63 (can be looked at but not consumed)
-PRELOAD_SLACK = 7 (extra lookahead bits)
-```
+### Phase 5: Exceed Everything (Target: 115%+ of libdeflate)
 
-### The Fix
-Track whether refill is needed based on actual bit consumption:
-```rust
-// Only refill when we've consumed enough to need it
-if bits.available() < MIN_FASTLOOP_BITS {
-    bits.refill_branchless();
-}
+#### 5.1 Hybrid Parallel Strategy
+**Goal**: Optimal parallelism for all file types
 
-// Preload next entry even when bits aren't "officially" available
-// (using the 7 slack bits)
-let next_entry = table[(bits.peek(12)) as usize];
-```
+| File Type | Strategy | Expected Speed |
+|-----------|----------|----------------|
+| BGZF | Parallel blocks | 5,000+ MB/s |
+| Multi-member | Parallel members | 4,000+ MB/s |
+| Single-member | Two-pass parallel | 2,500+ MB/s |
+| Small files | Fast sequential | 1,400+ MB/s |
 
----
+#### 5.2 Profile-Guided Optimization
+**Goal**: Let real-world data guide optimizations
 
-## Phase 7: Parallel BGZF Optimization (Already done ✅)
+- Enable PGO in release builds
+- Optimize hot paths based on actual usage
 
-We already beat libdeflate on BGZF parallel decompression:
-- **3770 MB/s with 8 threads**
-- Linear scaling with thread count
-- Zero lock contention via UnsafeCell
+#### 5.3 Assembly Hot Paths (Optional)
+**Goal**: Match or beat ISA-L on critical paths
 
----
+If Rust compiler doesn't optimize adequately, hand-write assembly for:
+- Inner decode loop
+- Bit buffer operations
+- Match copy
 
 ## Implementation Priority
 
-| Phase | Optimization | Est. Gain | Effort | Priority |
-|-------|--------------|-----------|--------|----------|
-| 1 | saved_bitbuf | 10-15% | Medium | **HIGH** |
-| 2 | 5-word copy | 5-8% | Low | **HIGH** |
-| 3 | JIT table cache | 5-10% | High | Medium |
-| 4 | BMI2 intrinsics | 5-10% | Medium | **HIGH** |
-| 5 | 11-bit table | 2-3% | Medium | Low |
-| 6 | Preload slack | 2-3% | Low | Medium |
+| Phase | Effort | Expected Gain | Priority |
+|-------|--------|---------------|----------|
+| 1.1 Subtables | HIGH | +10-15% | **P0** |
+| 1.2 Consume-first | MEDIUM | +12% | **P0** |
+| 2.1 Branchless refill | LOW | +3-5% | P1 |
+| 2.2 Entry subtraction | LOW | +2-3% | P1 |
+| 3.1 BMI2 | LOW | +5% | P1 |
+| 4.1 Multi-symbol | HIGH | +15-20% | P2 |
+| 4.2 JIT cache | MEDIUM | +5-10% | P2 |
+| 5.1 Hybrid parallel | MEDIUM | N/A (already fast) | P2 |
 
-**Recommended order**: Phase 2 → Phase 1 → Phase 4 → Phase 6 → Phase 3 → Phase 5
+## Success Metrics
+
+### Milestone 1: Match libdeflate (100%)
+- Single-thread silesia: 1,200 MB/s
+- All existing tests pass
+- No regression in BGZF parallel performance
+
+### Milestone 2: Exceed libdeflate (115%)
+- Single-thread silesia: 1,400+ MB/s
+- Beat rapidgzip+ISA-L on all benchmarks
+- Become the fastest pure-Rust decompressor
+
+### Milestone 3: Best in Class (130%+)
+- Single-thread silesia: 1,600+ MB/s
+- BGZF parallel: 5,000+ MB/s
+- Recognized as fastest gzip decompressor
+
+## Testing Strategy
+
+Every optimization MUST have:
+1. **Micro-benchmark** - Isolate and measure the specific improvement
+2. **Correctness test** - Verify output matches reference implementation
+3. **Integration test** - Ensure no regression in overall performance
+4. **Cross-platform test** - Works on x86_64, aarch64, and other targets
+
+## Reference Implementations
+
+- **libdeflate**: `./libdeflate/lib/decompress_template.h`
+- **rapidgzip**: `./rapidgzip/librapidarchive/src/rapidgzip/gzip/deflate.hpp`
+- **ISA-L**: `./isa-l/igzip/`
+- **zlib-ng**: Industry-standard reference
 
 ---
 
-## Verification Strategy
-
-After each phase:
-1. Run `GZIPPY_TRACE=1` to get timing
-2. Compare with libdeflate benchmark
-3. Ensure all 163 tests pass
-4. Profile to find new bottleneck
-
-```bash
-# Quick benchmark
-cargo test --release benchmark_turbo_vs_all -- --nocapture
-
-# Full trace
-GZIPPY_TRACE=1 ./target/release/gzippy -d benchmark_data/silesia-gzip.tar.gz -k
-```
-
----
-
-## Target Milestones
-
-| Milestone | Speed | % of libdeflate |
-|-----------|-------|-----------------|
-| Current | 703 MB/s | 57.5% |
-| After Phase 1+2 | ~850 MB/s | 70% |
-| After Phase 3+4 | ~1050 MB/s | 86% |
-| After Phase 5+6 | ~1150 MB/s | 94% |
-| With JIT cache | ~1300 MB/s | 106% |
-| Optimal | ~1400 MB/s | 115% |
-
----
-
-## Appendix: libdeflate Entry Format
-
-```
-Literals:
-    Bit 31:     1 (HUFFDEC_LITERAL - test with signed comparison)
-    Bit 23-16:  literal value
-    Bit 15:     0
-    Bit 3-0:    codeword length
-
-Lengths:
-    Bit 31:     0
-    Bit 24-16:  length base value  
-    Bit 15:     0
-    Bit 11-8:   codeword length (for saved_bitbuf shift)
-    Bit 4-0:    codeword length + extra bit count
-
-EOB:
-    Bit 31:     0
-    Bit 15:     1 (HUFFDEC_EXCEPTIONAL)
-    Bit 13:     1 (HUFFDEC_END_OF_BLOCK)
-```
-
-Our PackedLUT format is similar but uses different bit positions. Consider
-aligning exactly with libdeflate for easier porting of optimizations.
+*Last updated: January 2026*
+*Goal: Exceed ALL competition in performance*
