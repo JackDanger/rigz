@@ -4,6 +4,17 @@
 
 **gzippy aims to be the fastest gzip implementation in existence.**
 
+## 🚨 CRITICAL: Optimization Roadmap
+
+**READ THIS FIRST**: `docs/OPTIMIZATION_ROADMAP.md` contains the exhaustive list of
+every optimization needed to beat libdeflate. This is the primary reference for
+closing the performance gap. Current status:
+- Simple data: 62% of libdeflate (target: 110%)
+- Complex data: 45% of libdeflate (target: 106%)
+- BGZF parallel: ALREADY BEATS libdeflate
+
+The roadmap has 4 phases with 45 total optimizations. Work through them in order.
+
 We build on the shoulders of giants. These projects laid the foundation:
 - **pigz** by Mark Adler — pioneered parallel gzip compression
 - **libdeflate** by Eric Biggers — showed what's possible with modern deflate

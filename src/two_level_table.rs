@@ -419,6 +419,110 @@ impl<'a> FastBits<'a> {
 }
 
 // =============================================================================
+// TurboBits: libdeflate-style bit reader with branchless refill
+// =============================================================================
+
+/// libdeflate-style bit reader with key optimizations:
+/// 1. Branchless refill (always load word, adjust pointer arithmetically)
+/// 2. Allow garbage in high bits of `bits` (saves masking)
+/// 3. `consume_entry(entry)` subtracts full u32 (no masking needed)
+pub struct TurboBits<'a> {
+    data: &'a [u8],
+    pos: usize,
+    buf: u64,
+    /// Bits available - high bits may contain garbage (libdeflate trick)
+    /// Only low 8 bits are meaningful for comparisons
+    bits: u32,
+}
+
+impl<'a> TurboBits<'a> {
+    #[inline]
+    pub fn new(data: &'a [u8]) -> Self {
+        let mut tb = Self {
+            data,
+            pos: 0,
+            buf: 0,
+            bits: 0,
+        };
+        tb.refill_branchless();
+        tb
+    }
+
+    /// Branchless refill - always loads a word, adjusts pointer arithmetically
+    /// Based on libdeflate's REFILL_BITS_BRANCHLESS() macro
+    #[inline(always)]
+    pub fn refill_branchless(&mut self) {
+        if self.pos + 8 <= self.data.len() {
+            // Load 8 bytes unconditionally
+            let word = unsafe { (self.data.as_ptr().add(self.pos) as *const u64).read_unaligned() };
+            self.buf |= word.to_le() << (self.bits as u8);
+
+            // libdeflate trick: advance by (64 - bits) / 8 bytes
+            // This is branchless pointer arithmetic
+            let bytes_to_add = (64 - (self.bits as u8)) >> 3;
+            self.pos += bytes_to_add as usize;
+
+            // Set bits to 56+ (allow garbage in high bits)
+            // libdeflate uses: bitsleft |= MAX_BITSLEFT & ~7 which is 0x38 (56)
+            self.bits |= 56;
+        } else {
+            // Near end of input - byte-by-byte
+            while (self.bits as u8) <= 56 && self.pos < self.data.len() {
+                self.buf |= (self.data[self.pos] as u64) << (self.bits as u8);
+                self.pos += 1;
+                self.bits += 8;
+            }
+        }
+    }
+
+    /// Get raw buffer for table lookup
+    #[inline(always)]
+    pub fn buffer(&self) -> u64 {
+        self.buf
+    }
+
+    /// Consume bits from a packed entry - subtracts full u32 (libdeflate style)
+    /// The entry's low byte contains bits to consume; high bits are ignored
+    /// because we only use low 8 bits of self.bits for comparisons
+    #[inline(always)]
+    pub fn consume_entry(&mut self, entry: u32) {
+        // Shift buffer by low 8 bits of entry (CPU ignores high bits in shift)
+        self.buf >>= entry as u8;
+        // Subtract full entry - garbage in high bits is fine
+        self.bits = self.bits.wrapping_sub(entry);
+    }
+
+    /// Consume n bits (standard method)
+    #[inline(always)]
+    pub fn consume(&mut self, n: u32) {
+        self.buf >>= n;
+        self.bits = self.bits.wrapping_sub(n);
+    }
+
+    /// Read n bits and consume them
+    #[inline(always)]
+    pub fn read(&mut self, n: u32) -> u32 {
+        let val = (self.buf & ((1u64 << n) - 1)) as u32;
+        self.consume(n);
+        val
+    }
+
+    /// Check if we have at least n consumable bits (uses low 8 bits only)
+    #[inline(always)]
+    pub fn has_bits(&self, n: u32) -> bool {
+        (self.bits as u8) >= n as u8
+    }
+
+    /// Ensure we have at least n bits
+    #[inline(always)]
+    pub fn ensure(&mut self, n: u32) {
+        if (self.bits as u8) < n as u8 {
+            self.refill_branchless();
+        }
+    }
+}
+
+// =============================================================================
 // Optimized Decode Functions
 // =============================================================================
 
