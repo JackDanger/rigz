@@ -423,21 +423,24 @@ impl LitLenTable {
         Some(Self { entries, table_bits })
     }
 
-    /// Look up an entry by bit pattern
+    /// Look up an entry by bit pattern (unsafe unchecked for max speed)
     #[inline(always)]
     pub fn lookup(&self, bits: u64) -> LitLenEntry {
         let idx = (bits as usize) & ((1usize << self.table_bits) - 1);
-        self.entries[idx]
+        // SAFETY: idx is masked to be within table_bits range, 
+        // and entries is always at least (1 << table_bits) in size
+        unsafe { *self.entries.get_unchecked(idx) }
     }
 
-    /// Look up a subtable entry
+    /// Look up a subtable entry (unsafe unchecked for max speed)
     #[inline(always)]
     pub fn lookup_subtable(&self, entry: LitLenEntry, bits: u64) -> LitLenEntry {
         let subtable_start = entry.subtable_start() as usize;
         let subtable_bits = entry.subtable_bits();
         let main_bits = entry.main_table_bits();
         let idx = ((bits >> main_bits) as usize) & ((1usize << subtable_bits) - 1);
-        self.entries[subtable_start + idx]
+        // SAFETY: subtable entries are allocated during build
+        unsafe { *self.entries.get_unchecked(subtable_start + idx) }
     }
 
     /// Resolve an entry (handle subtables)
@@ -549,21 +552,23 @@ impl DistTable {
         Some(Self { entries, table_bits })
     }
 
-    /// Look up an entry by bit pattern
+    /// Look up an entry by bit pattern (unsafe unchecked for max speed)
     #[inline(always)]
     pub fn lookup(&self, bits: u64) -> DistEntry {
         let idx = (bits as usize) & ((1usize << self.table_bits) - 1);
-        self.entries[idx]
+        // SAFETY: idx is masked to be within table_bits range
+        unsafe { *self.entries.get_unchecked(idx) }
     }
 
-    /// Look up a subtable entry
+    /// Look up a subtable entry (unsafe unchecked for max speed)
     #[inline(always)]
     pub fn lookup_subtable(&self, entry: DistEntry, bits: u64) -> DistEntry {
         let subtable_start = entry.subtable_start() as usize;
         let subtable_bits = entry.subtable_bits();
         let main_bits = entry.main_table_bits();
         let idx = ((bits >> main_bits) as usize) & ((1usize << subtable_bits) - 1);
-        self.entries[subtable_start + idx]
+        // SAFETY: subtable entries are allocated during build
+        unsafe { *self.entries.get_unchecked(subtable_start + idx) }
     }
 
     /// Resolve an entry (handle subtables)

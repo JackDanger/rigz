@@ -97,10 +97,11 @@ impl<'a> LibdeflateBits<'a> {
     #[inline(always)]
     pub fn refill_branchless(&mut self) {
         if self.pos + 8 <= self.data.len() {
-            // Fast path: can load 8 bytes
-            let word = u64::from_le_bytes(
-                self.data[self.pos..self.pos + 8].try_into().unwrap(),
-            );
+            // Fast path: unaligned 8-byte load (avoids slice overhead)
+            let word = unsafe {
+                (self.data.as_ptr().add(self.pos) as *const u64).read_unaligned()
+            };
+            let word = u64::from_le(word);
             self.bitbuf |= word << (self.bitsleft as u8);
             self.pos += 7;
             self.pos -= ((self.bitsleft >> 3) & 0x7) as usize;
@@ -180,42 +181,55 @@ impl<'a> LibdeflateBits<'a> {
 }
 
 /// Copy a match (LZ77 back-reference) to output
+/// UNSAFE version for maximum performance
 /// Optimized for common patterns:
 /// - distance=1 (RLE): memset
-/// - distance>=8: word-at-a-time copy
+/// - distance>=8: word-at-a-time copy with overlapping writes
 /// - distance 2-7: pattern expansion
 #[inline(always)]
 fn copy_match(output: &mut [u8], out_pos: usize, distance: u32, length: u32) -> usize {
     let dist = distance as usize;
     let len = length as usize;
-    let src_pos = out_pos - dist;
-
-    if distance == 1 {
-        // RLE: repeat single byte
-        let byte = output[src_pos];
-        output[out_pos..out_pos + len].fill(byte);
-    } else if distance >= 8 && len >= 8 {
-        // Fast word copy for non-overlapping or large distance
-        let mut src = src_pos;
-        let mut dst = out_pos;
-        let end = out_pos + len;
+    
+    unsafe {
+        let out_ptr = output.as_mut_ptr();
+        let dst = out_ptr.add(out_pos);
+        let src = out_ptr.add(out_pos - dist);
         
-        while dst + 8 <= end {
-            let word = u64::from_le_bytes(output[src..src + 8].try_into().unwrap());
-            output[dst..dst + 8].copy_from_slice(&word.to_le_bytes());
-            src += 8;
-            dst += 8;
-        }
-        // Handle remainder
-        while dst < end {
-            output[dst] = output[src];
-            src += 1;
-            dst += 1;
-        }
-    } else {
-        // Overlapping copy - byte by byte
-        for i in 0..len {
-            output[out_pos + i] = output[src_pos + i % dist];
+        if distance == 1 {
+            // RLE: memset
+            let byte = *src;
+            std::ptr::write_bytes(dst, byte, len);
+        } else if dist >= 8 {
+            // Fast path: 8-byte chunks with overlapping writes
+            // This works because we're always writing forward
+            let mut s = src;
+            let mut d = dst;
+            let end = dst.add(len);
+            
+            while d < end {
+                let chunk = (s as *const u64).read_unaligned();
+                (d as *mut u64).write_unaligned(chunk);
+                s = s.add(8);
+                d = d.add(8);
+            }
+        } else if dist >= 4 {
+            // 4-byte chunks for medium distances
+            let mut s = src;
+            let mut d = dst;
+            let end = dst.add(len);
+            
+            while d < end {
+                let chunk = (s as *const u32).read_unaligned();
+                (d as *mut u32).write_unaligned(chunk);
+                s = s.add(4);
+                d = d.add(4);
+            }
+        } else {
+            // Byte-by-byte for very short distances (2-3)
+            for i in 0..len {
+                *dst.add(i) = *src.add(i % dist);
+            }
         }
     }
 
@@ -587,25 +601,64 @@ fn decode_huffman(
         // Fast path: literal (bit 31 set)
         // Use signed comparison: (entry as i32) < 0
         if (entry.raw() as i32) < 0 {
-            // LITERAL - tight loop for multiple literals
-            output[out_pos] = entry.literal_value();
+            // LITERAL - tight loop with unsafe writes for max speed
+            let out_ptr = output.as_mut_ptr();
+            
+            unsafe {
+                *out_ptr.add(out_pos) = entry.literal_value();
+            }
             out_pos += 1;
             bits.consume_entry(entry.raw());
 
-            // Try to decode more literals without leaving loop
-            while bits.available() >= 15 {
-                let saved2 = bits.peek_bits();
-                let mut e2 = litlen_table.lookup(saved2);
-                if e2.is_subtable_ptr() {
-                    e2 = litlen_table.lookup_subtable(e2, saved2);
-                }
+            // Unrolled literal decode - up to 4 more without refill
+            // Each literal uses max 15 bits, so 56+ bits = 3+ literals safe
+            if bits.available() >= 45 {
+                // Try 3 more literals in a row
+                let s2 = bits.peek_bits();
+                let mut e2 = litlen_table.lookup(s2);
+                if e2.is_subtable_ptr() { e2 = litlen_table.lookup_subtable(e2, s2); }
                 
                 if (e2.raw() as i32) < 0 {
-                    output[out_pos] = e2.literal_value();
+                    unsafe { *out_ptr.add(out_pos) = e2.literal_value(); }
                     out_pos += 1;
                     bits.consume_entry(e2.raw());
-                } else {
-                    break;
+                    
+                    let s3 = bits.peek_bits();
+                    let mut e3 = litlen_table.lookup(s3);
+                    if e3.is_subtable_ptr() { e3 = litlen_table.lookup_subtable(e3, s3); }
+                    
+                    if (e3.raw() as i32) < 0 {
+                        unsafe { *out_ptr.add(out_pos) = e3.literal_value(); }
+                        out_pos += 1;
+                        bits.consume_entry(e3.raw());
+                        
+                        let s4 = bits.peek_bits();
+                        let mut e4 = litlen_table.lookup(s4);
+                        if e4.is_subtable_ptr() { e4 = litlen_table.lookup_subtable(e4, s4); }
+                        
+                        if (e4.raw() as i32) < 0 {
+                            unsafe { *out_ptr.add(out_pos) = e4.literal_value(); }
+                            out_pos += 1;
+                            bits.consume_entry(e4.raw());
+                        }
+                    }
+                }
+            } else {
+                // Slower path: check bits each time
+                while bits.available() >= 15 {
+                    let saved2 = bits.peek_bits();
+                    let mut e2 = litlen_table.lookup(saved2);
+                    if e2.is_subtable_ptr() {
+                        e2 = litlen_table.lookup_subtable(e2, saved2);
+                    }
+                    
+                    if (e2.raw() as i32) < 0 {
+                        unsafe { *out_ptr.add(out_pos) = e2.literal_value(); }
+                        out_pos += 1;
+                        bits.consume_entry(e2.raw());
+                    } else {
+                        break;
+                    }
                 }
             }
             continue 'fastloop;
@@ -620,14 +673,23 @@ fn decode_huffman(
             return Err(Error::new(ErrorKind::InvalidData, "Unresolved subtable"));
         }
 
-        // LENGTH CODE
+        // LENGTH CODE - decode length and distance together for better pipelining
         bits.consume_entry(entry.raw());
         let length = entry.decode_length(saved_bitbuf);
 
-        // Get distance
+        // Refill and preload distance entry
         bits.refill_branchless();
         let dist_saved = bits.peek_bits();
         let mut dist_entry = dist_table.lookup(dist_saved);
+        
+        // Prefetch the match source location (hide memory latency)
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            // Estimate source position (distance is typically small)
+            let likely_src = output.as_ptr().add(out_pos.saturating_sub(32));
+            std::arch::x86_64::_mm_prefetch(likely_src as *const i8, std::arch::x86_64::_MM_HINT_T0);
+        }
+        
         if dist_entry.is_subtable_ptr() {
             dist_entry = dist_table.lookup_subtable(dist_entry, dist_saved);
         }
@@ -639,7 +701,7 @@ fn decode_huffman(
         bits.consume_entry(dist_entry.raw());
         let distance = dist_entry.decode_distance(dist_saved);
 
-        // Validate
+        // Validate (branch unlikely to be taken)
         if distance == 0 || distance as usize > out_pos {
             return Err(Error::new(
                 ErrorKind::InvalidData,
@@ -647,7 +709,7 @@ fn decode_huffman(
             ));
         }
 
-        // Copy match
+        // Copy match with optimized routine
         out_pos = copy_match(output, out_pos, distance, length);
     }
 
@@ -937,5 +999,43 @@ mod tests {
         eprintln!("libdeflate throughput: {:>8.1} MB/s", lib_throughput);
         eprintln!("Ratio: {:.1}%", 100.0 * our_throughput / lib_throughput);
         eprintln!("=========================\n");
+    }
+
+    /// Profile the decode loop to find bottlenecks
+    #[test]
+    fn profile_decode_hotspots() {
+        let gz = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let start = 10 + if (gz[3] & 0x08) != 0 {
+            gz[10..].iter().position(|&b| b == 0).unwrap_or(0) + 1
+        } else { 0 };
+        let end = gz.len() - 8;
+        let deflate = &gz[start..end];
+        let isize = u32::from_le_bytes([gz[gz.len()-4], gz[gz.len()-3], gz[gz.len()-2], gz[gz.len()-1]]) as usize;
+
+        let mut out = vec![0u8; isize + 1000];
+
+        // Run decode and measure wall clock
+        let iters = 10;
+        let start_t = std::time::Instant::now();
+        for _ in 0..iters {
+            let _ = inflate_libdeflate(deflate, &mut out);
+        }
+        let elapsed = start_t.elapsed();
+        
+        let throughput = (isize * iters) as f64 / elapsed.as_secs_f64() / 1e6;
+        let ns_per_byte = elapsed.as_nanos() as f64 / (isize * iters) as f64;
+        
+        eprintln!("\n=== DECODE PROFILING ===");
+        eprintln!("Total: {} MB in {:.2}s", (isize * iters) / 1_000_000, elapsed.as_secs_f64());
+        eprintln!("Throughput: {:.1} MB/s", throughput);
+        eprintln!("Time per byte: {:.2} ns", ns_per_byte);
+        eprintln!("========================\n");
+        
+        // For deeper profiling, run: 
+        // cargo flamegraph --bin gzippy -- -d benchmark_data/silesia-gzip.tar.gz -c > /dev/null
     }
 }
