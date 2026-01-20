@@ -66,11 +66,13 @@ jobs:
         continue-on-error: true
         run: |
           cd isa-l
+          rm -rf build
           mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
           make -j$(nproc) igzip || true
-          if [ -f bin/igzip ]; then
-            cp bin/igzip /tmp/igzip-cli
+          # Binary is at build/igzip (not build/bin/igzip)
+          if [ -f igzip ]; then
+            cp igzip /tmp/igzip-cli
             echo "✓ igzip CLI built"
           fi
 

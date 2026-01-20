@@ -78,11 +78,12 @@ jobs:
       - name: Build igzip
         run: |
           cd isa-l
+          rm -rf build
           mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
           make -j$(nproc) igzip
-          # Verify build succeeded
-          test -f bin/igzip || (echo "ERROR: igzip build failed" && exit 1)
+          # Binary is at build/igzip (not build/bin/igzip)
+          test -f igzip || (echo "ERROR: igzip build failed" && exit 1)
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
@@ -93,7 +94,7 @@ jobs:
             pigz/pigz
             pigz/unpigz
             rapidgzip/librapidarchive/build/src/tools/rapidgzip
-            isa-l/build/bin/igzip
+            isa-l/build/igzip
           retention-days: 1
 
   # ============================================================================
@@ -260,13 +261,13 @@ jobs:
       - name: Setup tools
         run: |
           chmod +x tools/target/release/gzippy
-          [ -f tools/isa-l/build/bin/igzip ] && chmod +x tools/isa-l/build/bin/igzip || true
+          [ -f tools/isa-l/build/igzip ] && chmod +x tools/isa-l/build/igzip || true
 
       - name: Run benchmark
         run: |
           IGZIP=""
-          if [ -f tools/isa-l/build/bin/igzip ]; then
-            IGZIP="--igzip tools/isa-l/build/bin/igzip"
+          if [ -f tools/isa-l/build/igzip ]; then
+            IGZIP="--igzip tools/isa-l/build/igzip"
           fi
           python3 scripts/benchmark_guard.py \
             --type igzip \

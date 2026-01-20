@@ -12,7 +12,7 @@
 #   gzippy:    target/release/gzippy
 #   pigz:      pigz/pigz, pigz/unpigz
 #   rapidgzip: rapidgzip/librapidarchive/build/src/tools/rapidgzip
-#   igzip:     isa-l/build/bin/igzip
+#   igzip:     isa-l/build/igzip
 #   zopfli:    zopfli/zopfli
 #   libdeflate: libdeflate/build/programs/libdeflate-gzip
 #   gzip:      gzip/gzip, gzip/gunzip
@@ -161,7 +161,8 @@ if $BUILD_IGZIP; then
     
     cd "$REPO_ROOT"
     
-    IGZIP_BIN="isa-l/build/bin/igzip"
+    # Binary is at build/igzip (not build/bin/igzip)
+    IGZIP_BIN="isa-l/build/igzip"
     if [[ -f "$IGZIP_BIN" ]]; then
         log_info "✓ igzip built: $IGZIP_BIN"
     else
