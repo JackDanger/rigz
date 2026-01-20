@@ -1372,45 +1372,11 @@ fn decode_huffman_turbo(
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad dist"));
             }
 
-            // OPTIMIZATION 4: Unconditional 40-byte copy
-            // Copy at least 40 bytes (5 words), actual length may be less
-            // This is safe because we have 320 bytes margin
-            let src_start = out_pos - distance;
+            // Use optimized copy function (handles all cases efficiently)
+            out_pos = copy_match_into(output, out_pos, distance, length);
 
-            if distance >= 8 {
-                // Non-overlapping or minimally overlapping: use word copies
-                let mut copied = 0;
-                while copied < 40 && copied < length {
-                    let src = src_start + copied;
-                    let dst = out_pos + copied;
-                    if dst + 8 <= output.len() && src + 8 <= output.len() {
-                        unsafe {
-                            let word = (output.as_ptr().add(src) as *const u64).read_unaligned();
-                            (output.as_mut_ptr().add(dst) as *mut u64).write_unaligned(word);
-                        }
-                    }
-                    copied += 8;
-                }
-                // Finish remaining bytes
-                for i in 40.min(length)..length {
-                    output[out_pos + i] = output[src_start + i];
-                }
-            } else if distance == 1 {
-                // RLE: memset
-                let byte = output[src_start];
-                for i in 0..length {
-                    output[out_pos + i] = byte;
-                }
-            } else {
-                // Small distance (2-7): byte-by-byte
-                for i in 0..length {
-                    output[out_pos + i] = output[src_start + i];
-                }
-            }
-            out_pos += length;
-
-            // Use preloaded entry (hide latency)
-            let _ = next_entry_preload; // Compiler hint to keep it alive
+            // Silence unused variable warning - preload was for latency hiding
+            let _ = next_entry_preload;
             continue;
         }
 
