@@ -495,7 +495,7 @@ jobs:
   # Guard: Must beat rapidgzip on single-member (gzip) files too
   # ============================================================================
   vs-rapidgzip-single:
-    name: Guard: Within 1% of rapidgzip (single-member)
+    name: "Guard: Within 1% of rapidgzip (single-member)"
     runs-on: ubuntu-latest
     
     steps:
@@ -619,7 +619,7 @@ jobs:
   # Guard: Must beat igzip on single-threaded decompression
   # ============================================================================
   vs-igzip:
-    name: Guard: Faster than igzip (single-threaded)
+    name: "Guard: Faster than igzip (single-threaded)"
     runs-on: ubuntu-latest
     
     steps:
