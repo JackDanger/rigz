@@ -613,9 +613,56 @@ Consume-first table throughput: 1,003.9 M symbols/sec
 
 ### Next Steps
 
-1. Build `ConsumeFirstTable` instead of `PackedLUT` in table construction
-2. Update `decode_huffman_turbo` to use consume-first pattern
-3. Expect ~40% speedup → should exceed libdeflate
+1. Build `ConsumeFirstTable` instead of `PackedLUT` in table construction ✅ DONE
+2. Update `decode_huffman_turbo` to use consume-first pattern ✅ DONE
+3. Expect ~40% speedup → should exceed libdeflate ❌ Not yet achieved
+
+## Pre-computed Optimization Attempt (Jan 2026)
+
+### What We Tried
+
+Attempted to embed pre-computed length/distance base values and extra bits counts
+directly in CFEntry to enable the saved_bitbuf pattern from libdeflate:
+
+```rust
+// Target entry format
+[Type:2][BaseValue:16][ExtraBits:4][CodewordBits:8]
+
+// saved_bitbuf pattern
+saved_bitbuf = bits.buffer();
+entry = lookup(saved_bitbuf);
+bits.consume(entry.total_bits());  // codeword + extra
+length = entry.base_value() + ((saved_bitbuf >> entry.codeword_bits()) & extra_mask);
+```
+
+### What Went Wrong
+
+1. **Bit layout conflicts**: The DATA_SHIFT used for literal symbols overlaps with
+   EXTRA_BITS_SHIFT. For literal 'A' (65), `extra_bits()` returns 1 instead of 0.
+
+2. **Subtable complexity**: For subtable entries, saved_bitbuf must be captured at
+   different points (after main table bits consumed, before subtable consumed).
+
+3. **Integration complexity**: The tight literal loop uses `resolve_entry()` which
+   only consumes codeword bits, then reads extra bits separately. Changing this
+   breaks the optimization chain.
+
+### Current Status
+
+- All 220 tests pass with consume-first pattern
+- Performance: 56.4% of libdeflate on simple data, 44.8% on silesia
+- Pre-computed optimization reverted to maintain correctness
+
+### Lessons Learned
+
+1. **Test incrementally**: The pre-computed changes touched too many things at once.
+   Should have kept old path available and switched incrementally.
+
+2. **Separate concerns**: Subtable handling and pre-computed values are independent.
+   Should implement subtables first, verify correctness, then add pre-computation.
+
+3. **Bit layout design**: Need careful design upfront to ensure all entry types have
+   non-overlapping fields. Consider using separate entry types for literal vs length.
 
 ## Testing Best Practices
 
