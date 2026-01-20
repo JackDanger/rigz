@@ -1271,6 +1271,7 @@ struct ChunkBoundary {
 /// 2. **Second pass (parallel)**: Re-decode each chunk using windows as dictionaries
 ///
 /// Target: 2x-3x speedup over single-threaded on large files
+#[allow(dead_code)] // Keep for future use - currently libdeflater is faster for single-member
 pub fn decompress_single_member_parallel<W: Write>(
     data: &[u8],
     writer: &mut W,

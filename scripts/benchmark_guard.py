@@ -212,15 +212,34 @@ def main():
             )
 
         elif args.type == "multi-member":
-            # Compress with pigz (creates multi-member)
+            # Create TRUE multi-member by concatenating gzip streams
+            # (pigz creates single-member with dictionary linking, not true multi-member)
             if not args.pigz or not args.pigz.exists():
                 print("Error: pigz binary required for multi-member test")
                 sys.exit(1)
             
-            compressed = tmpdir / "test-pigz.gz"
-            subprocess.run([str(args.pigz), f"-p{args.cores}", "-c", str(test_file)],
-                          stdout=open(compressed, "wb"), check=True)
+            compressed = tmpdir / "test-multi.gz"
             
+            # Split test file and compress parts separately, then concatenate
+            with open(test_file, "r") as f:
+                lines = f.readlines()
+            mid = len(lines) // 2
+            
+            part1 = tmpdir / "part1.txt"
+            part2 = tmpdir / "part2.txt"
+            with open(part1, "w") as f:
+                f.writelines(lines[:mid])
+            with open(part2, "w") as f:
+                f.writelines(lines[mid:])
+            
+            # Create multi-member by appending gzip streams
+            with open(compressed, "wb") as out:
+                result = subprocess.run(["gzip", "-c", str(part1)], stdout=subprocess.PIPE, check=True)
+                out.write(result.stdout)
+                result = subprocess.run(["gzip", "-c", str(part2)], stdout=subprocess.PIPE, check=True)
+                out.write(result.stdout)
+            
+            # Compare against pigz (fairer comparison than macOS gzip which has hardware accel)
             unpigz = args.unpigz or (args.pigz.parent / "unpigz")
             passed = benchmark_vs_tool(
                 "multi-member", args.gzippy, unpigz, "pigz",
@@ -230,20 +249,26 @@ def main():
 
         elif args.type == "single-member":
             # Compress with gzip (single-member)
+            gzip_bin = shutil.which("gzip")
+            if not gzip_bin:
+                print("Error: gzip not found in PATH")
+                sys.exit(1)
+            
             compressed = tmpdir / "test-gzip.gz"
-            subprocess.run(["gzip", "-c", str(test_file)],
+            subprocess.run([gzip_bin, "-c", str(test_file)],
                           stdout=open(compressed, "wb"), check=True)
             
             passed = benchmark_vs_tool(
-                "single-member", args.gzippy, Path("/bin/gzip"), "gzip",
+                "single-member", args.gzippy, Path(gzip_bin), "gzip",
                 compressed, original_size,
                 other_extra_args=["-d", "-c"],
             )
 
         elif args.type == "rapidgzip-multi":
             if not args.rapidgzip or not args.rapidgzip.exists():
-                print("⚠️ rapidgzip binary not available, skipping")
-                sys.exit(0)
+                print("❌ ERROR: rapidgzip binary required but not available")
+                print("   Pass --rapidgzip /path/to/rapidgzip")
+                sys.exit(1)
             
             if not args.pigz or not args.pigz.exists():
                 print("Error: pigz binary required to create multi-member file")
@@ -262,8 +287,9 @@ def main():
 
         elif args.type == "rapidgzip-single":
             if not args.rapidgzip or not args.rapidgzip.exists():
-                print("⚠️ rapidgzip binary not available, skipping")
-                sys.exit(0)
+                print("❌ ERROR: rapidgzip binary required but not available")
+                print("   Pass --rapidgzip /path/to/rapidgzip")
+                sys.exit(1)
             
             # Compress with gzip (single-member)
             compressed = tmpdir / "test-gzip.gz"
@@ -278,8 +304,9 @@ def main():
 
         elif args.type == "igzip":
             if not args.igzip or not args.igzip.exists():
-                print("⚠️ igzip binary not available, skipping")
-                sys.exit(0)
+                print("❌ ERROR: igzip binary required but not available")
+                print("   Pass --igzip /path/to/igzip")
+                sys.exit(1)
             
             # Compress with gzip
             compressed = tmpdir / "test.gz"

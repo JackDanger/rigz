@@ -15,7 +15,7 @@
 //! Instead, we use flate2's GzDecoder which properly parses each member.
 
 use std::fs::File;
-use std::io::{self, stdin, stdout, BufReader, BufWriter, Write};
+use std::io::{stdin, stdout, BufReader, BufWriter, Write};
 use std::path::Path;
 
 use memmap2::Mmap;
@@ -136,16 +136,46 @@ pub fn decompress_file(filename: &str, args: &GzippyArgs) -> GzippyResult<i32> {
 }
 
 pub fn decompress_stdin(_args: &GzippyArgs) -> GzippyResult<i32> {
-    use flate2::read::MultiGzDecoder;
+    use std::io::Read;
 
+    // Buffer stdin into memory to use our optimized parallel decompressor
+    // This trades memory for speed: ~20MB stdin fits easily in RAM
     let stdin = stdin();
-    let input = BufReader::with_capacity(STREAM_BUFFER_SIZE, stdin.lock());
-    let stdout = stdout();
-    let mut output = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
+    let mut input_data = Vec::new();
+    {
+        let mut reader = BufReader::with_capacity(STREAM_BUFFER_SIZE, stdin.lock());
+        reader.read_to_end(&mut input_data)?;
+    }
 
-    let mut decoder = MultiGzDecoder::new(input);
-    io::copy(&mut decoder, &mut output)?;
-    output.flush()?;
+    if input_data.is_empty() {
+        return Ok(0);
+    }
+
+    // Detect format
+    let format = if input_data.len() >= 2 && input_data[0] == 0x1f && input_data[1] == 0x8b {
+        CompressionFormat::Gzip
+    } else if input_data.len() >= 2 && input_data[0] == 0x78 {
+        CompressionFormat::Zlib
+    } else {
+        CompressionFormat::Gzip // Default
+    };
+
+    // Decompress into buffer (allows parallel decompression, then write to stdout)
+    let mut output_buffer = Vec::new();
+    match format {
+        CompressionFormat::Gzip | CompressionFormat::Zip => {
+            decompress_gzip_libdeflate(&input_data, &mut output_buffer)?;
+        }
+        CompressionFormat::Zlib => {
+            decompress_zlib_libdeflate(&input_data, &mut output_buffer)?;
+        }
+    }
+
+    // Write to stdout
+    let stdout = stdout();
+    let mut writer = BufWriter::with_capacity(STREAM_BUFFER_SIZE, stdout.lock());
+    writer.write_all(&output_buffer)?;
+    writer.flush()?;
 
     Ok(0)
 }
@@ -363,16 +393,12 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
         .unwrap_or(4);
 
     if !is_likely_multi_member(data) {
-        // Single-member: try our optimized single-member parallel first
-        if let Ok(bytes) = crate::bgzf::decompress_single_member_parallel(data, writer, num_threads)
-        {
-            if std::env::var("GZIPPY_DEBUG").is_ok() {
-                eprintln!("[gzippy] Single-member: {} bytes", bytes);
-            }
-            return Ok(bytes);
+        // Single-member: use libdeflater (fastest for single-member)
+        // Our pure Rust is optimized for parallel BGZF, but libdeflater beats us
+        // on single-threaded single-member due to hand-optimized C.
+        if std::env::var("GZIPPY_DEBUG").is_ok() {
+            eprintln!("[gzippy] Single-member: using libdeflater (fastest path)");
         }
-
-        // Fallback to fast libdeflater path
         return decompress_single_member_libdeflate(data, writer);
     }
 

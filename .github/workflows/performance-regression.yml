@@ -70,14 +70,18 @@ jobs:
           cd rapidgzip/librapidarchive
           mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_ISAL=OFF
-          make -j$(nproc) rapidgzip || echo "rapidgzip build failed (optional)"
+          make -j$(nproc) rapidgzip
+          # Verify build succeeded
+          test -f tools/rapidgzip || (echo "ERROR: rapidgzip build failed" && exit 1)
 
       - name: Build igzip
         run: |
           cd isa-l
           mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release
-          make -j$(nproc) igzip || echo "igzip build failed (optional)"
+          make -j$(nproc) igzip
+          # Verify build succeeded
+          test -f bin/igzip || (echo "ERROR: igzip build failed" && exit 1)
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
@@ -194,19 +198,17 @@ jobs:
         run: |
           chmod +x tools/target/release/gzippy
           chmod +x tools/pigz/pigz tools/pigz/unpigz
-          [ -f tools/rapidgzip/librapidarchive/build/tools/rapidgzip ] && chmod +x tools/rapidgzip/librapidarchive/build/tools/rapidgzip || true
+          chmod +x tools/rapidgzip/librapidarchive/build/tools/rapidgzip
+          # Verify rapidgzip is available - this is REQUIRED, not optional
+          tools/rapidgzip/librapidarchive/build/tools/rapidgzip --version || (echo "ERROR: rapidgzip not available" && exit 1)
 
       - name: Run benchmark
         run: |
-          RAPIDGZIP=""
-          if [ -f tools/rapidgzip/librapidarchive/build/tools/rapidgzip ]; then
-            RAPIDGZIP="--rapidgzip tools/rapidgzip/librapidarchive/build/tools/rapidgzip"
-          fi
           python3 scripts/benchmark_guard.py \
             --type rapidgzip-multi \
             --gzippy tools/target/release/gzippy \
             --pigz tools/pigz/pigz \
-            $RAPIDGZIP
+            --rapidgzip tools/rapidgzip/librapidarchive/build/tools/rapidgzip
 
   # ============================================================================
   # Guard: vs rapidgzip on single-member files
@@ -227,18 +229,16 @@ jobs:
       - name: Setup tools
         run: |
           chmod +x tools/target/release/gzippy
-          [ -f tools/rapidgzip/librapidarchive/build/tools/rapidgzip ] && chmod +x tools/rapidgzip/librapidarchive/build/tools/rapidgzip || true
+          chmod +x tools/rapidgzip/librapidarchive/build/tools/rapidgzip
+          # Verify rapidgzip is available - this is REQUIRED, not optional
+          tools/rapidgzip/librapidarchive/build/tools/rapidgzip --version || (echo "ERROR: rapidgzip not available" && exit 1)
 
       - name: Run benchmark
         run: |
-          RAPIDGZIP=""
-          if [ -f tools/rapidgzip/librapidarchive/build/tools/rapidgzip ]; then
-            RAPIDGZIP="--rapidgzip tools/rapidgzip/librapidarchive/build/tools/rapidgzip"
-          fi
           python3 scripts/benchmark_guard.py \
             --type rapidgzip-single \
             --gzippy tools/target/release/gzippy \
-            $RAPIDGZIP
+            --rapidgzip tools/rapidgzip/librapidarchive/build/tools/rapidgzip
 
   # ============================================================================
   # Guard: vs igzip on single-threaded decompression
