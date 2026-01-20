@@ -734,6 +734,10 @@ fn decode_huffman_into(
 
         match entry.distance {
             DIST_LITERAL => {
+                // === LITERAL FAST PATH ===
+                // This is the hot path - most deflate streams are literal-heavy
+                // We use a tight inner loop that continues until we hit a non-literal
+
                 if unlikely(out_pos >= output.len()) {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
@@ -743,77 +747,21 @@ fn decode_huffman_into(
                 output[out_pos] = entry.symbol_or_length;
                 out_pos += 1;
 
-                // Multi-literal optimization: decode up to 4 literals in a row
-                // This is the hot path - most compressed data is literal-heavy
-                // We unroll 4 iterations to reduce loop overhead
-                if likely(bits.bits_available() >= 48 && out_pos + 4 <= output.len()) {
-                    // Fast path: plenty of bits and output space
-                    let mut literals_decoded = 0;
+                // Continue decoding literals in a tight loop while we can
+                // Exit conditions: non-literal, need refill, output full
+                while likely(bits.bits_available() >= 12 && out_pos + 8 <= output.len()) {
+                    let e = combined_lut.decode(bits.buffer());
 
-                    // Literal 2
-                    let entry2 = combined_lut.decode(bits.buffer());
-                    if entry2.bits_to_skip > 0 && entry2.distance == DIST_LITERAL {
-                        bits.consume(entry2.bits_to_skip as u32);
-                        output[out_pos] = entry2.symbol_or_length;
-                        out_pos += 1;
-                        literals_decoded += 1;
-
-                        // Literal 3
-                        let entry3 = combined_lut.decode(bits.buffer());
-                        if entry3.bits_to_skip > 0 && entry3.distance == DIST_LITERAL {
-                            bits.consume(entry3.bits_to_skip as u32);
-                            output[out_pos] = entry3.symbol_or_length;
-                            out_pos += 1;
-                            literals_decoded += 1;
-
-                            // Literal 4
-                            let entry4 = combined_lut.decode(bits.buffer());
-                            if entry4.bits_to_skip > 0 && entry4.distance == DIST_LITERAL {
-                                bits.consume(entry4.bits_to_skip as u32);
-                                output[out_pos] = entry4.symbol_or_length;
-                                out_pos += 1;
-                                literals_decoded += 1;
-
-                                // Literal 5 (if we still have room)
-                                if bits.bits_available() >= 12 {
-                                    let entry5 = combined_lut.decode(bits.buffer());
-                                    if entry5.bits_to_skip > 0 && entry5.distance == DIST_LITERAL {
-                                        bits.consume(entry5.bits_to_skip as u32);
-                                        output[out_pos] = entry5.symbol_or_length;
-                                        out_pos += 1;
-                                        #[allow(unused_assignments)]
-                                        {
-                                            literals_decoded += 1;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    // Check if this is a literal (fast check)
+                    if e.bits_to_skip == 0 || e.distance != DIST_LITERAL {
+                        // Non-literal - exit inner loop, outer loop will handle it
+                        break;
                     }
 
-                    // Skip refill if we decoded enough literals
-                    let _ = literals_decoded;
-                } else if bits.bits_available() >= 24 {
-                    // Slower path: check bounds on each literal
-                    let entry2 = combined_lut.decode(bits.buffer());
-                    if entry2.bits_to_skip > 0 && entry2.distance == DIST_LITERAL {
-                        bits.consume(entry2.bits_to_skip as u32);
-                        if out_pos < output.len() {
-                            output[out_pos] = entry2.symbol_or_length;
-                            out_pos += 1;
-                        }
-
-                        if bits.bits_available() >= 12 {
-                            let entry3 = combined_lut.decode(bits.buffer());
-                            if entry3.bits_to_skip > 0 && entry3.distance == DIST_LITERAL {
-                                bits.consume(entry3.bits_to_skip as u32);
-                                if out_pos < output.len() {
-                                    output[out_pos] = entry3.symbol_or_length;
-                                    out_pos += 1;
-                                }
-                            }
-                        }
-                    }
+                    // It's a literal - consume and write
+                    bits.consume(e.bits_to_skip as u32);
+                    output[out_pos] = e.symbol_or_length;
+                    out_pos += 1;
                 }
             }
 
