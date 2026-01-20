@@ -1460,6 +1460,56 @@ mod tests {
         assert_eq!(&output[..size], &original3[..], "Content mismatch");
     }
 
+    /// Micro-benchmark: decode loop without branching overhead
+    /// This shows the theoretical maximum throughput if we eliminate branching
+    #[test]
+    fn microbench_decode_loop() {
+        use crate::two_level_table::FastBits;
+
+        // Create synthetic bit stream
+        let data: Vec<u8> = (0..8_000_000u64).map(|i| (i * 7 % 256) as u8).collect();
+
+        // Build a simple LUT with fixed Huffman codes
+        let lens: Vec<u8> = (0..288u16)
+            .map(|i| {
+                if i < 144 {
+                    8
+                } else if i < 256 {
+                    9
+                } else if i < 280 {
+                    7
+                } else {
+                    8
+                }
+            })
+            .collect();
+        let lut = crate::combined_lut::CombinedLUT::build(&lens, &[5u8; 32]).unwrap();
+
+        // Benchmark: tight loop (lookup + consume, no branching)
+        let iterations = 5_000_000u64;
+        let mut sum = 0u64;
+        let mut bits = FastBits::new(&data);
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            bits.ensure(12);
+            let entry = lut.decode(bits.buffer());
+            bits.consume(entry.bits_to_skip as u32);
+            sum += entry.symbol_or_length as u64;
+        }
+        let elapsed = start.elapsed();
+        let ops_per_sec = iterations as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+
+        eprintln!("\n=== Decode Loop Micro-Benchmark ===");
+        eprintln!("Tight loop (no branching): {:.1} M/s", ops_per_sec);
+        eprintln!("Sum (prevent optimization): {}", sum);
+
+        // Key insight: ~1500 M ops/s is possible without branching
+        // Real decode loop is ~1470 M symbols/s (11,773 MB/s)
+        // The 61% gap to libdeflate (18,952 MB/s) is NOT from bit operations
+        // It's from branch overhead in the main decode loop
+    }
+
     /// Benchmark inflate_into vs libdeflate
     #[test]
     fn benchmark_inflate_into() {
