@@ -406,10 +406,13 @@ def main():
         # === COMPRESSION BENCHMARKS ===
         print("\nCompression:")
         
-        # Always benchmark all tools for complete comparison
-        # zopfli only at L9 (it's very slow and only makes sense for max compression)
+        # Benchmark tools for comparison
+        # - igzip only at L1-L3 (its max level is 3, so higher levels are noise)
+        # - zopfli only at L9 (it's very slow and only makes sense for max compression)
         comp_files = {}
-        tools = ["gzip", "pigz", "igzip", "gzippy"]
+        tools = ["gzip", "pigz", "gzippy"]
+        if args.level <= 3:
+            tools.insert(2, "igzip")  # Insert after pigz for consistent ordering
         if args.level >= 9:
             tools.append("zopfli")
         
