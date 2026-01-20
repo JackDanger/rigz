@@ -511,9 +511,147 @@ pub fn build_fixed_tables() -> (ConsumeFirstTable, ConsumeFirstTable) {
     (lit_table, dist_table)
 }
 
+// ============================================================================
+// JIT Table Cache
+// ============================================================================
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+/// Cached table pair (literal/length + distance)
+#[derive(Clone)]
+pub struct CachedTablePair {
+    pub lit_table: Arc<ConsumeFirstTable>,
+    pub dist_table: Arc<ConsumeFirstTable>,
+}
+
+/// Global table cache for JIT-style optimization
+/// Uses FNV-1a hash of code lengths as key
+static TABLE_CACHE: std::sync::OnceLock<Mutex<HashMap<u64, CachedTablePair>>> =
+    std::sync::OnceLock::new();
+
+fn get_cache() -> &'static Mutex<HashMap<u64, CachedTablePair>> {
+    TABLE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Compute a fast hash of code lengths for cache lookup (FNV-1a)
+fn hash_code_lengths(lit_lens: &[u8], dist_lens: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in lit_lens.iter().chain(dist_lens.iter()) {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Build or retrieve cached tables for the given code lengths
+///
+/// This implements JIT-style caching: if we've seen these exact code lengths
+/// before, we return the cached tables instead of rebuilding them.
+pub fn get_or_build_tables(lit_lens: &[u8], dist_lens: &[u8]) -> io::Result<CachedTablePair> {
+    let hash = hash_code_lengths(lit_lens, dist_lens);
+
+    // Fast path: check cache
+    {
+        let cache = get_cache().lock().unwrap();
+        if let Some(cached) = cache.get(&hash) {
+            return Ok(cached.clone());
+        }
+    }
+
+    // Slow path: build tables
+    let lit_table = Arc::new(ConsumeFirstTable::build(lit_lens)?);
+    let dist_table = Arc::new(ConsumeFirstTable::build_distance(dist_lens)?);
+
+    let pair = CachedTablePair {
+        lit_table,
+        dist_table,
+    };
+
+    // Store in cache
+    {
+        let mut cache = get_cache().lock().unwrap();
+        // Double-check in case another thread built it
+        if let Some(existing) = cache.get(&hash) {
+            return Ok(existing.clone());
+        }
+        cache.insert(hash, pair.clone());
+    }
+
+    Ok(pair)
+}
+
+/// Clear the table cache (useful for testing or memory pressure)
+pub fn clear_table_cache() {
+    if let Some(cache) = TABLE_CACHE.get() {
+        cache.lock().unwrap().clear();
+    }
+}
+
+/// Get cache statistics (entries, capacity)
+pub fn cache_stats() -> (usize, usize) {
+    if let Some(cache) = TABLE_CACHE.get() {
+        let guard = cache.lock().unwrap();
+        (guard.len(), guard.capacity())
+    } else {
+        (0, 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_jit_cache() {
+        // Clear any existing cache
+        clear_table_cache();
+
+        // Build fixed Huffman tables twice - should hit cache on second call
+        let mut lit_lens = vec![0u8; 288];
+        lit_lens[..144].fill(8);
+        lit_lens[144..256].fill(9);
+        lit_lens[256] = 7;
+        lit_lens[257..280].fill(7);
+        lit_lens[280..288].fill(8);
+        let dist_lens = vec![5u8; 32];
+
+        // First build - should be cache miss
+        let (entries_before, _) = cache_stats();
+        let tables1 = get_or_build_tables(&lit_lens, &dist_lens).unwrap();
+        let (entries_after, _) = cache_stats();
+        assert_eq!(
+            entries_after,
+            entries_before + 1,
+            "First build should add to cache"
+        );
+
+        // Second build with same inputs - should be cache hit
+        let tables2 = get_or_build_tables(&lit_lens, &dist_lens).unwrap();
+        let (entries_final, _) = cache_stats();
+        assert_eq!(
+            entries_final, entries_after,
+            "Cache hit should not add entries"
+        );
+
+        // Tables should be the same (same Arc pointer)
+        assert!(Arc::ptr_eq(&tables1.lit_table, &tables2.lit_table));
+        assert!(Arc::ptr_eq(&tables1.dist_table, &tables2.dist_table));
+
+        // Different input should create new entry
+        let dist_lens2 = vec![6u8; 32];
+        let tables3 = get_or_build_tables(&lit_lens, &dist_lens2).unwrap();
+        let (entries_new, _) = cache_stats();
+        assert_eq!(
+            entries_new,
+            entries_final + 1,
+            "Different input should add to cache"
+        );
+        assert!(!Arc::ptr_eq(&tables1.dist_table, &tables3.dist_table));
+
+        eprintln!("\n[TEST] JIT cache test passed!");
+        eprintln!("[TEST]   Cache entries: {}", entries_new);
+    }
 
     #[test]
     fn test_entry_types() {

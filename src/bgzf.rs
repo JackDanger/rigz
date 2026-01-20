@@ -646,12 +646,11 @@ fn decode_dynamic_into_turbo(
     let lit_len_lens = &code_lens[..hlit];
     let dist_lens = &code_lens[hlit..];
 
-    // Consume-first path - key to libdeflate's speed
-    use crate::consume_first_table::ConsumeFirstTable;
+    // Use JIT table cache - avoids rebuilding identical tables
+    use crate::consume_first_table::get_or_build_tables;
 
-    let cf_lit_table = ConsumeFirstTable::build(lit_len_lens)?;
-    let cf_dist_table = ConsumeFirstTable::build_distance(dist_lens)?;
-    decode_huffman_consume_first(bits, output, out_pos, &cf_lit_table, &cf_dist_table)
+    let tables = get_or_build_tables(lit_len_lens, dist_lens)?;
+    decode_huffman_consume_first(bits, output, out_pos, &tables.lit_table, &tables.dist_table)
 }
 
 /// Public version of inflate_into for use by other modules
