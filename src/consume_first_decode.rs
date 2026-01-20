@@ -134,7 +134,7 @@ impl<'a> Bits<'a> {
 }
 
 // =============================================================================
-// Match Copy - Optimized
+// Match Copy - Matching libdeflate's decompress_template.h lines 575-680
 // =============================================================================
 
 #[inline(always)]
@@ -144,27 +144,68 @@ fn copy_match(output: &mut [u8], out_pos: usize, distance: u32, length: u32) -> 
 
     unsafe {
         let out_ptr = output.as_mut_ptr();
-        let dst = out_ptr.add(out_pos);
-        let src = out_ptr.add(out_pos - dist);
+        let mut dst = out_ptr.add(out_pos);
+        let mut src = out_ptr.add(out_pos - dist);
+        let end = dst.add(len);
 
-        if dist == 1 {
-            // RLE
-            std::ptr::write_bytes(dst, *src, len);
-        } else if dist >= 8 {
-            // Fast 8-byte chunks
-            let mut s = src;
-            let mut d = dst;
-            let end = dst.add(len);
-            while d < end {
-                let chunk = (s as *const u64).read_unaligned();
-                (d as *mut u64).write_unaligned(chunk);
-                s = s.add(8);
-                d = d.add(8);
+        if dist >= 8 {
+            // Fast path: offset >= WORDBYTES (8)
+            // Unconditionally copy 5 words first (40 bytes - covers most matches)
+            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+            src = src.add(8);
+            dst = dst.add(8);
+            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+            src = src.add(8);
+            dst = dst.add(8);
+            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+            src = src.add(8);
+            dst = dst.add(8);
+            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+            src = src.add(8);
+            dst = dst.add(8);
+            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+            src = src.add(8);
+            dst = dst.add(8);
+
+            // Loop for longer matches
+            while dst < end {
+                (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+                src = src.add(8);
+                dst = dst.add(8);
+            }
+        } else if dist == 1 {
+            // RLE path: broadcast byte and copy words (auto-vectorizes)
+            let v = 0x0101010101010101u64 * (*src as u64);
+            (dst as *mut u64).write_unaligned(v);
+            dst = dst.add(8);
+            (dst as *mut u64).write_unaligned(v);
+            dst = dst.add(8);
+            (dst as *mut u64).write_unaligned(v);
+            dst = dst.add(8);
+            (dst as *mut u64).write_unaligned(v);
+            dst = dst.add(8);
+            while dst < end {
+                (dst as *mut u64).write_unaligned(v);
+                dst = dst.add(8);
             }
         } else {
-            // Byte-by-byte for short distances
-            for i in 0..len {
-                *dst.add(i) = *src.add(i % dist);
+            // Small distance (2-7): word copy with stride = offset
+            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+            src = src.add(dist);
+            dst = dst.add(dist);
+            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+            src = src.add(dist);
+            dst = dst.add(dist);
+            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+            src = src.add(dist);
+            dst = dst.add(dist);
+            (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+            src = src.add(dist);
+            dst = dst.add(dist);
+            while dst < end {
+                (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
+                src = src.add(dist);
+                dst = dst.add(dist);
             }
         }
     }
@@ -326,10 +367,11 @@ fn decode_huffman_cf(
                 ));
             }
 
-            out_pos = copy_match(output, out_pos, distance, length);
-
+            // PRELOAD next entry BEFORE copy
             bits.refill();
             entry = litlen.lookup(bits.peek());
+
+            out_pos = copy_match(output, out_pos, distance, length);
             continue; // NEVER fall through
         }
 
@@ -380,12 +422,13 @@ fn decode_huffman_cf(
             ));
         }
 
-        // Copy match
-        out_pos = copy_match(output, out_pos, distance, length);
-
-        // PRELOAD next entry
+        // PRELOAD next entry BEFORE copy (libdeflate optimization)
+        // This hides memory latency by overlapping lookup with copy
         bits.refill();
         entry = litlen.lookup(bits.peek());
+
+        // Copy match (overlaps with memory latency of table lookup)
+        out_pos = copy_match(output, out_pos, distance, length);
     }
 
     // GENERIC LOOP (near end of output)
