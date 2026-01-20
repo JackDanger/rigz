@@ -370,7 +370,7 @@ jobs:
   # Guard: Must beat rapidgzip on multi-member files
   # ============================================================================
   vs-rapidgzip:
-    name: Guard: Within 1% of rapidgzip (multi-member)
+    name: "Guard: Within 1% of rapidgzip (multi-member)"
     runs-on: ubuntu-latest
     
     steps:
