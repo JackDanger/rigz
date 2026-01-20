@@ -259,7 +259,85 @@ jobs:
           retention-days: 7
 
   # ============================================================================
-  # STAGE 3b: Random data edge cases
+  # STAGE 3b: Single-Member Large File Benchmark (tests 4-phase pipeline)
+  # ============================================================================
+  # This specifically tests single-member gzip files (created by standard gzip),
+  # which exercise the hyper-parallel 4-phase pipeline:
+  #   Phase 1: Window Boot (sequential first chunk for 32KB window)
+  #   Phase 2: Speculative Parallel Decode (markers for unresolved back-refs)
+  #   Phase 3: Window Propagation + SIMD Marker Replacement
+  #   Phase 4: Write Output
+  #
+  # Uses 500MB tarball to ensure parallel overhead is worth it.
+  # ============================================================================
+  single-member:
+    name: Single-Member 500MB ${{ matrix.threads }}T
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        threads: [1, 0]  # 0 = max cores
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: ./bin
+
+      - name: Setup
+        run: |
+          chmod +x ./bin/*
+          mkdir -p results
+          
+          if [ "${{ matrix.threads }}" = "0" ]; then
+            echo "THREADS=$(nproc)" >> $GITHUB_ENV
+          else
+            echo "THREADS=${{ matrix.threads }}" >> $GITHUB_ENV
+          fi
+
+      - name: Generate 500MB tarball (single-member gzip)
+        run: |
+          echo "Creating 500MB tarball from /usr..."
+          
+          # Create a real tarball from /usr (realistic mixed content)
+          tar cf - /usr/share /usr/lib 2>/dev/null | head -c $((500 * 1024 * 1024)) > /tmp/giant.tar
+          
+          # Pad to exactly 500MB if needed
+          CURRENT_SIZE=$(stat -c%s /tmp/giant.tar)
+          if [ "$CURRENT_SIZE" -lt $((500 * 1024 * 1024)) ]; then
+            dd if=/dev/zero bs=1 count=$((500 * 1024 * 1024 - CURRENT_SIZE)) >> /tmp/giant.tar 2>/dev/null
+          fi
+          
+          echo "Tarball size: $(stat -c%s /tmp/giant.tar) bytes"
+          
+          # Compress with standard gzip -6 (creates single-member file)
+          # This is the key: NOT pigz or gzippy, which create multi-member
+          echo "Compressing with gzip -6 (single-member)..."
+          gzip -6 -c /tmp/giant.tar > /tmp/giant.tar.gz
+          
+          echo "Compressed size: $(stat -c%s /tmp/giant.tar.gz) bytes"
+          echo "Ratio: $(echo "scale=2; $(stat -c%s /tmp/giant.tar.gz) * 100 / $(stat -c%s /tmp/giant.tar)" | bc)%"
+
+      - name: Benchmark single-member decompression
+        run: |
+          python3 scripts/benchmark_single_member.py \
+            --binaries ./bin \
+            --compressed-file /tmp/giant.tar.gz \
+            --original-file /tmp/giant.tar \
+            --threads $THREADS \
+            --output results/single-member.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: results-single-member-t${{ matrix.threads }}
+          path: results/
+          retention-days: 7
+
+  # ============================================================================
+  # STAGE 3c: Random data edge cases
   # ============================================================================
   random-data:
     name: Random Data L${{ matrix.level }} T${{ matrix.threads }}
@@ -304,7 +382,7 @@ jobs:
   guards:
     name: Performance Guards
     runs-on: ubuntu-latest
-    needs: [benchmark, random-data]
+    needs: [benchmark, single-member, random-data]
     if: always() && needs.benchmark.result == 'success'
 
     steps:
