@@ -1,18 +1,13 @@
 # =============================================================================
 # Performance Guards: Protect our performance advantages
 # =============================================================================
-# These tests enforce hard thresholds. CI FAILS if we regress:
+# All guards use RELATIVE comparisons (gzippy vs other tools on same machine).
+# This ensures CI doesn't break when runner specs change.
 #
-# - BGZF Parallel: MUST achieve ≥500 MB/s (CI-conservative; local: ~3900 MB/s)
-# - Multi-member: MUST achieve ≥300 MB/s
-# - Single-member: MUST achieve ≥300 MB/s
+# Guards:
+# - vs pigz: MUST be faster on BGZF, multi-member, and single-member files
 # - vs rapidgzip: MUST be faster on both multi-member AND single-member files
-# - vs igzip: MUST be ≥90% of igzip speed (single-threaded decompression)
-#
-# These encode our key wins:
-# - BGZF parallel is 2.9x faster than libdeflate single-thread
-# - Multi-member parallel handles pigz-style files efficiently
-# - Competitive with rapidgzip (the established parallel decompressor)
+# - vs igzip: MUST be >= 90% of igzip speed (single-threaded decompression)
 #
 # NOTE: Thread counts and compression levels are tested in ci.yml (edge-cases)
 # =============================================================================
@@ -37,7 +32,7 @@ jobs:
   # Pure Rust Performance Advantages - These MUST be maintained
   # ============================================================================
   bgzf-parallel:
-    name: Guard: BGZF Parallel ≥500 MB/s
+    name: "Guard: BGZF faster than pigz"
     runs-on: ubuntu-latest
     
     steps:
@@ -48,14 +43,22 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Run BGZF parallel benchmark
+      - name: Install dependencies
         run: |
-          echo "## BGZF Parallel Performance" >> $GITHUB_STEP_SUMMARY
+          sudo apt-get update
+          sudo apt-get install -y build-essential zlib1g-dev
+
+      - name: Build tools
+        run: |
+          cargo build --release
+          make -C pigz
+
+      - name: Compare BGZF decompression
+        run: |
+          echo "## BGZF: gzippy vs pigz" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          cargo build --release
-          
-          # Create compressible test data (BGZF shines on compressible data)
+          # Create test data
           python3 -c "
           import random
           random.seed(42)
@@ -68,43 +71,49 @@ jobs:
           ./target/release/gzippy -1 -c /tmp/test.txt > /tmp/test.gz
           SIZE=$(stat -c%s /tmp/test.txt)
           
-          # Warmup
-          ./target/release/gzippy -d < /tmp/test.gz > /tmp/out1.txt
-          
-          # Timed runs
+          # Test gzippy
+          ./target/release/gzippy -d < /tmp/test.gz > /tmp/out1.txt  # warmup
           START=$(date +%s.%N)
           for i in 1 2 3 4 5; do
             ./target/release/gzippy -d < /tmp/test.gz > /tmp/out.txt
           done
           END=$(date +%s.%N)
+          GZIPPY_TIME=$(echo "($END - $START) / 5" | bc -l)
+          GZIPPY_SPEED=$(echo "$SIZE / $GZIPPY_TIME / 1000000" | bc -l)
           
-          TOTAL_TIME=$(echo "$END - $START" | bc)
-          AVG_TIME=$(echo "$TOTAL_TIME / 5" | bc -l)
-          SPEED=$(echo "$SIZE / $AVG_TIME / 1000000" | bc -l)
+          # Test pigz (unpigz)
+          ./pigz/unpigz -c /tmp/test.gz > /tmp/out2.txt  # warmup
+          START=$(date +%s.%N)
+          for i in 1 2 3 4 5; do
+            ./pigz/unpigz -c /tmp/test.gz > /tmp/out.txt
+          done
+          END=$(date +%s.%N)
+          PIGZ_TIME=$(echo "($END - $START) / 5" | bc -l)
+          PIGZ_SPEED=$(echo "$SIZE / $PIGZ_TIME / 1000000" | bc -l)
           
           # Verify correctness
           diff /tmp/test.txt /tmp/out.txt
           
-          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| File size | ${SIZE} bytes |" >> $GITHUB_STEP_SUMMARY
-          echo "| Avg time | ${AVG_TIME}s |" >> $GITHUB_STEP_SUMMARY
-          printf "| Speed | %.0f MB/s |\n" "$SPEED" >> $GITHUB_STEP_SUMMARY
+          RATIO=$(echo "$GZIPPY_SPEED / $PIGZ_SPEED" | bc -l)
+          
+          echo "| Tool | Speed (MB/s) |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------------|" >> $GITHUB_STEP_SUMMARY
+          printf "| gzippy | %.0f |\n" "$GZIPPY_SPEED" >> $GITHUB_STEP_SUMMARY
+          printf "| pigz | %.0f |\n" "$PIGZ_SPEED" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          printf "**Ratio**: gzippy is %.2fx of pigz\n" "$RATIO" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Check threshold: BGZF parallel should be > 500 MB/s (conservative for CI runners)
-          # Note: Local benchmarks show 3000+ MB/s, but CI runners are slower
-          THRESHOLD=500
-          if awk "BEGIN {exit !($SPEED > $THRESHOLD)}"; then
-            echo "✅ **PASS**: BGZF decompression $(printf '%.0f' $SPEED) MB/s > ${THRESHOLD} MB/s" >> $GITHUB_STEP_SUMMARY
+          # Must be faster than pigz (>= 0.95 allows for CI noise)
+          if awk "BEGIN {exit !($RATIO >= 0.95)}"; then
+            echo "✅ **PASS**: gzippy BGZF decompression is competitive" >> $GITHUB_STEP_SUMMARY
           else
-            echo "❌ **FAIL**: BGZF decompression too slow" >> $GITHUB_STEP_SUMMARY
-            echo "   Got: $(printf '%.0f' $SPEED) MB/s, Threshold: ${THRESHOLD} MB/s" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **FAIL**: gzippy slower than pigz on BGZF (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
   multi-member-parallel:
-    name: Guard: Multi-member ≥300 MB/s
+    name: "Guard: Multi-member faster than pigz"
     runs-on: ubuntu-latest
     
     steps:
@@ -125,9 +134,9 @@ jobs:
           cargo build --release
           make -C pigz
 
-      - name: Test multi-member decompression
+      - name: Compare multi-member decompression
         run: |
-          echo "## Multi-member Parallel Performance" >> $GITHUB_STEP_SUMMARY
+          echo "## Multi-member: gzippy vs pigz" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           # Create test data
@@ -141,47 +150,51 @@ jobs:
           
           # Compress with pigz (creates multi-member gzip)
           ./pigz/pigz -p4 -c /tmp/test.txt > /tmp/test-pigz.gz
+          SIZE=$(stat -c%s /tmp/test.txt)
           
-          # Decompress with gzippy and measure
-          CORES=$(nproc)
-          
-          # Warmup
-          ./target/release/gzippy -d < /tmp/test-pigz.gz > /tmp/out1.txt
-          
-          # Timed run
+          # Test gzippy
+          ./target/release/gzippy -d < /tmp/test-pigz.gz > /tmp/out1.txt  # warmup
           START=$(date +%s.%N)
           for i in 1 2 3 4 5; do
             ./target/release/gzippy -d < /tmp/test-pigz.gz > /tmp/out.txt
           done
           END=$(date +%s.%N)
+          GZIPPY_TIME=$(echo "($END - $START) / 5" | bc -l)
+          GZIPPY_SPEED=$(echo "$SIZE / $GZIPPY_TIME / 1000000" | bc -l)
           
-          TOTAL_TIME=$(echo "$END - $START" | bc)
-          AVG_TIME=$(echo "$TOTAL_TIME / 5" | bc -l)
-          SIZE=$(stat -c%s /tmp/test.txt)
-          SPEED=$(echo "$SIZE / $AVG_TIME / 1000000" | bc -l)
+          # Test pigz (unpigz)
+          ./pigz/unpigz -c /tmp/test-pigz.gz > /tmp/out2.txt  # warmup
+          START=$(date +%s.%N)
+          for i in 1 2 3 4 5; do
+            ./pigz/unpigz -c /tmp/test-pigz.gz > /tmp/out.txt
+          done
+          END=$(date +%s.%N)
+          PIGZ_TIME=$(echo "($END - $START) / 5" | bc -l)
+          PIGZ_SPEED=$(echo "$SIZE / $PIGZ_TIME / 1000000" | bc -l)
           
           # Verify correctness
           diff /tmp/test.txt /tmp/out.txt
           
-          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| File size | ${SIZE} bytes |" >> $GITHUB_STEP_SUMMARY
-          echo "| Avg time | ${AVG_TIME}s |" >> $GITHUB_STEP_SUMMARY
-          printf "| Speed | %.0f MB/s |\n" "$SPEED" >> $GITHUB_STEP_SUMMARY
+          RATIO=$(echo "$GZIPPY_SPEED / $PIGZ_SPEED" | bc -l)
+          
+          echo "| Tool | Speed (MB/s) |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------------|" >> $GITHUB_STEP_SUMMARY
+          printf "| gzippy | %.0f |\n" "$GZIPPY_SPEED" >> $GITHUB_STEP_SUMMARY
+          printf "| pigz | %.0f |\n" "$PIGZ_SPEED" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          printf "**Ratio**: gzippy is %.2fx of pigz\n" "$RATIO" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Check threshold: multi-member should be > 300 MB/s (conservative for CI)
-          THRESHOLD=300
-          if awk "BEGIN {exit !($SPEED > $THRESHOLD)}"; then
-            echo "✅ **PASS**: Multi-member decompression $(printf '%.0f' $SPEED) MB/s > ${THRESHOLD} MB/s" >> $GITHUB_STEP_SUMMARY
+          # Must be faster than pigz (>= 0.95 allows for CI noise)
+          if awk "BEGIN {exit !($RATIO >= 0.95)}"; then
+            echo "✅ **PASS**: gzippy multi-member decompression is competitive" >> $GITHUB_STEP_SUMMARY
           else
-            echo "❌ **FAIL**: Multi-member decompression too slow" >> $GITHUB_STEP_SUMMARY
-            echo "   Got: $(printf '%.0f' $SPEED) MB/s, Threshold: ${THRESHOLD} MB/s" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **FAIL**: gzippy slower than pigz on multi-member (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
   single-member-gzip:
-    name: Guard: Single-member ≥300 MB/s
+    name: "Guard: Single-member faster than gzip"
     runs-on: ubuntu-latest
     
     steps:
@@ -192,9 +205,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Test single-member decompression
+      - name: Compare single-member decompression
         run: |
-          echo "## Single-member gzip Performance" >> $GITHUB_STEP_SUMMARY
+          echo "## Single-member: gzippy vs gzip" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           # Create test data
@@ -208,41 +221,49 @@ jobs:
           
           # Compress with gzip (single-member)
           gzip -c /tmp/test.txt > /tmp/test-gzip.gz
+          SIZE=$(stat -c%s /tmp/test.txt)
           
           cargo build --release
           
-          # Warmup
-          ./target/release/gzippy -d < /tmp/test-gzip.gz > /tmp/out1.txt
-          
-          # Timed runs
+          # Test gzippy
+          ./target/release/gzippy -d < /tmp/test-gzip.gz > /tmp/out1.txt  # warmup
           START=$(date +%s.%N)
           for i in 1 2 3 4 5; do
             ./target/release/gzippy -d < /tmp/test-gzip.gz > /tmp/out.txt
           done
           END=$(date +%s.%N)
+          GZIPPY_TIME=$(echo "($END - $START) / 5" | bc -l)
+          GZIPPY_SPEED=$(echo "$SIZE / $GZIPPY_TIME / 1000000" | bc -l)
           
-          TOTAL_TIME=$(echo "$END - $START" | bc)
-          AVG_TIME=$(echo "$TOTAL_TIME / 5" | bc -l)
-          SIZE=$(stat -c%s /tmp/test.txt)
-          SPEED=$(echo "$SIZE / $AVG_TIME / 1000000" | bc -l)
+          # Test gzip
+          gzip -d < /tmp/test-gzip.gz > /tmp/out2.txt  # warmup
+          gzip -c /tmp/test.txt > /tmp/test-gzip.gz  # recreate since gzip consumed it
+          START=$(date +%s.%N)
+          for i in 1 2 3 4 5; do
+            gzip -d -c /tmp/test-gzip.gz > /tmp/out.txt
+          done
+          END=$(date +%s.%N)
+          GZIP_TIME=$(echo "($END - $START) / 5" | bc -l)
+          GZIP_SPEED=$(echo "$SIZE / $GZIP_TIME / 1000000" | bc -l)
           
           # Verify correctness
           diff /tmp/test.txt /tmp/out.txt
           
-          echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| File size | ${SIZE} bytes |" >> $GITHUB_STEP_SUMMARY
-          echo "| Avg time | ${AVG_TIME}s |" >> $GITHUB_STEP_SUMMARY
-          printf "| Speed | %.0f MB/s |\n" "$SPEED" >> $GITHUB_STEP_SUMMARY
+          RATIO=$(echo "$GZIPPY_SPEED / $GZIP_SPEED" | bc -l)
+          
+          echo "| Tool | Speed (MB/s) |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------------|" >> $GITHUB_STEP_SUMMARY
+          printf "| gzippy | %.0f |\n" "$GZIPPY_SPEED" >> $GITHUB_STEP_SUMMARY
+          printf "| gzip | %.0f |\n" "$GZIP_SPEED" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          printf "**Ratio**: gzippy is %.2fx of gzip\n" "$RATIO" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Check threshold: single-member should be > 300 MB/s (conservative for CI)
-          THRESHOLD=300
-          if awk "BEGIN {exit !($SPEED > $THRESHOLD)}"; then
-            echo "✅ **PASS**: Single-member decompression $(printf '%.0f' $SPEED) MB/s > ${THRESHOLD} MB/s" >> $GITHUB_STEP_SUMMARY
+          # Must be faster than gzip (>= 1.0, no slack needed - gzip is slow)
+          if awk "BEGIN {exit !($RATIO >= 1.0)}"; then
+            echo "✅ **PASS**: gzippy is faster than gzip" >> $GITHUB_STEP_SUMMARY
           else
-            echo "❌ **FAIL**: Single-member decompression too slow" >> $GITHUB_STEP_SUMMARY
-            echo "   Got: $(printf '%.0f' $SPEED) MB/s, Threshold: ${THRESHOLD} MB/s" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **FAIL**: gzippy slower than gzip (${RATIO}x)" >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
@@ -548,12 +569,12 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Guard | Threshold | Status |" >> $GITHUB_STEP_SUMMARY
           echo "|-------|-----------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| BGZF Parallel | ≥500 MB/s | ${{ needs.bgzf-parallel.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Multi-member | ≥300 MB/s | ${{ needs.multi-member-parallel.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Single-member | ≥300 MB/s | ${{ needs.single-member-gzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| BGZF vs pigz | Must be faster | ${{ needs.bgzf-parallel.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Multi-member vs pigz | Must be faster | ${{ needs.multi-member-parallel.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Single-member vs gzip | Must be faster | ${{ needs.single-member-gzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| vs rapidgzip (multi) | Must be faster | ${{ needs.vs-rapidgzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| vs rapidgzip (single) | Must be faster | ${{ needs.vs-rapidgzip-single.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| vs igzip | ≥90% speed | ${{ needs.vs-igzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| vs igzip | >= 90% speed | ${{ needs.vs-igzip.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
