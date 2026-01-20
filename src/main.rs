@@ -13,6 +13,7 @@ mod block_finder_lut;
 mod cli;
 mod combined_lut;
 mod compression;
+mod consume_first_table;
 mod decompression;
 mod error;
 mod fast_inflate;
