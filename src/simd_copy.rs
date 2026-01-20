@@ -123,11 +123,75 @@ mod neon {
         copy_16(src.add(16), dst.add(16));
     }
 
-    /// Broadcast a single byte to 16 positions
+    /// Copy 64 bytes using four NEON operations
+    #[inline(always)]
+    pub unsafe fn copy_64(src: *const u8, dst: *mut u8) {
+        // Load all 4 vectors first to maximize memory parallelism
+        let v0 = vld1q_u8(src);
+        let v1 = vld1q_u8(src.add(16));
+        let v2 = vld1q_u8(src.add(32));
+        let v3 = vld1q_u8(src.add(48));
+        // Store all 4 vectors
+        vst1q_u8(dst, v0);
+        vst1q_u8(dst.add(16), v1);
+        vst1q_u8(dst.add(32), v2);
+        vst1q_u8(dst.add(48), v3);
+    }
+
+    /// Broadcast a single byte to 16 positions (RLE optimization)
     #[inline(always)]
     pub unsafe fn fill_byte_16(byte: u8, dst: *mut u8) {
         let pattern = vdupq_n_u8(byte);
         vst1q_u8(dst, pattern);
+    }
+
+    /// Broadcast a single byte to 32 positions
+    #[inline(always)]
+    pub unsafe fn fill_byte_32(byte: u8, dst: *mut u8) {
+        let pattern = vdupq_n_u8(byte);
+        vst1q_u8(dst, pattern);
+        vst1q_u8(dst.add(16), pattern);
+    }
+
+    /// Broadcast a 2-byte pattern to 16 bytes
+    #[inline(always)]
+    pub unsafe fn fill_word_16(word: u16, dst: *mut u8) {
+        let pattern = vdupq_n_u16(word);
+        vst1q_u8(dst, vreinterpretq_u8_u16(pattern));
+    }
+
+    /// Broadcast a 4-byte pattern to 16 bytes
+    #[inline(always)]
+    pub unsafe fn fill_dword_16(dword: u32, dst: *mut u8) {
+        let pattern = vdupq_n_u32(dword);
+        vst1q_u8(dst, vreinterpretq_u8_u32(pattern));
+    }
+
+    /// Broadcast an 8-byte pattern to 16 bytes
+    #[inline(always)]
+    pub unsafe fn fill_qword_16(qword: u64, dst: *mut u8) {
+        let pattern = vdupq_n_u64(qword);
+        vst1q_u8(dst, vreinterpretq_u8_u64(pattern));
+    }
+
+    /// Optimized LZ77 copy for distance >= 16 (non-overlapping)
+    /// Copies `len` bytes, may overwrite up to 15 extra bytes
+    #[inline(always)]
+    pub unsafe fn lz77_copy_nonoverlap(src: *const u8, dst: *mut u8, len: usize) {
+        let mut i = 0;
+        // Unroll for common cases
+        while i + 64 <= len {
+            copy_64(src.add(i), dst.add(i));
+            i += 64;
+        }
+        while i + 16 <= len {
+            copy_16(src.add(i), dst.add(i));
+            i += 16;
+        }
+        // Handle remainder with final potentially-overlapping copy
+        if i < len {
+            copy_16(src.add(len - 16), dst.add(len - 16));
+        }
     }
 }
 

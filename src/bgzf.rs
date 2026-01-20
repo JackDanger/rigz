@@ -845,12 +845,115 @@ fn decode_huffman_turbo(
     let fastloop_end = out_end.saturating_sub(320);
     let table = &packed_lut.table;
 
-    // === FASTLOOP with all Phase 1 optimizations ===
+    // === FASTLOOP with Phase 1 + Phase 2 optimizations ===
+    // Phase 2.1: Try to decode 2 literals at the TOP of each iteration
+    // This halves loop overhead for literal-heavy data (libdeflate's key insight)
     while out_pos < fastloop_end {
         bits.ensure(56);
 
-        // Direct table lookup
-        let entry = table[(bits.buffer() & LUT_MASK) as usize].0;
+        // === FIRST LITERAL ATTEMPT ===
+        let entry1 = table[(bits.buffer() & LUT_MASK) as usize].0;
+
+        // Check if it's a valid literal (bit 31 set, bits > 0)
+        if (entry1 as i32) < 0 && (entry1 & BITS_MASK) != 0 {
+            bits.consume_entry(entry1);
+            output[out_pos] = ((entry1 >> SYMBOL_SHIFT) & 0xFF) as u8;
+            out_pos += 1;
+
+            // === SECOND LITERAL ATTEMPT ===
+            let entry2 = table[(bits.buffer() & LUT_MASK) as usize].0;
+
+            if (entry2 as i32) < 0 && (entry2 & BITS_MASK) != 0 {
+                bits.consume_entry(entry2);
+                output[out_pos] = ((entry2 >> SYMBOL_SHIFT) & 0xFF) as u8;
+                out_pos += 1;
+
+                // Continue with tight literal loop for runs > 2
+                loop {
+                    if !bits.has_bits(12) {
+                        break;
+                    }
+                    let e = table[(bits.buffer() & LUT_MASK) as usize].0;
+                    if (e as i32) >= 0 || (e & BITS_MASK) == 0 {
+                        break;
+                    }
+                    bits.consume_entry(e);
+                    output[out_pos] = ((e >> SYMBOL_SHIFT) & 0xFF) as u8;
+                    out_pos += 1;
+                }
+                continue;
+            }
+            // Second wasn't a literal - fall through to handle it
+            // (entry2 is already loaded, no need to reload)
+            if entry2 & BITS_MASK == 0 {
+                // Invalid - use slow path
+                let (symbol, code_len) = lit_len_table.decode(bits.buffer());
+                if code_len == 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid code"));
+                }
+                bits.consume(code_len);
+                if symbol == 256 {
+                    return Ok(out_pos);
+                }
+                if symbol < 256 {
+                    output[out_pos] = symbol as u8;
+                    out_pos += 1;
+                    continue;
+                }
+                // Length code
+                let len_idx = (symbol - 257) as usize;
+                bits.ensure(16);
+                let length = LEN_START[len_idx] as usize
+                    + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
+                let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
+                if dist_len == 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid dist"));
+                }
+                bits.consume(dist_len);
+                bits.ensure(16);
+                let distance = DIST_START[dist_sym as usize] as usize
+                    + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+                if distance > out_pos {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad dist"));
+                }
+                out_pos = copy_match_into(output, out_pos, distance, length);
+                continue;
+            }
+
+            bits.consume_entry(entry2);
+            // Handle entry2 as non-literal (EOB, match, etc.) - jump to match handling
+            let dist_field = entry2 & DIST_MASK;
+            if dist_field == DIST_EOB {
+                return Ok(out_pos);
+            }
+            if dist_field == DIST_SLOW {
+                let length = ((entry2 >> SYMBOL_SHIFT) & 0xFF) as usize + 3;
+                let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
+                if dist_len == 0 {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid dist"));
+                }
+                bits.consume(dist_len);
+                bits.ensure(16);
+                let distance = DIST_START[dist_sym as usize] as usize
+                    + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+                if distance > out_pos {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad dist"));
+                }
+                out_pos = copy_match_into(output, out_pos, distance, length);
+                continue;
+            }
+            // Pre-computed match
+            let length = ((entry2 >> SYMBOL_SHIFT) & 0xFF) as usize + 3;
+            let distance = (dist_field >> DIST_SHIFT) as usize;
+            if distance > out_pos {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad dist"));
+            }
+            out_pos = copy_match_into(output, out_pos, distance, length);
+            continue;
+        }
+
+        // First entry wasn't a literal - handle it directly
+        let entry = entry1;
 
         // Invalid entry - fallback
         if entry & BITS_MASK == 0 {
@@ -892,27 +995,6 @@ fn decode_huffman_turbo(
 
         // OPTIMIZATION 1: bitsleft -= entry (consume full u32)
         bits.consume_entry(entry);
-
-        // LITERAL TEST: i32 < 0 means bit 31 set (literal)
-        if (entry as i32) < 0 {
-            output[out_pos] = ((entry >> SYMBOL_SHIFT) & 0xFF) as u8;
-            out_pos += 1;
-
-            // Tight literal inner loop
-            loop {
-                if !bits.has_bits(12) {
-                    break;
-                }
-                let e = table[(bits.buffer() & LUT_MASK) as usize].0;
-                if (e as i32) >= 0 || (e & BITS_MASK) == 0 {
-                    break;
-                }
-                bits.consume_entry(e);
-                output[out_pos] = ((e >> SYMBOL_SHIFT) & 0xFF) as u8;
-                out_pos += 1;
-            }
-            continue;
-        }
 
         let dist_field = entry & DIST_MASK;
 
