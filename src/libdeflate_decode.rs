@@ -393,7 +393,7 @@ fn get_or_build_dynamic_tables(
 }
 
 /// Build fixed Huffman tables (cached)
-fn get_fixed_tables() -> &'static (LitLenTable, DistTable) {
+pub fn get_fixed_tables() -> &'static (LitLenTable, DistTable) {
     FIXED_TABLES.get_or_init(|| {
         // Fixed literal/length table
         let mut litlen_lengths = [0u8; 288];
@@ -775,6 +775,167 @@ fn decode_huffman(
     }
 }
 
+/// Decode Huffman stream with double-literal cache
+/// 
+/// This version uses a pre-built double-literal cache to decode
+/// pairs of consecutive literals in a single lookup.
+fn decode_huffman_double_lit(
+    bits: &mut LibdeflateBits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    litlen_table: &LitLenTable,
+    dist_table: &DistTable,
+    double_cache: &crate::double_literal::DoubleLitCache,
+) -> Result<usize> {
+    use crate::double_literal::DOUBLE_LIT_BITS;
+    
+    const FASTLOOP_MARGIN: usize = 274;
+    
+    'fastloop: while out_pos + FASTLOOP_MARGIN <= output.len() {
+        bits.refill_branchless();
+        let saved_bitbuf = bits.peek_bits();
+        
+        // Try double-literal cache first
+        let dl_entry = double_cache.lookup(saved_bitbuf);
+        
+        if dl_entry.is_literal() {
+            let out_ptr = output.as_mut_ptr();
+            
+            if dl_entry.has_second() {
+                // Double literal - write both at once
+                unsafe {
+                    *out_ptr.add(out_pos) = dl_entry.symbol1();
+                    *out_ptr.add(out_pos + 1) = dl_entry.symbol2();
+                }
+                out_pos += 2;
+                bits.consume(dl_entry.total_bits() as u32);
+                
+                // Try to get more doubles
+                if bits.available() >= DOUBLE_LIT_BITS as u32 {
+                    let dl2 = double_cache.lookup(bits.peek_bits());
+                    if dl2.is_literal() && dl2.has_second() {
+                        unsafe {
+                            *out_ptr.add(out_pos) = dl2.symbol1();
+                            *out_ptr.add(out_pos + 1) = dl2.symbol2();
+                        }
+                        out_pos += 2;
+                        bits.consume(dl2.total_bits() as u32);
+                    }
+                }
+                continue 'fastloop;
+            } else {
+                // Single literal from cache
+                unsafe {
+                    *out_ptr.add(out_pos) = dl_entry.symbol1();
+                }
+                out_pos += 1;
+                bits.consume(dl_entry.total_bits() as u32);
+                continue 'fastloop;
+            }
+        }
+        
+        // Fall back to regular decode for non-literals
+        let mut entry = litlen_table.lookup(saved_bitbuf);
+        if entry.is_subtable_ptr() {
+            entry = litlen_table.lookup_subtable(entry, saved_bitbuf);
+        }
+        
+        if entry.is_exceptional() {
+            if entry.is_end_of_block() {
+                bits.consume_entry(entry.raw());
+                return Ok(out_pos);
+            }
+            return Err(Error::new(ErrorKind::InvalidData, "Unresolved subtable"));
+        }
+        
+        // Length code
+        bits.consume_entry(entry.raw());
+        let length = entry.decode_length(saved_bitbuf);
+        
+        bits.refill_branchless();
+        let dist_saved = bits.peek_bits();
+        let mut dist_entry = dist_table.lookup(dist_saved);
+        if dist_entry.is_subtable_ptr() {
+            dist_entry = dist_table.lookup_subtable(dist_entry, dist_saved);
+        }
+        
+        if dist_entry.is_exceptional() {
+            return Err(Error::new(ErrorKind::InvalidData, "Invalid distance code"));
+        }
+        
+        bits.consume_entry(dist_entry.raw());
+        let distance = dist_entry.decode_distance(dist_saved);
+        
+        if distance == 0 || distance as usize > out_pos {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Invalid distance {} at pos {}", distance, out_pos),
+            ));
+        }
+        
+        out_pos = copy_match(output, out_pos, distance, length);
+    }
+    
+    // Generic loop (no double-literal cache)
+    loop {
+        if !bits.has_bits(15) {
+            bits.refill_branchless();
+        }
+        
+        let saved_bitbuf = bits.peek_bits();
+        let entry = litlen_table.resolve(saved_bitbuf);
+        
+        if (entry.raw() as i32) < 0 {
+            if out_pos >= output.len() {
+                return Err(Error::new(ErrorKind::WriteZero, "Output buffer full"));
+            }
+            output[out_pos] = entry.literal_value();
+            out_pos += 1;
+            bits.consume_entry(entry.raw());
+            continue;
+        }
+        
+        if entry.is_end_of_block() {
+            bits.consume_entry(entry.raw());
+            return Ok(out_pos);
+        }
+        
+        if entry.is_exceptional() {
+            return Err(Error::new(ErrorKind::InvalidData, "Invalid code"));
+        }
+        
+        bits.consume_entry(entry.raw());
+        let length = entry.decode_length(saved_bitbuf);
+        
+        if !bits.has_bits(15) {
+            bits.refill_branchless();
+        }
+        
+        let dist_saved = bits.peek_bits();
+        let dist_entry = dist_table.resolve(dist_saved);
+        
+        if dist_entry.is_exceptional() {
+            return Err(Error::new(ErrorKind::InvalidData, "Invalid distance"));
+        }
+        
+        bits.consume_entry(dist_entry.raw());
+        let distance = dist_entry.decode_distance(dist_saved);
+        
+        if distance == 0 || distance as usize > out_pos {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Invalid distance {} at pos {}", distance, out_pos),
+            ));
+        }
+        
+        if out_pos + length as usize > output.len() {
+            return Err(Error::new(ErrorKind::WriteZero, "Output buffer full"));
+        }
+        
+        out_pos = copy_match(output, out_pos, distance, length);
+    }
+}
+
 /// Public entry point for decompression
 pub fn inflate_libdeflate(deflate_data: &[u8], output: &mut [u8]) -> Result<usize> {
     decode_libdeflate(deflate_data, output)
@@ -1037,5 +1198,67 @@ mod tests {
         
         // For deeper profiling, run: 
         // cargo flamegraph --bin gzippy -- -d benchmark_data/silesia-gzip.tar.gz -c > /dev/null
+    }
+    
+    /// Benchmark double-literal cache version
+    #[test]
+    fn bench_double_literal() {
+        let gz = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("Skipping double-literal bench - no silesia data");
+                return;
+            },
+        };
+        
+        let start = 10 + if (gz[3] & 0x08) != 0 {
+            gz[10..].iter().position(|&b| b == 0).unwrap_or(0) + 1
+        } else { 0 };
+        let end = gz.len() - 8;
+        let deflate_data = &gz[start..end];
+        let isize = u32::from_le_bytes([gz[gz.len()-4], gz[gz.len()-3], gz[gz.len()-2], gz[gz.len()-1]]) as usize;
+        
+        let mut output = vec![0u8; isize + 1000];
+        let mut lib_output = vec![0u8; isize + 1000];
+        
+        // Get reference from libdeflate
+        let lib_size = libdeflater::Decompressor::new()
+            .deflate_decompress(deflate_data, &mut lib_output)
+            .expect("libdeflate failed");
+        
+        // Build double-literal cache for fixed tables
+        let tables = get_fixed_tables();
+        let double_cache = crate::double_literal::DoubleLitCache::build(&tables.0);
+        
+        // Benchmark regular decode
+        let iterations = 5;
+        let start_t = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = inflate_libdeflate(deflate_data, &mut output);
+        }
+        let regular_time = start_t.elapsed();
+        
+        // Note: double_literal decode would need to be wired into the main inflate path
+        // For now, just report that the cache is built
+        
+        let regular_throughput = (isize * iterations) as f64 / regular_time.as_secs_f64() / 1e6;
+        
+        // Get libdeflate baseline
+        let start_t = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = libdeflater::Decompressor::new()
+                .deflate_decompress(deflate_data, &mut lib_output);
+        }
+        let lib_time = start_t.elapsed();
+        let lib_throughput = (lib_size * iterations) as f64 / lib_time.as_secs_f64() / 1e6;
+        
+        eprintln!("\n=== DOUBLE-LITERAL Benchmark ===");
+        eprintln!("Data size: {} MB", isize / 1_000_000);
+        eprintln!("Regular throughput:    {:>8.1} MB/s", regular_throughput);
+        eprintln!("libdeflate throughput: {:>8.1} MB/s", lib_throughput);
+        eprintln!("Ratio: {:.1}%", 100.0 * regular_throughput / lib_throughput);
+        eprintln!("Double-literal cache size: {} KB", 
+            std::mem::size_of::<crate::double_literal::DoubleLitCache>() / 1024);
+        eprintln!("================================\n");
     }
 }

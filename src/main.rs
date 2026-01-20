@@ -15,6 +15,7 @@ mod combined_lut;
 mod compression;
 mod consume_first_table;
 mod decompression;
+mod double_literal;
 mod error;
 mod fast_inflate;
 mod format;
