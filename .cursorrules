@@ -563,3 +563,56 @@ This uses `MAX_BITSLEFT = WORDBITS - 1` (e.g., 63) so the `|= MAX_BITSLEFT & ~7`
 3. **Use 11-bit LUT** (matches rapidgzip's optimal, 8KB table fits L1)
 4. **Special-case distance=1** as memset (very common pattern)
 5. **Branchless bit refill** - copy libdeflate's approach exactly
+
+## CRITICAL DISCOVERY: Consume-First Pattern (Jan 2026)
+
+**The #1 optimization opportunity: consume-first is 39.8% faster than check-first.**
+
+### What This Means
+
+libdeflate's decode loop:
+```c
+// CONSUME FIRST (unconditionally)
+bitbuf >>= (u8)entry;
+bitsleft -= entry;
+
+// THEN check type
+if (entry & HUFFDEC_LITERAL) { ... }
+```
+
+Our old approach:
+```rust
+// CHECK FIRST
+if is_literal(entry) {
+    // Then consume
+    bits.consume(entry.bits());
+}
+```
+
+### The Blocker
+
+Our `PackedLUT` uses `BITS=0` for invalid entries (codes > 12 bits).
+Consuming an entry with `BITS=0` is a no-op that corrupts decode state.
+
+### The Solution
+
+New `consume_first_table.rs` module:
+- Type bits (30-31): 00=subtable, 01=literal, 10=length, 11=EOB
+- Bits field (0-7): NEVER 0, always valid
+- Subtables for codes > 11 bits (like libdeflate)
+
+### Benchmark Proof
+
+```
+Check-first:   38.44ms
+Consume-first: 27.50ms
+Speedup: 39.8%
+
+Consume-first table throughput: 1,003.9 M symbols/sec
+```
+
+### Next Steps
+
+1. Build `ConsumeFirstTable` instead of `PackedLUT` in table construction
+2. Update `decode_huffman_turbo` to use consume-first pattern
+3. Expect ~40% speedup → should exceed libdeflate
