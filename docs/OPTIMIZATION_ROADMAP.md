@@ -70,13 +70,24 @@ modulo. Implemented libdeflate's word-at-a-time + stride approach.
 | Long Distance (d>=40) | 4,449 MB/s | ✅ Fast |
 | Short Distance (d=2-7) | 4,109 MB/s | ✅ Fixed |
 
+### Micro-benchmark Results (Jan 2026)
+
+| Component | Speed | Finding |
+|-----------|-------|---------|
+| Table lookup | 3250 M/sec | NOT bottleneck (<2% between 10/11/12 bit) |
+| Consume-first pattern | 12% faster | Can't use - our table has BITS=0 entries |
+
+**Key insight**: libdeflate's table NEVER has invalid entries (BITS=0). They use
+subtables for long codes. Our table has BITS=0 for subtable pointers, which means
+we must check-then-consume, not consume-then-check.
+
 ### Where the Gap Actually Is
 
-All copy paths are now optimized. The remaining 50% gap to libdeflate is:
-1. **Decode loop structure** - libdeflate's "consume first, then branch" pattern
-2. **Table size** - 12-bit table (8KB) vs libdeflate's 11-bit (4KB fits L1)
-3. **Inline macros** - libdeflate uses C macros, we use function calls
-4. **BMI2 intrinsics** - libdeflate uses bzhi/pext on x86_64
+All copy paths are now optimized. The remaining ~50% gap to libdeflate is:
+1. **Table entry format** - libdeflate uses subtables, never BITS=0, enabling consume-first
+2. **Inline macros** - libdeflate uses C macros, we use function calls
+3. **BMI2 intrinsics** - libdeflate uses bzhi/pext on x86_64
+4. **Compiler differences** - C with -O3 vs Rust with LTO
 
 ### What Actually Helps
 

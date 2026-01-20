@@ -4566,6 +4566,72 @@ mod optimization_tests {
         );
     }
 
+    /// Benchmark bit extraction methods (mask vs BMI2-style)
+    #[test]
+    fn bench_bit_extraction() {
+        let words: Vec<u64> = (0..100_000).map(|i| i * 0x12345678ABCD).collect();
+        let counts: Vec<u32> = (0..100_000).map(|i| (i % 15 + 1) as u32).collect();
+
+        let iterations = 500;
+
+        // Pattern 1: Mask with shift (standard approach)
+        let start = std::time::Instant::now();
+        let mut sum = 0u64;
+        for _ in 0..iterations {
+            for (&word, &count) in words.iter().zip(counts.iter()) {
+                sum = sum.wrapping_add(word & ((1u64 << count) - 1));
+            }
+        }
+        let elapsed_mask = start.elapsed();
+
+        // Pattern 2: Using wrapping operations (may optimize differently)
+        let start = std::time::Instant::now();
+        let mut sum2 = 0u64;
+        for _ in 0..iterations {
+            for (&word, &count) in words.iter().zip(counts.iter()) {
+                sum2 = sum2.wrapping_add(word & (1u64.wrapping_shl(count).wrapping_sub(1)));
+            }
+        }
+        let elapsed_wrap = start.elapsed();
+
+        // Pattern 3: On x86_64 with BMI2, use bzhi intrinsic
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        let elapsed_bmi2 = {
+            use std::arch::x86_64::_bzhi_u64;
+            let start = std::time::Instant::now();
+            let mut sum3 = 0u64;
+            for _ in 0..iterations {
+                for (&word, &count) in words.iter().zip(counts.iter()) {
+                    sum3 = sum3.wrapping_add(unsafe { _bzhi_u64(word, count) });
+                }
+            }
+            let _ = sum3; // prevent optimization
+            start.elapsed()
+        };
+
+        eprintln!("\n[BENCH] Bit Extraction Methods:");
+        eprintln!(
+            "[BENCH]   Mask (standard): {:.2}ms",
+            elapsed_mask.as_secs_f64() * 1000.0
+        );
+        eprintln!(
+            "[BENCH]   Wrapping ops:    {:.2}ms",
+            elapsed_wrap.as_secs_f64() * 1000.0
+        );
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+        eprintln!(
+            "[BENCH]   BMI2 bzhi:       {:.2}ms",
+            elapsed_bmi2.as_secs_f64() * 1000.0
+        );
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+        eprintln!("[BENCH]   BMI2 bzhi:       (not available on this CPU)");
+        eprintln!(
+            "[BENCH]   (sums: {} {} to prevent optimization)",
+            sum % 1000,
+            sum2 % 1000
+        );
+    }
+
     /// Combined benchmark with detailed path counting
     #[test]
     fn bench_with_path_counts() {
