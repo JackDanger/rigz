@@ -1,243 +1,163 @@
 # =============================================================================
-# PR Performance Summary: Rich consolidated performance table
+# PR Performance Summary: Aggregate results from compression/decompression workflows
 # =============================================================================
-# Generates a comprehensive performance summary comparing gzippy vs competitors.
-# Runs after all other workflows complete and posts a summary to the PR.
+# This workflow triggers AFTER the compression and decompression benchmarks complete.
+# It downloads their artifacts, aggregates the results, and posts a unified summary.
+#
+# Key design decisions:
+# - Uses workflow_run trigger to wait for other workflows to complete
+# - No redundant benchmark runs - trusts numbers from dedicated workflows
+# - All logic extracted into Python scripts for maintainability
 # =============================================================================
 name: PR Summary
 
 on:
-  pull_request:
-    branches: ["*"]
+  # Trigger after benchmark workflows complete
+  workflow_run:
+    workflows:
+      - "Compression Benchmarks"
+      - "Decompression Benchmarks"
+    types:
+      - completed
+  
+  # Allow manual triggering for debugging
   workflow_dispatch:
 
 permissions:
   contents: read
   pull-requests: write
-
-env:
-  CARGO_TERM_COLOR: always
+  actions: read  # Needed to download artifacts from other workflows
 
 jobs:
-  performance-summary:
+  aggregate-and-summarize:
     name: Generate Performance Summary
     runs-on: ubuntu-latest
+    # Only run if the triggering workflow succeeded (or on manual dispatch)
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install system dependencies
+      - name: Get PR number from triggering workflow
+        id: pr
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential zlib1g-dev cmake nasm
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "pr_number=" >> $GITHUB_OUTPUT
+            echo "Manual dispatch - no PR associated"
+          else
+            # Get the PR number from the triggering workflow run
+            PR_NUMBER=$(curl -s -H "Authorization: token ${{ github.token }}" \
+              "${{ github.event.workflow_run.repository.url }}/actions/runs/${{ github.event.workflow_run.id }}" \
+              | jq -r '.pull_requests[0].number // empty')
+            echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+            echo "PR number: $PR_NUMBER"
+          fi
 
-      - name: Build all tools
-        run: |
-          cargo build --release
-          make -C pigz
-          cd isa-l && mkdir -p build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && make -j$(nproc) igzip
-
-      - name: Run comprehensive benchmarks
-        id: benchmark
+      - name: Collect system info
         run: |
           mkdir -p results
-          
-          # Get CPU info
-          CPU_MODEL=$(grep "model name" /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)
-          CORES=$(nproc)
-          
-          # Detect SIMD features
-          SIMD_FEATURES=""
-          if grep -q "avx512" /proc/cpuinfo; then SIMD_FEATURES="$SIMD_FEATURES avx512"; fi
-          if grep -q "avx2" /proc/cpuinfo; then SIMD_FEATURES="$SIMD_FEATURES avx2"; fi
-          if grep -q "avx " /proc/cpuinfo; then SIMD_FEATURES="$SIMD_FEATURES avx"; fi
-          if grep -q "sse4_2" /proc/cpuinfo; then SIMD_FEATURES="$SIMD_FEATURES sse4.2"; fi
-          if grep -q "bmi2" /proc/cpuinfo; then SIMD_FEATURES="$SIMD_FEATURES bmi2"; fi
-          
-          cat > results/system.json << EOF
-          {
-            "cpu": "$CPU_MODEL",
-            "cores": $CORES,
-            "simd": "$SIMD_FEATURES"
-          }
-          EOF
-          
-          # Generate test data
-          echo "Generating test data..."
-          python3 -c "
-          import random
-          random.seed(42)
-          
-          # 10MB text file
-          with open('/tmp/test-10mb.txt', 'w') as f:
-              for _ in range(100000):
-                  f.write(''.join(random.choices('abcdefghij klmnopqrs tuvwxyz ', k=100)) + '\n')
-          
-          # 1MB text file
-          with open('/tmp/test-1mb.txt', 'w') as f:
-              for _ in range(10000):
-                  f.write(''.join(random.choices('abcdefghij klmnopqrs tuvwxyz ', k=100)) + '\n')
-          "
-          
-          echo "Running compression benchmarks..."
-          
-          # Function to benchmark compression
-          benchmark_compress() {
-            local tool=$1
-            local level=$2
-            local input=$3
-            local threads=$4
-            local output_prefix=$5
-            
-            case $tool in
-              gzippy)
-                cmd="./target/release/gzippy -$level -p$threads -c $input"
-                ;;
-              pigz)
-                cmd="./pigz/pigz -$level -p$threads -c $input"
-                ;;
-              igzip)
-                # igzip doesn't support threads
-                cmd="./isa-l/build/igzip -c $input"
-                ;;
-              gzip)
-                cmd="gzip -$level -c $input"
-                ;;
-            esac
-            
-            # Warmup
-            eval "$cmd > /tmp/warmup.gz" 2>/dev/null
-            
-            # Timed runs
-            local start=$(date +%s.%N)
-            for i in 1 2 3; do
-              eval "$cmd > /tmp/out.gz" 2>/dev/null
-            done
-            local end=$(date +%s.%N)
-            
-            local total=$(echo "$end - $start" | bc)
-            local avg=$(echo "$total / 3" | bc -l)
-            local size=$(stat -c%s /tmp/out.gz)
-            local input_size=$(stat -c%s $input)
-            local ratio=$(echo "scale=2; $size * 100 / $input_size" | bc)
-            local speed=$(echo "$input_size / $avg / 1000000" | bc -l)
-            
-            printf '{"tool":"%s","level":%d,"threads":%d,"time":%.4f,"size":%d,"ratio":%.2f,"speed":%.1f}' \
-              "$tool" "$level" "$threads" "$avg" "$size" "$ratio" "$speed"
-          }
-          
-          # Function to benchmark decompression
-          benchmark_decompress() {
-            local tool=$1
-            local input=$2
-            
-            case $tool in
-              gzippy)
-                cmd="./target/release/gzippy -d < $input > /tmp/out.txt"
-                ;;
-              pigz)
-                cmd="./pigz/pigz -d < $input > /tmp/out.txt"
-                ;;
-              igzip)
-                cmd="./isa-l/build/igzip -d < $input > /tmp/out.txt"
-                ;;
-              gzip)
-                cmd="gzip -d < $input > /tmp/out.txt"
-                ;;
-            esac
-            
-            # Warmup
-            eval "$cmd" 2>/dev/null
-            
-            # Timed runs
-            local start=$(date +%s.%N)
-            for i in 1 2 3 4 5; do
-              eval "$cmd" 2>/dev/null
-            done
-            local end=$(date +%s.%N)
-            
-            local total=$(echo "$end - $start" | bc)
-            local avg=$(echo "$total / 5" | bc -l)
-            local output_size=$(stat -c%s /tmp/out.txt)
-            local speed=$(echo "$output_size / $avg / 1000000" | bc -l)
-            
-            printf '{"tool":"%s","time":%.4f,"speed":%.1f}' "$tool" "$avg" "$speed"
-          }
-          
-          CORES=$(nproc)
-          
-          # Compression benchmarks
-          echo "[" > results/compression.json
-          first=true
-          for level in 1 6 9; do
-            for threads in 1 $CORES; do
-              for tool in gzippy pigz gzip; do
-                if [ "$first" = true ]; then first=false; else echo "," >> results/compression.json; fi
-                benchmark_compress $tool $level /tmp/test-10mb.txt $threads >> results/compression.json
-              done
-              # igzip (no thread support, only run once per level)
-              if [ "$threads" = "1" ]; then
-                echo "," >> results/compression.json
-                benchmark_compress igzip $level /tmp/test-10mb.txt 1 >> results/compression.json
-              fi
-            done
-          done
-          echo "]" >> results/compression.json
-          
-          # Create compressed files for decompression tests
-          ./target/release/gzippy -1 -c /tmp/test-10mb.txt > /tmp/test-gzippy.gz
-          ./pigz/pigz -1 -p$CORES -c /tmp/test-10mb.txt > /tmp/test-pigz.gz
-          gzip -1 -c /tmp/test-10mb.txt > /tmp/test-gzip.gz
-          
-          # Decompression benchmarks
-          echo "[" > results/decompression.json
-          first=true
-          for source in gzippy pigz gzip; do
-            for tool in gzippy pigz igzip gzip; do
-              if [ "$first" = true ]; then first=false; else echo "," >> results/decompression.json; fi
-              result=$(benchmark_decompress $tool /tmp/test-$source.gz)
-              echo "${result%\}},\"source\":\"$source\"}" >> results/decompression.json
-            done
-          done
-          echo "]" >> results/decompression.json
+          python3 scripts/collect_system_info.py --output results/system.json
+          cat results/system.json
 
-      - name: Generate rich summary
+      - name: Download compression artifacts
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: compression.yml
+          run_id: ${{ github.event.workflow_run.id }}
+          path: results/compression
+          if_no_artifact_found: warn
+        continue-on-error: true
+
+      - name: Download decompression artifacts
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: decompression.yml
+          run_id: ${{ github.event.workflow_run.id }}
+          path: results/decompression
+          if_no_artifact_found: warn
+        continue-on-error: true
+
+      - name: Try to find latest artifacts from both workflows
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "Manual dispatch - attempting to download latest artifacts..."
+          # This is a fallback for manual testing
+        continue-on-error: true
+
+      - name: Debug downloaded artifacts
+        run: |
+          echo "=== Artifact Structure ==="
+          find results -type f -name "*.json" | head -30
+          echo ""
+          echo "=== Sample files ==="
+          for f in $(find results -name "*.json" | head -3); do
+            echo "--- $f ---"
+            head -20 "$f"
+            echo ""
+          done
+
+      - name: Aggregate benchmark results
+        run: |
+          python3 scripts/aggregate_benchmark_results.py \
+            --input-dir results \
+            --output-dir aggregated
+          
+          echo "=== Aggregated Compression ==="
+          cat aggregated/compression.json | head -50
+          
+          echo ""
+          echo "=== Aggregated Decompression ==="
+          cat aggregated/decompression.json | head -50
+
+      - name: Generate summary
         run: |
           python3 scripts/generate_summary.py \
             --system results/system.json \
-            --compression results/compression.json \
-            --decompression results/decompression.json \
+            --compression aggregated/compression.json \
+            --decompression aggregated/decompression.json \
             --output summary.md
           
           cat summary.md >> $GITHUB_STEP_SUMMARY
+          echo ""
+          echo "=== Summary Generated ==="
           cat summary.md
 
       - name: Post comment to PR
-        if: github.event_name == 'pull_request'
+        if: steps.pr.outputs.pr_number != ''
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const summary = fs.readFileSync('summary.md', 'utf8');
+            
+            let summary;
+            try {
+              summary = fs.readFileSync('summary.md', 'utf8');
+            } catch {
+              summary = '## gzippy Performance Summary\n\nNo benchmark results available yet.';
+            }
+            
+            const prNumber = parseInt('${{ steps.pr.outputs.pr_number }}');
+            if (!prNumber) {
+              console.log('No PR number - skipping comment');
+              return;
+            }
+            
+            const body = summary + '\n\n---\n*Updated: ' + new Date().toISOString() + '*';
             
             // Find existing comment
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number: context.issue.number
+              issue_number: prNumber
             });
             
+            const marker = '# 🚀 gzippy Performance Summary';
             const botComment = comments.find(c => 
               c.user.type === 'Bot' && 
-              c.body.includes('gzippy Performance Summary')
+              c.body && c.body.includes(marker)
             );
-            
-            const body = summary + '\n\n---\n*Updated: ' + new Date().toISOString() + '*';
             
             if (botComment) {
               await github.rest.issues.updateComment({
@@ -246,17 +166,23 @@ jobs:
                 comment_id: botComment.id,
                 body: body
               });
+              console.log('Updated existing comment');
             } else {
               await github.rest.issues.createComment({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                issue_number: context.issue.number,
+                issue_number: prNumber,
                 body: body
               });
+              console.log('Created new comment');
             }
 
-      - name: Upload benchmark results
+      - name: Upload aggregated results
         uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results
-          path: results/
+          name: aggregated-benchmark-results
+          path: |
+            aggregated/
+            results/system.json
+            summary.md
+          retention-days: 30
