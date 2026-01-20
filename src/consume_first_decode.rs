@@ -283,12 +283,12 @@ fn decode_huffman_cf(
                             *out_ptr.add(out_pos) = lit4;
                         }
                         out_pos += 1;
-                        bits.refill();
 
                         // Literal 5
                         if (entry.raw() as i32) < 0 {
                             bits.consume_entry(entry.raw());
                             let lit5 = entry.literal_value();
+                            bits.refill(); // Only refill after 5 literals (~45 bits consumed)
                             entry = litlen.lookup(bits.peek());
                             unsafe {
                                 *out_ptr.add(out_pos) = lit5;
@@ -296,15 +296,28 @@ fn decode_huffman_cf(
                             out_pos += 1;
                             continue;
                         }
+                        // After 4 literals, check if refill needed
+                        if bits.available() < 30 {
+                            bits.refill();
+                        }
                         continue;
                     }
-                    bits.refill();
+                    // After 3 literals, check if refill needed
+                    if bits.available() < 30 {
+                        bits.refill();
+                    }
                     continue;
                 }
-                bits.refill();
+                // After 2 literals, check if refill needed
+                if bits.available() < 30 {
+                    bits.refill();
+                }
                 continue;
             }
-            bits.refill();
+            // After 1 literal, check if refill needed
+            if bits.available() < 30 {
+                bits.refill();
+            }
             continue;
         }
 
