@@ -356,7 +356,15 @@ jobs:
           path: ./bin
 
       - name: Setup
-        run: chmod +x ./bin/*
+        run: |
+          chmod +x ./bin/*
+          
+          # Resolve thread count
+          if [ "${{ matrix.threads }}" = "max" ]; then
+            echo "THREADS=$(nproc)" >> $GITHUB_ENV
+          else
+            echo "THREADS=${{ matrix.threads }}" >> $GITHUB_ENV
+          fi
 
       - name: Test random data
         run: |
@@ -364,7 +372,7 @@ jobs:
           dd if=/dev/urandom of=/tmp/random.bin bs=1M count=10 2>/dev/null
           
           # Compress
-          cat /tmp/random.bin | ./bin/gzippy -${{ matrix.level }} -p${{ matrix.threads }} > /tmp/random.gz
+          cat /tmp/random.bin | ./bin/gzippy -${{ matrix.level }} -p$THREADS > /tmp/random.gz
           
           # Decompress with gzippy
           ./bin/gzippy -d < /tmp/random.gz > /tmp/random.out
