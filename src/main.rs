@@ -22,6 +22,7 @@ mod inflate_tables;
 mod isal;
 mod libdeflate_ext;
 mod marker_decode;
+mod multi_symbol;
 mod optimization;
 mod packed_lut;
 mod parallel_compress;

@@ -6,9 +6,20 @@
 
 | Metric | gzippy | libdeflate | rapidgzip | Target |
 |--------|--------|------------|-----------|--------|
-| Single-thread silesia | ~630 MB/s | 1,200 MB/s | 720 MB/s (ISA-L) | **1,400+ MB/s** |
+| Simple data | 19,400 MB/s | 28,200 MB/s | N/A | **30,000+ MB/s** |
+| Pure literals | 28,000 MB/s | N/A | N/A | **35,000+ MB/s** |
 | BGZF parallel (8T) | 3,770 MB/s | N/A | N/A | **5,000+ MB/s** |
-| Ratio vs libdeflate | 52% | 100% | 60% | **115%** |
+| Ratio vs libdeflate | **69%** | 100% | 60% | **115%** |
+
+**Progress**: Improved from 52% to 69% of libdeflate through optimizations.
+
+### Latest Benchmarks (Jan 2026)
+
+```
+Simple data: 19,406 MB/s (69% of libdeflate's 28,206 MB/s)
+Pure literals: 28,090 MB/s (excellent - near theoretical max)
+Multi-symbol synthetic: 2.27x faster than single-symbol (3M vs 1.3M sym/ms)
+```
 
 ## Competitive Intelligence
 
@@ -59,11 +70,20 @@
 
 | Issue | Impact | Fix Difficulty |
 |-------|--------|----------------|
+| **Multi-symbol decode** | 2.27x potential (synthetic bench) | MEDIUM |
 | **Table design (BITS=0 entries)** | 12% (blocks consume-first) | HIGH |
-| **No subtables** | Can't use libdeflate's pattern | HIGH |
 | **Function call overhead** | 5-10% (Rust vs C inline) | MEDIUM |
 | **Branch prediction** | 5-10% (nested conditionals) | MEDIUM |
 | **No BMI2 intrinsics** | 5% on supported CPUs | LOW |
+
+### What We've Ruled Out
+
+| Optimization | Benchmark Result | Conclusion |
+|--------------|-----------------|------------|
+| Subtables alone | 0.56x slower | Adds indirection, not helpful by itself |
+| JIT table cache | HashMap overhead > benefit | Need custom hash/cache |
+| 11-bit vs 12-bit table | <2% difference | NOT bottleneck |
+| Pure literal decode | 28 GB/s | Already near optimal |
 
 ## Roadmap to Exceed All Tools
 
