@@ -44,6 +44,10 @@ mod ultra_decompress;
 mod ultra_fast_inflate;
 mod ultra_inflate;
 mod utils;
+mod golden_tests;
+mod libdeflate_entry;
+mod libdeflate_decode;
+mod ultimate_decode;
 
 use cli::GzippyArgs;
 use error::GzippyError;
