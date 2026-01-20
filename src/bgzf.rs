@@ -555,15 +555,22 @@ fn decode_stored_into_turbo(
     Ok(out_pos)
 }
 
-/// Turbo decode for fixed Huffman blocks
+/// Turbo decode for fixed Huffman blocks using consume-first path
 #[allow(dead_code)]
 fn decode_fixed_into_turbo(
     bits: &mut TurboBits,
     output: &mut [u8],
     out_pos: usize,
 ) -> io::Result<usize> {
-    let (lit_len_table, dist_table, packed_lut) = get_fixed_tables_turbo();
-    decode_huffman_turbo(bits, output, out_pos, packed_lut, lit_len_table, dist_table)
+    use crate::consume_first_table::ConsumeFirstTable;
+
+    // Fixed Huffman code lengths (RFC 1951)
+    let lit_len_lens = get_fixed_lit_len_lens();
+    let dist_lens = [5u8; 32];
+
+    let cf_lit_table = ConsumeFirstTable::build(&lit_len_lens)?;
+    let cf_dist_table = ConsumeFirstTable::build_distance(&dist_lens)?;
+    decode_huffman_consume_first(bits, output, out_pos, &cf_lit_table, &cf_dist_table)
 }
 
 /// Turbo decode for dynamic Huffman blocks
@@ -639,32 +646,12 @@ fn decode_dynamic_into_turbo(
     let lit_len_lens = &code_lens[..hlit];
     let dist_lens = &code_lens[hlit..];
 
-    // Try consume-first path (39.8% faster in benchmarks)
-    #[cfg(feature = "consume_first")]
-    {
-        use crate::consume_first_table::ConsumeFirstTable;
+    // Consume-first path - key to libdeflate's speed
+    use crate::consume_first_table::ConsumeFirstTable;
 
-        let cf_lit_table = ConsumeFirstTable::build(lit_len_lens)?;
-        let cf_dist_table = ConsumeFirstTable::build_distance(dist_lens)?;
-        decode_huffman_consume_first(bits, output, out_pos, &cf_lit_table, &cf_dist_table)
-    }
-
-    // Default: PackedLUT for turbo decode + TwoLevelTable for fallback
-    #[cfg(not(feature = "consume_first"))]
-    {
-        let lit_len_table = TwoLevelTable::build(lit_len_lens)?;
-        let dist_table = TwoLevelTable::build(dist_lens)?;
-        let packed_lut = PackedLUT::build(lit_len_lens, dist_lens)?;
-
-        decode_huffman_turbo(
-            bits,
-            output,
-            out_pos,
-            &packed_lut,
-            &lit_len_table,
-            &dist_table,
-        )
-    }
+    let cf_lit_table = ConsumeFirstTable::build(lit_len_lens)?;
+    let cf_dist_table = ConsumeFirstTable::build_distance(dist_lens)?;
+    decode_huffman_consume_first(bits, output, out_pos, &cf_lit_table, &cf_dist_table)
 }
 
 /// Public version of inflate_into for use by other modules

@@ -16,7 +16,6 @@ build = "build.rs"
 [features]
 default = []
 isal = []  # ISA-L decompression (enabled by build.rs when static lib is built)
-consume_first = []  # Use consume-first decode pattern (39.8% faster)
 trace = []  # Enable decode tracing instrumentation
 
 [dependencies]
