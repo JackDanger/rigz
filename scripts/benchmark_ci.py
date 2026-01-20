@@ -97,17 +97,18 @@ def generate_test_file(path: str, size_mb: int, data_type: str = "text") -> None
     """Generate a test file of the specified type.
     
     Data types:
-    - text: Realistic text (from Proust if available, otherwise lorem ipsum)
+    - text: Realistic text (from test_data/text-1MB.txt, concatenated)
+    - tarball: Real binary data from /usr/ (tar archive content, truncated/padded)
     - random: Random base64 (poorly compressible, stress test)
-    - binary: Mixed binary content (tarball-like)
+    - binary: Mixed binary content (synthetic tarball-like)
     """
     size_bytes = size_mb * 1024 * 1024
     
     if data_type == "text":
-        # Use Proust text if available, otherwise generate repetitive text
-        proust_path = Path("test_data/text-1MB.txt")
-        if proust_path.exists():
-            seed = proust_path.read_bytes()
+        # Use text file from test_data, concatenated to reach size
+        text_path = Path("test_data/text-1MB.txt")
+        if text_path.exists():
+            seed = text_path.read_bytes()
         else:
             # Fallback: repetitive English text
             seed = (b"The quick brown fox jumps over the lazy dog. " * 100 +
@@ -121,6 +122,49 @@ def generate_test_file(path: str, size_mb: int, data_type: str = "text") -> None
                 chunk = seed[:size_bytes - written]
                 f.write(chunk)
                 written += len(chunk)
+    
+    elif data_type == "tarball":
+        # Create a tar archive from /usr/ contents, sized to requirement
+        # This gives us real-world binary data with mixed content:
+        # - ELF binaries, shared libraries
+        # - Text config files, man pages
+        # - Localization data, fonts
+        # The result is truncated/padded to exact size (doesn't need to be valid tar)
+        import tempfile
+        
+        # Create oversized tar, then truncate
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.tar') as tmp:
+            tmp_path = tmp.name
+        
+        try:
+            # Try to create tar from /usr/share (good mix of content types)
+            # Use --ignore-failed-read to handle permission errors
+            # Limit depth and use head to avoid creating huge files
+            tar_cmd = (
+                f"tar cf - /usr/share 2>/dev/null | head -c {size_bytes * 2} > {tmp_path} || "
+                f"tar cf - /usr 2>/dev/null | head -c {size_bytes * 2} > {tmp_path} || "
+                f"tar cf - /bin /lib 2>/dev/null | head -c {size_bytes * 2} > {tmp_path}"
+            )
+            subprocess.run(tar_cmd, shell=True, check=False, stderr=subprocess.DEVNULL)
+            
+            # Read what we got and pad/truncate to exact size
+            if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+                with open(tmp_path, 'rb') as f:
+                    seed = f.read()
+            else:
+                # Fallback: use binary data type if tar fails
+                seed = os.urandom(1024 * 1024)  # 1MB random as seed
+            
+            # Write to target, repeating/truncating as needed
+            with open(path, 'wb') as f:
+                written = 0
+                while written < size_bytes:
+                    chunk = seed[:size_bytes - written]
+                    f.write(chunk)
+                    written += len(chunk)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
                 
     elif data_type == "random":
         # Random base64 - compresses poorly
@@ -128,7 +172,7 @@ def generate_test_file(path: str, size_mb: int, data_type: str = "text") -> None
         subprocess.run(cmd, shell=True, check=True, stderr=subprocess.DEVNULL)
         
     elif data_type == "binary":
-        # Mixed binary content (simulate tarball)
+        # Mixed binary content (synthetic tarball-like)
         with open(path, 'wb') as f:
             written = 0
             while written < size_bytes:
@@ -340,8 +384,8 @@ def main():
     parser.add_argument("--output", type=str, default="benchmark-results.json",
                        help="Output JSON file")
     parser.add_argument("--data-type", type=str, default="text",
-                       choices=["text", "random", "binary"],
-                       help="Type of test data (default: text)")
+                       choices=["text", "tarball", "random", "binary"],
+                       help="Type of test data: text (prose), tarball (real /usr/ content), random, binary")
     parser.add_argument("--check-ratio", action="store_true",
                        help="(Deprecated - ratio is always checked)")
     parser.add_argument("--max-time-overhead", type=float, default=None,

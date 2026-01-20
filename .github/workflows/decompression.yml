@@ -111,9 +111,12 @@ jobs:
   # STAGE 2: Generate test data and all compressed variants
   # ============================================================================
   prepare-data:
-    name: Prepare Test Data
+    name: Prepare ${{ matrix.data_type }} Data
     runs-on: ubuntu-latest
     needs: build
+    strategy:
+      matrix:
+        data_type: [text, tarball]
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -123,13 +126,15 @@ jobs:
       - name: Setup binaries
         run: chmod +x ./bin/*
 
-      - name: Generate 100MB text data
+      - name: Generate 100MB test data
         run: |
-          python3 -c "
+          if [ "${{ matrix.data_type }}" = "text" ]; then
+            # Generate text data from repeated patterns
+            python3 -c "
           import random
           random.seed(42)
           words = ['the', 'quick', 'brown', 'fox', 'jumps', 'over', 'lazy', 'dog', 'and', 'cat']
-          with open('/tmp/test-100mb.txt', 'w') as f:
+          with open('/tmp/test-100mb.bin', 'w') as f:
               target = 100 * 1024 * 1024
               written = 0
               while written < target:
@@ -137,7 +142,27 @@ jobs:
                   f.write(line)
                   written += len(line)
           "
-          ls -lh /tmp/test-100mb.txt
+          else
+            # Generate tarball from /usr/ contents
+            echo "Creating tarball from /usr/ contents..."
+            tar cf - /usr/share 2>/dev/null | head -c $((200 * 1024 * 1024)) > /tmp/usr_content.tar || true
+            
+            # Pad/truncate to exactly 100MB
+            python3 -c "
+          import os
+          target = 100 * 1024 * 1024
+          with open('/tmp/usr_content.tar', 'rb') as f:
+              seed = f.read()
+          with open('/tmp/test-100mb.bin', 'wb') as f:
+              written = 0
+              while written < target:
+                  chunk = seed[:target - written]
+                  f.write(chunk)
+                  written += len(chunk)
+          "
+            rm -f /tmp/usr_content.tar
+          fi
+          ls -lh /tmp/test-100mb.bin
 
       - name: Create all compressed variants
         run: |
@@ -145,26 +170,26 @@ jobs:
           
           # gzippy at all levels
           for level in 1 6 9; do
-            ./bin/gzippy -$level -c /tmp/test-100mb.txt > /tmp/compressed/gzippy-L${level}.gz
+            ./bin/gzippy -$level -c /tmp/test-100mb.bin > /tmp/compressed/gzippy-L${level}.gz
           done
           
           # pigz at all levels  
           for level in 1 6 9; do
-            ./bin/pigz -$level -c /tmp/test-100mb.txt > /tmp/compressed/pigz-L${level}.gz
+            ./bin/pigz -$level -c /tmp/test-100mb.bin > /tmp/compressed/pigz-L${level}.gz
           done
           
           # gzip at all levels
           for level in 1 6 9; do
-            gzip -$level -c /tmp/test-100mb.txt > /tmp/compressed/gzip-L${level}.gz
+            gzip -$level -c /tmp/test-100mb.bin > /tmp/compressed/gzip-L${level}.gz
           done
           
           ls -lh /tmp/compressed/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: test-data
+          name: test-data-${{ matrix.data_type }}
           path: |
-            /tmp/test-100mb.txt
+            /tmp/test-100mb.bin
             /tmp/compressed/
           retention-days: 1
 
@@ -172,9 +197,13 @@ jobs:
   # STAGE 3: Run comprehensive decompression benchmarks
   # ============================================================================
   benchmark:
-    name: Decompress All Sources
+    name: Decompress ${{ matrix.data_type }}
     runs-on: ubuntu-latest
     needs: prepare-data
+    strategy:
+      fail-fast: false
+      matrix:
+        data_type: [text, tarball]
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -183,7 +212,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: test-data
+          name: test-data-${{ matrix.data_type }}
           path: ./data
 
       - name: Setup
@@ -193,23 +222,22 @@ jobs:
 
       - name: Debug artifact structure
         run: |
-          echo "Artifact structure:"
+          echo "Artifact structure for ${{ matrix.data_type }}:"
           find ./data -type f | head -20
           ls -la ./data/ || true
-          ls -la ./data/test-100mb.txt 2>/dev/null || ls -la ./data/tmp/test-100mb.txt 2>/dev/null || echo "File not found in expected locations"
 
       - name: Run decompression benchmarks
         run: |
           # Find the test file (artifact path may vary)
-          if [ -f "./data/test-100mb.txt" ]; then
-            ORIGINAL="./data/test-100mb.txt"
+          if [ -f "./data/test-100mb.bin" ]; then
+            ORIGINAL="./data/test-100mb.bin"
             COMPRESSED_DIR="./data/compressed"
-          elif [ -f "./data/tmp/test-100mb.txt" ]; then
-            ORIGINAL="./data/tmp/test-100mb.txt"
+          elif [ -f "./data/tmp/test-100mb.bin" ]; then
+            ORIGINAL="./data/tmp/test-100mb.bin"
             COMPRESSED_DIR="./data/tmp/compressed"
           else
             echo "ERROR: Could not find test file"
-            find ./data -name "*.txt" | head -5
+            find ./data -name "*.bin" | head -5
             exit 1
           fi
           ORIGINAL_SIZE=$(stat -c%s "$ORIGINAL")
@@ -353,7 +381,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: benchmark-results
+          name: benchmark-results-${{ matrix.data_type }}
           path: results/
           retention-days: 7
 
@@ -373,8 +401,9 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          name: benchmark-results
+          pattern: benchmark-results-*
           path: results/
+          merge-multiple: true
         continue-on-error: true
 
       - name: Generate summary
