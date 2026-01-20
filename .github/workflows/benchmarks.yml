@@ -199,12 +199,12 @@ jobs:
         data_type: [text, tarball]
         size: [10, 100]
         level: [1, 6, 9]
-        threads: [1, 0]  # 0 = max cores
+        threads: ["1", "max"]
         exclude:
           # Skip 100MB single-thread at L1 (too noisy)
           - size: 100
             level: 1
-            threads: 1
+            threads: "1"
 
     steps:
       - uses: actions/checkout@v4
@@ -234,7 +234,7 @@ jobs:
           fi
           
           # Resolve thread count
-          if [ "${{ matrix.threads }}" = "0" ]; then
+          if [ "${{ matrix.threads }}" = "max" ]; then
             echo "THREADS=$(nproc)" >> $GITHUB_ENV
           else
             echo "THREADS=${{ matrix.threads }}" >> $GITHUB_ENV
@@ -277,7 +277,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        threads: [1, 0]  # 0 = max cores
+        threads: ["1", "max"]  # 0 = max cores
 
     steps:
       - uses: actions/checkout@v4
@@ -292,7 +292,7 @@ jobs:
           chmod +x ./bin/*
           mkdir -p results
           
-          if [ "${{ matrix.threads }}" = "0" ]; then
+          if [ "${{ matrix.threads }}" = "max" ]; then
             echo "THREADS=$(nproc)" >> $GITHUB_ENV
           else
             echo "THREADS=${{ matrix.threads }}" >> $GITHUB_ENV
@@ -347,7 +347,7 @@ jobs:
       fail-fast: false
       matrix:
         level: [1, 9]
-        threads: [1, 4]
+        threads: ["1", "max"]
 
     steps:
       - uses: actions/download-artifact@v4
