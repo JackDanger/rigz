@@ -812,6 +812,527 @@ fn decode_huffman_into(
     Ok(out_pos)
 }
 
+/// Ultra-tight decode loop using direct bit manipulation
+///
+/// Key optimizations:
+/// 1. Cast entry to i32 - negative means literal (most common)
+/// 2. Single branch for literals, everything else is rare path
+/// 3. No function calls in hot literal path
+/// 4. Bit arithmetic instead of method calls
+#[allow(dead_code)]
+#[inline(never)]
+fn decode_huffman_ultra(
+    bits: &mut FastBits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    packed_lut: &crate::packed_lut::PackedLUT,
+    lit_len_table: &TwoLevelTable,
+    dist_table: &TwoLevelTable,
+) -> io::Result<usize> {
+    use crate::inflate_tables::{DIST_EXTRA_BITS, DIST_START, LEN_EXTRA_BITS, LEN_START};
+
+    // Entry format constants (inlined for speed)
+    const BITS_MASK: u32 = 0xFF;
+    const SYMBOL_SHIFT: u32 = 23;
+    const DIST_SHIFT: u32 = 8;
+    const DIST_MASK: u32 = 0x7FFF << DIST_SHIFT;
+    const DIST_EOB: u32 = 0x7FFF << DIST_SHIFT;
+    const DIST_SLOW: u32 = 0x7FFE << DIST_SHIFT;
+    const LUT_MASK: u64 = 0xFFF;
+
+    let out_end = output.len();
+    let fastloop_end = out_end.saturating_sub(300);
+    let table = &packed_lut.table;
+
+    // === FASTLOOP ===
+    while out_pos < fastloop_end {
+        bits.ensure(56);
+
+        // Direct table lookup (no method call)
+        let entry = table[(bits.buffer() & LUT_MASK) as usize].0;
+        let entry_bits = entry & BITS_MASK;
+
+        // Invalid entry check
+        if entry_bits == 0 {
+            let (symbol, code_len) = lit_len_table.decode(bits.buffer());
+            if code_len == 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid code"));
+            }
+            bits.consume(code_len);
+
+            if symbol < 256 {
+                output[out_pos] = symbol as u8;
+                out_pos += 1;
+                continue;
+            }
+            if symbol == 256 {
+                return Ok(out_pos);
+            }
+
+            // Length code
+            let len_idx = (symbol - 257) as usize;
+            bits.ensure(16);
+            let length =
+                LEN_START[len_idx] as usize + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
+
+            let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
+            if dist_len == 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid dist"));
+            }
+            bits.consume(dist_len);
+            bits.ensure(16);
+            let distance = DIST_START[dist_sym as usize] as usize
+                + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+
+            if distance > out_pos {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad dist"));
+            }
+            out_pos = copy_match_into(output, out_pos, distance, length);
+            continue;
+        }
+
+        bits.consume(entry_bits);
+
+        // LITERAL TEST: Cast to i32, if negative (bit 31 set) it's a literal
+        // This is the hot path - ~80% of iterations on typical data
+        if (entry as i32) < 0 {
+            output[out_pos] = ((entry >> SYMBOL_SHIFT) & 0xFF) as u8;
+            out_pos += 1;
+
+            // === TIGHT LITERAL INNER LOOP ===
+            // Keep decoding literals without jumping back to outer loop
+            loop {
+                if bits.bits_available() < 12 {
+                    break;
+                }
+
+                let e = table[(bits.buffer() & LUT_MASK) as usize].0;
+                // Not literal or invalid -> break
+                if (e as i32) >= 0 || (e & BITS_MASK) == 0 {
+                    break;
+                }
+
+                bits.consume(e & BITS_MASK);
+                output[out_pos] = ((e >> SYMBOL_SHIFT) & 0xFF) as u8;
+                out_pos += 1;
+            }
+            continue;
+        }
+
+        // Non-literal path (rare)
+        let dist_field = entry & DIST_MASK;
+
+        // EOB check
+        if dist_field == DIST_EOB {
+            return Ok(out_pos);
+        }
+
+        // Slow path (length with extra bits, distance decoded separately)
+        if dist_field == DIST_SLOW {
+            let length = ((entry >> SYMBOL_SHIFT) & 0xFF) as usize + 3;
+
+            let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
+            if dist_len == 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid dist"));
+            }
+            bits.consume(dist_len);
+            bits.ensure(16);
+            let distance = DIST_START[dist_sym as usize] as usize
+                + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+
+            if distance > out_pos {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad dist"));
+            }
+            out_pos = copy_match_into(output, out_pos, distance, length);
+            continue;
+        }
+
+        // Pre-computed LZ77 match (distance in entry)
+        let length = ((entry >> SYMBOL_SHIFT) & 0xFF) as usize + 3;
+        let distance = (dist_field >> DIST_SHIFT) as usize;
+
+        if distance > out_pos {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad dist"));
+        }
+        out_pos = copy_match_into(output, out_pos, distance, length);
+    }
+
+    // === SLOWLOOP: With bounds checks ===
+    loop {
+        bits.ensure(32);
+
+        let entry = table[(bits.buffer() & LUT_MASK) as usize].0;
+        let entry_bits = entry & BITS_MASK;
+
+        if entry_bits == 0 {
+            let (symbol, code_len) = lit_len_table.decode(bits.buffer());
+            if code_len == 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid code"));
+            }
+            bits.consume(code_len);
+
+            if symbol < 256 {
+                if out_pos >= out_end {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "Output full"));
+                }
+                output[out_pos] = symbol as u8;
+                out_pos += 1;
+                continue;
+            }
+            if symbol == 256 {
+                return Ok(out_pos);
+            }
+
+            let len_idx = (symbol - 257) as usize;
+            bits.ensure(16);
+            let length =
+                LEN_START[len_idx] as usize + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
+
+            let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
+            if dist_len == 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid dist"));
+            }
+            bits.consume(dist_len);
+            bits.ensure(16);
+            let distance = DIST_START[dist_sym as usize] as usize
+                + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+
+            if distance > out_pos {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad dist"));
+            }
+            out_pos = copy_match_into(output, out_pos, distance, length);
+            continue;
+        }
+
+        bits.consume(entry_bits);
+
+        if (entry as i32) < 0 {
+            if out_pos >= out_end {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "Output full"));
+            }
+            output[out_pos] = ((entry >> SYMBOL_SHIFT) & 0xFF) as u8;
+            out_pos += 1;
+            continue;
+        }
+
+        let dist_field = entry & DIST_MASK;
+        if dist_field == DIST_EOB {
+            return Ok(out_pos);
+        }
+
+        if dist_field == DIST_SLOW {
+            let length = ((entry >> SYMBOL_SHIFT) & 0xFF) as usize + 3;
+            let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
+            if dist_len == 0 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid dist"));
+            }
+            bits.consume(dist_len);
+            bits.ensure(16);
+            let distance = DIST_START[dist_sym as usize] as usize
+                + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+            if distance > out_pos {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad dist"));
+            }
+            out_pos = copy_match_into(output, out_pos, distance, length);
+            continue;
+        }
+
+        let length = ((entry >> SYMBOL_SHIFT) & 0xFF) as usize + 3;
+        let distance = (dist_field >> DIST_SHIFT) as usize;
+        if distance > out_pos {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad dist"));
+        }
+        out_pos = copy_match_into(output, out_pos, distance, length);
+    }
+}
+
+/// Ultra-optimized decode loop using PackedLUT
+///
+/// Key optimizations from libdeflate:
+/// 1. Packed u32 entries - all info in one register
+/// 2. Bit testing instead of match statements  
+/// 3. Fastloop with no bounds checks
+/// 4. Tight literal inner loop
+#[allow(dead_code)]
+fn decode_huffman_packed(
+    bits: &mut FastBits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    packed_lut: &crate::packed_lut::PackedLUT,
+    lit_len_table: &TwoLevelTable,
+    dist_table: &TwoLevelTable,
+) -> io::Result<usize> {
+    use crate::inflate_tables::{DIST_EXTRA_BITS, DIST_START};
+
+    // Fastloop margin: max bytes written per iteration
+    // 258 (max match) + 8 (literal unroll) + safety margin
+    const FASTLOOP_MARGIN: usize = 300;
+
+    let out_end = output.len();
+    let fastloop_end = out_end.saturating_sub(FASTLOOP_MARGIN);
+
+    // === FASTLOOP: No per-iteration bounds checks ===
+    while out_pos < fastloop_end {
+        bits.ensure(56); // Enough for multiple symbols
+
+        let entry = packed_lut.decode(bits.buffer());
+
+        // Invalid entry - fallback to TwoLevelTable
+        if entry.bits() == 0 {
+            let (symbol, code_len) = lit_len_table.decode(bits.buffer());
+            if code_len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid Huffman code",
+                ));
+            }
+            bits.consume(code_len);
+
+            if symbol < 256 {
+                output[out_pos] = symbol as u8;
+                out_pos += 1;
+                continue;
+            }
+            if symbol == 256 {
+                return Ok(out_pos);
+            }
+
+            // Length code - decode via slow path
+            let len_idx = (symbol - 257) as usize;
+            if len_idx >= 29 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid length code",
+                ));
+            }
+
+            use crate::inflate_tables::{LEN_EXTRA_BITS, LEN_START};
+            bits.ensure(16);
+            let length =
+                LEN_START[len_idx] as usize + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
+
+            let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
+            if dist_len == 0 || dist_sym >= 30 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid distance code",
+                ));
+            }
+            bits.consume(dist_len);
+
+            bits.ensure(16);
+            let distance = DIST_START[dist_sym as usize] as usize
+                + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+
+            if distance > out_pos || distance == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid distance",
+                ));
+            }
+
+            out_pos = copy_match_into(output, out_pos, distance, length);
+            continue;
+        }
+
+        // Consume bits for this entry
+        bits.consume(entry.bits());
+
+        // Test bit 31: literal (most common case)
+        if entry.is_literal() {
+            output[out_pos] = entry.symbol();
+            out_pos += 1;
+
+            // === TIGHT LITERAL LOOP ===
+            // Continue decoding literals without going back to outer loop
+            while bits.bits_available() >= 12 {
+                let e = packed_lut.decode(bits.buffer());
+                if !e.is_literal() || e.bits() == 0 {
+                    break;
+                }
+                bits.consume(e.bits());
+                output[out_pos] = e.symbol();
+                out_pos += 1;
+            }
+            continue;
+        }
+
+        // Check for EOB
+        if entry.is_eob() {
+            return Ok(out_pos);
+        }
+
+        // Check for slow path (length code, distance decoded separately)
+        if entry.is_slow_path() {
+            let length = entry.length();
+
+            let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
+            if dist_len == 0 || dist_sym >= 30 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid distance code",
+                ));
+            }
+            bits.consume(dist_len);
+
+            bits.ensure(16);
+            let distance = DIST_START[dist_sym as usize] as usize
+                + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+
+            if distance > out_pos || distance == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid distance",
+                ));
+            }
+
+            out_pos = copy_match_into(output, out_pos, distance, length);
+            continue;
+        }
+
+        // LZ77 match with pre-computed distance (not used in current build)
+        let length = entry.length();
+        let distance = entry.distance();
+
+        if distance > out_pos || distance == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid distance",
+            ));
+        }
+
+        out_pos = copy_match_into(output, out_pos, distance, length);
+    }
+
+    // === SLOWLOOP: Safe bounds checking ===
+    loop {
+        bits.ensure(32);
+
+        let entry = packed_lut.decode(bits.buffer());
+
+        if entry.bits() == 0 {
+            // Fallback to TwoLevelTable
+            let (symbol, code_len) = lit_len_table.decode(bits.buffer());
+            if code_len == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid Huffman code",
+                ));
+            }
+            bits.consume(code_len);
+
+            if symbol < 256 {
+                if out_pos >= out_end {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "Output buffer full",
+                    ));
+                }
+                output[out_pos] = symbol as u8;
+                out_pos += 1;
+                continue;
+            }
+            if symbol == 256 {
+                return Ok(out_pos);
+            }
+
+            let len_idx = (symbol - 257) as usize;
+            if len_idx >= 29 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid length code",
+                ));
+            }
+
+            use crate::inflate_tables::{LEN_EXTRA_BITS, LEN_START};
+            bits.ensure(16);
+            let length =
+                LEN_START[len_idx] as usize + bits.read(LEN_EXTRA_BITS[len_idx] as u32) as usize;
+
+            let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
+            if dist_len == 0 || dist_sym >= 30 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid distance code",
+                ));
+            }
+            bits.consume(dist_len);
+
+            bits.ensure(16);
+            let distance = DIST_START[dist_sym as usize] as usize
+                + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+
+            if distance > out_pos || distance == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid distance",
+                ));
+            }
+
+            out_pos = copy_match_into(output, out_pos, distance, length);
+            continue;
+        }
+
+        bits.consume(entry.bits());
+
+        if entry.is_literal() {
+            if out_pos >= out_end {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "Output buffer full",
+                ));
+            }
+            output[out_pos] = entry.symbol();
+            out_pos += 1;
+            continue;
+        }
+
+        if entry.is_eob() {
+            return Ok(out_pos);
+        }
+
+        if entry.is_slow_path() {
+            let length = entry.length();
+
+            let (dist_sym, dist_len) = dist_table.decode(bits.buffer());
+            if dist_len == 0 || dist_sym >= 30 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid distance code",
+                ));
+            }
+            bits.consume(dist_len);
+
+            bits.ensure(16);
+            let distance = DIST_START[dist_sym as usize] as usize
+                + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
+
+            if distance > out_pos || distance == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid distance",
+                ));
+            }
+
+            out_pos = copy_match_into(output, out_pos, distance, length);
+            continue;
+        }
+
+        // LZ77 match
+        let length = entry.length();
+        let distance = entry.distance();
+
+        if distance > out_pos || distance == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid distance",
+            ));
+        }
+
+        out_pos = copy_match_into(output, out_pos, distance, length);
+    }
+}
+
 /// AVX-512 copy for large non-overlapping regions (5-10% gain on AVX-512 CPUs)
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 #[inline(always)]
@@ -1513,6 +2034,50 @@ mod tests {
         // Verify correctness
         let size = inflate_into(&compressed, &mut output).unwrap();
         assert_eq!(size, original.len());
+    }
+
+    /// Benchmark packed LUT decode vs CombinedLUT  
+    #[test]
+    fn benchmark_packed_vs_combined() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as IoWrite;
+
+        // Create 1MB of mixed content data for realistic testing
+        let mut original = Vec::with_capacity(1_000_000);
+        for i in 0..100_000 {
+            // Mix of literals, runs, and varied patterns
+            original.push(((i * 7) % 256) as u8);
+            original.push((i % 256) as u8);
+            if i % 100 == 0 {
+                // Add some runs
+                original.extend(std::iter::repeat_n(b'A', 10));
+            }
+        }
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Warm up by running the full decompression a few times
+        let mut output = vec![0u8; original.len() + 10000];
+        for _ in 0..5 {
+            let _ = inflate_into(&compressed, &mut output);
+        }
+
+        // Benchmark the inflate_into function which uses CombinedLUT
+        let iterations = 100;
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = inflate_into(&compressed, &mut output);
+        }
+        let time = start.elapsed();
+        let speed = original.len() as f64 * iterations as f64 / time.as_secs_f64() / 1_000_000.0;
+
+        eprintln!("\n=== inflate_into (CombinedLUT) Benchmark ===");
+        eprintln!("Output size: {} bytes", original.len());
+        eprintln!("Iterations: {}", iterations);
+        eprintln!("Speed: {:.1} MB/s", speed);
     }
 
     #[test]

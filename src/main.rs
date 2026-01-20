@@ -22,6 +22,7 @@ mod isal;
 mod libdeflate_ext;
 mod marker_decode;
 mod optimization;
+mod packed_lut;
 mod parallel_compress;
 mod parallel_decompress;
 mod parallel_inflate;
