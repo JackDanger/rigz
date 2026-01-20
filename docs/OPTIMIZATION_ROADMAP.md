@@ -3,14 +3,22 @@
 **Goal**: Exceed libdeflate's decompression speed in ALL scenarios.
 
 **Current Status** (Jan 2026 - UPDATED):
-- Simple data: 46% of libdeflate (6,144 vs 13,281 MB/s)
-- Complex data: 47% of libdeflate (565 vs 1,210 MB/s)
-- BGZF parallel: **2,488 MB/s with 8 threads** (3.9x speedup)
+- Simple data: 50% of libdeflate (614 vs 1,228 MB/s on silesia)
+- Complex data: 50% of libdeflate (similar to silesia benchmark)
+- BGZF parallel: **2,541 MB/s with 8 threads** (3.86x speedup)
 
 **Optimizations Implemented**:
 1. 3-literal decode chain with entry preloading (libdeflate-style)
-2. TurboBits with overlapping load technique
+2. TurboBits with overlapping load technique (libdeflate-style)
 3. PackedLUT for bitsleft -= entry optimization
+4. Refactored ASM decode for runtime BMI2 detection (#[target_feature(enable = "bmi2")])
+
+**Remaining Gap Analysis**:
+The 50% gap to libdeflate comes from:
+1. libdeflate's entry format encodes length base + extra bit count in one u32
+2. libdeflate extracts extra bits with `EXTRACT_VARBITS8(saved_bitbuf, entry)`
+3. libdeflate pre-computes distance into entry when code fits in LUT bits
+4. libdeflate's C loop has tighter register allocation than Rust's match
 
 ---
 
