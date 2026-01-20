@@ -455,6 +455,158 @@ pub fn decode_simd_multi_sym(
     Ok(out_pos)
 }
 
+// =============================================================================
+// AVX2 Gather-Based Huffman Decode (Phase 3.2)
+// =============================================================================
+
+/// Packed u32 table entry for gather-based decode
+/// Format: bits[7:0] = code_length, bits[15:8] = symbol, bits[31] = literal_flag
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+pub struct GatherEntry(pub u32);
+
+impl GatherEntry {
+    pub const LITERAL_FLAG: u32 = 1 << 31;
+    pub const LENGTH_MASK: u32 = 0xFF;
+    pub const SYMBOL_SHIFT: u32 = 8;
+
+    #[inline(always)]
+    pub fn literal(bits: u8, byte: u8) -> Self {
+        GatherEntry(Self::LITERAL_FLAG | ((byte as u32) << Self::SYMBOL_SHIFT) | bits as u32)
+    }
+
+    #[inline(always)]
+    pub fn length_code(bits: u8, len_idx: u8) -> Self {
+        GatherEntry(((len_idx as u32) << Self::SYMBOL_SHIFT) | bits as u32)
+    }
+
+    #[inline(always)]
+    pub fn is_literal(self) -> bool {
+        self.0 & Self::LITERAL_FLAG != 0
+    }
+
+    #[inline(always)]
+    pub fn symbol(self) -> u8 {
+        ((self.0 >> Self::SYMBOL_SHIFT) & 0xFF) as u8
+    }
+
+    #[inline(always)]
+    pub fn code_length(self) -> u8 {
+        (self.0 & Self::LENGTH_MASK) as u8
+    }
+}
+
+/// Table for AVX2 gather-based decode (10-bit, 4KB)
+pub struct GatherTable {
+    pub entries: Box<[GatherEntry; 1024]>,
+}
+
+impl GatherTable {
+    /// Build table from Huffman code lengths
+    pub fn build(lit_len_lens: &[u8]) -> Option<Self> {
+        let mut entries = Box::new([GatherEntry::default(); 1024]);
+
+        // Build canonical codes (simplified)
+        let mut bl_count = [0u32; 16];
+        for &len in lit_len_lens.iter().take(286) {
+            if len > 0 {
+                bl_count[len as usize] += 1;
+            }
+        }
+
+        let mut next_code = [0u32; 16];
+        let mut code = 0u32;
+        for bits in 1..16 {
+            code = (code + bl_count[bits - 1]) << 1;
+            next_code[bits] = code;
+        }
+
+        // Fill table
+        for (sym, &len) in lit_len_lens.iter().enumerate().take(286) {
+            if len == 0 || len > 10 {
+                continue;
+            }
+            let code = next_code[len as usize];
+            next_code[len as usize] += 1;
+
+            // Bit-reverse the code for little-endian lookup
+            let mut rev = 0u32;
+            for i in 0..len {
+                if code & (1 << i) != 0 {
+                    rev |= 1 << (len - 1 - i);
+                }
+            }
+
+            // Fill all entries for this code
+            let fill_count = 1 << (10 - len);
+            for i in 0..fill_count {
+                let idx = rev as usize | (i << len);
+                if sym < 256 {
+                    entries[idx] = GatherEntry::literal(len, sym as u8);
+                } else {
+                    entries[idx] = GatherEntry::length_code(len, (sym - 256) as u8);
+                }
+            }
+        }
+
+        Some(GatherTable { entries })
+    }
+}
+
+/// AVX2 gather-based decode of 8 literals in parallel
+///
+/// This uses vpgatherdd to look up 8 table entries at once,
+/// then processes them in a tight scalar loop.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[allow(dead_code)]
+pub unsafe fn decode_8_gather(
+    table: &GatherTable,
+    bit_positions: &[u64; 8],
+    bitbuf: u64,
+) -> ([u8; 8], [u8; 8]) {
+    use std::arch::x86_64::*;
+
+    // Create 8 indices from bit positions
+    let mut indices = [0i32; 8];
+    for i in 0..8 {
+        indices[i] = ((bitbuf >> bit_positions[i]) & 0x3FF) as i32;
+    }
+
+    // Load indices into AVX2 register
+    let idx_vec = _mm256_loadu_si256(indices.as_ptr() as *const __m256i);
+
+    // Gather 8 entries from table
+    let base_ptr = table.entries.as_ptr() as *const i32;
+    let entries = _mm256_i32gather_epi32(base_ptr, idx_vec, 4);
+
+    // Extract to array
+    let mut entry_arr = [0u32; 8];
+    _mm256_storeu_si256(entry_arr.as_mut_ptr() as *mut __m256i, entries);
+
+    // Decode each entry
+    let mut literals = [0u8; 8];
+    let mut bits_consumed = [0u8; 8];
+
+    for i in 0..8 {
+        let e = GatherEntry(entry_arr[i]);
+        literals[i] = e.symbol();
+        bits_consumed[i] = e.code_length();
+    }
+
+    (literals, bits_consumed)
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[allow(dead_code)]
+pub unsafe fn decode_8_gather(
+    _table: &GatherTable,
+    _bit_positions: &[u64; 8],
+    _bitbuf: u64,
+) -> ([u8; 8], [u8; 8]) {
+    // Fallback - not available
+    ([0u8; 8], [0u8; 8])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
