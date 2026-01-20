@@ -662,25 +662,23 @@ on the decode loop by consuming bits unconditionally before checking entry types
 - Files compressed with flate2/zlib (Compression::default(), best())
 - Dickens and other silesia components when recompressed with flate2
 
-### Known Issues
+### Bug Fix (Jan 2026)
 
-**Failing tests (2/16) - silesia-gzip.tar.gz:**
-- Original silesia file fails at byte 158 with "Invalid distance"
-- Root cause: Subtable bit consumption in complex Huffman tables
-- The file was compressed with gzip -9 which creates longer Huffman codes
+**Root Cause Found**: Subtable entries were using `subtable_extra` (the MAX subtable size) as the
+bits-to-consume instead of `extra_bits` (the ACTUAL code length minus TABLE_BITS). This caused
+over-consumption of bits for codes shorter than the subtable size.
 
-### Root Cause Analysis
+**Fix**: In `build_inner`, changed:
+```rust
+let entry = create_entry(symbol, subtable_extra as u8, is_distance_table);
+```
+to:
+```rust
+let entry = create_entry(symbol, extra_bits, is_distance_table);
+```
 
-The issue is in `ConsumeFirstTable::build_inner` subtable handling:
-1. When a code needs a subtable (>11 bits), we create entries with `subtable_extra` bits
-2. For codes shorter than the subtable size, we fill multiple entries
-3. The filler pattern `sub_code | (i << extra_bits)` may be incorrect for some patterns
-
-### Next Steps to Fix
-
-1. Study libdeflate's `build_decode_table()` subtable filling logic
-2. Compare bit consumption between turbo and consume_first paths byte-by-byte
-3. Validate that `lookup_sub` index calculation matches table building
+**Result**: All 220 tests pass with and without the `consume_first` feature. The silesia file
+(211MB uncompressed) decompresses correctly.
 
 ### Usage
 

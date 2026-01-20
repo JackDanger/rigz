@@ -240,7 +240,13 @@ impl ConsumeFirstTable {
 
                 for i in 0..count {
                     let idx = reversed as usize | (i << len as usize);
-                    main[idx] = entry;
+                    // CRITICAL FIX: Don't overwrite subtable pointers!
+                    // If this index already has a subtable pointer, skip it.
+                    // The subtable pointer was created in Pass 2 for longer codes
+                    // that share this prefix.
+                    if !main[idx].is_subtable() {
+                        main[idx] = entry;
+                    }
                 }
             } else {
                 // Subtable entry
@@ -253,13 +259,15 @@ impl ConsumeFirstTable {
                 let subtable_extra = main[main_idx].subtable_extra_bits() as usize;
 
                 // Fill subtable entries
-                // CONSUME-FIRST: Entry must consume subtable_extra bits (the full subtable width)
+                // FIX: Entry must consume ACTUAL code length minus main bits,
+                // NOT the subtable size. We replicate to fill the subtable,
+                // but each entry has its own bits-to-consume.
                 let sub_code = (reversed >> main_bits) as usize;
                 let filler_bits = subtable_extra.saturating_sub(extra_bits as usize);
                 let count = 1 << filler_bits;
 
-                // Entry consumes subtable_extra bits (the FULL subtable width)
-                let entry = create_entry(symbol, subtable_extra as u8, is_distance_table);
+                // Entry consumes extra_bits (the ACTUAL code length minus TABLE_BITS)
+                let entry = create_entry(symbol, extra_bits, is_distance_table);
 
                 for i in 0..count {
                     // Place entry at all positions where "don't care" bits vary

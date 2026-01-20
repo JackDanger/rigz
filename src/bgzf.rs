@@ -643,6 +643,7 @@ fn decode_dynamic_into_turbo(
     #[cfg(feature = "consume_first")]
     {
         use crate::consume_first_table::ConsumeFirstTable;
+
         let cf_lit_table = ConsumeFirstTable::build(lit_len_lens)?;
         let cf_dist_table = ConsumeFirstTable::build_distance(dist_lens)?;
         decode_huffman_consume_first(bits, output, out_pos, &cf_lit_table, &cf_dist_table)
@@ -1373,6 +1374,12 @@ fn decode_huffman_consume_first(
 
                             let d = resolve_entry(bits, dist_table);
                             let dist_sym = d.symbol();
+                            if dist_sym >= 30 {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "Invalid distance symbol",
+                                ));
+                            }
                             bits.ensure(16);
                             let distance = DIST_START[dist_sym as usize] as usize
                                 + bits.read(DIST_EXTRA_BITS[dist_sym as usize] as u32) as usize;
@@ -1380,10 +1387,7 @@ fn decode_huffman_consume_first(
                             if distance == 0 || distance > out_pos {
                                 return Err(io::Error::new(
                                     io::ErrorKind::InvalidData,
-                                    format!(
-                                        "Invalid distance: {} at out_pos={}",
-                                        distance, out_pos
-                                    ),
+                                    "Invalid distance",
                                 ));
                             }
                             out_pos = copy_match_into(output, out_pos, distance, length);
@@ -5852,6 +5856,396 @@ mod optimization_tests {
             panic!("Found {} table mismatches!", mismatches);
         }
         eprintln!("[CF-TEST] Tables match for all 2048 patterns");
+    }
+
+    /// Test: Verify subtable construction for long codes (>11 bits)
+    #[test]
+    fn test_cf_subtable_construction() {
+        use crate::consume_first_table::ConsumeFirstTable;
+
+        // Create code lengths that require subtables:
+        // Symbols 0-255 get 12-bit codes (need 1-bit subtables)
+        // Symbol 256 (EOB) gets a 7-bit code
+        let mut code_lens = vec![0u8; 286];
+        code_lens[256] = 7; // EOB is short
+        for i in 0..256 {
+            code_lens[i] = 12; // All literals are 12 bits (need subtable)
+        }
+
+        let cf_table = ConsumeFirstTable::build(&code_lens).expect("CF build failed");
+
+        // Helper to reverse bits
+        fn reverse_bits(mut val: u32, n: u32) -> u32 {
+            let mut result = 0;
+            for _ in 0..n {
+                result = (result << 1) | (val & 1);
+                val >>= 1;
+            }
+            result
+        }
+
+        // Generate codewords using canonical Huffman algorithm
+        let mut bl_count = [0u32; 16];
+        for &len in &code_lens {
+            if len > 0 {
+                bl_count[len as usize] += 1;
+            }
+        }
+        let mut next_code = [0u32; 16];
+        let mut code = 0u32;
+        for bits in 1..=15 {
+            code = (code + bl_count[bits - 1]) << 1;
+            next_code[bits] = code;
+        }
+
+        eprintln!("\n[CF-SUBTABLE-TEST] Testing 12-bit codes with subtables:");
+        eprintln!(
+            "[CF-SUBTABLE-TEST]   12-bit codes: {} symbols",
+            bl_count[12]
+        );
+        eprintln!("[CF-SUBTABLE-TEST]   7-bit codes: {} symbols", bl_count[7]);
+        eprintln!(
+            "[CF-SUBTABLE-TEST]   CF subtable size: {} entries",
+            cf_table.sub.len()
+        );
+
+        // Test a few symbols
+        let mut test_next_code = next_code;
+        let mut errors = 0;
+
+        // Test EOB (symbol 256, 7 bits)
+        {
+            let code = test_next_code[7];
+            test_next_code[7] += 1;
+            let reversed = reverse_bits(code, 7);
+
+            // Use ConsumeFirstTable to decode
+            let cf_entry = cf_table.lookup_main(reversed as u64);
+
+            eprintln!(
+                "[CF-SUBTABLE-TEST]   EOB (sym=256): code={:#b}, reversed={:#b}",
+                code, reversed
+            );
+            eprintln!(
+                "[CF-SUBTABLE-TEST]     CF: sym={}, bits={}, is_eob={}",
+                cf_entry.symbol(),
+                cf_entry.bits(),
+                cf_entry.is_eob()
+            );
+
+            // Note: EOB symbol() returns 0 (by design - we only need is_eob() check)
+            if !cf_entry.is_eob() {
+                eprintln!("[CF-SUBTABLE-TEST]     ERROR: EOB mismatch - not marked as EOB!");
+                errors += 1;
+            }
+            if cf_entry.bits() != 7 {
+                eprintln!("[CF-SUBTABLE-TEST]     ERROR: EOB should consume 7 bits!");
+                errors += 1;
+            }
+        }
+
+        // Test first 12-bit literal (symbol 0)
+        {
+            let sym = 0;
+            let code = test_next_code[12];
+            test_next_code[12] += 1;
+            let reversed = reverse_bits(code, 12);
+
+            // Use ConsumeFirstTable to decode
+            let main_entry = cf_table.lookup_main(reversed as u64);
+            eprintln!(
+                "[CF-SUBTABLE-TEST]   Literal (sym=0): code={:#b}, reversed={:#b}",
+                code, reversed
+            );
+            eprintln!(
+                "[CF-SUBTABLE-TEST]     Main entry: sym={}, bits={}, is_subtable={}",
+                main_entry.symbol(),
+                main_entry.bits(),
+                main_entry.is_subtable()
+            );
+
+            if main_entry.is_subtable() {
+                // Need to look up in subtable
+                let remaining_bits = reversed >> 11; // Low 11 bits consumed, use next bits
+                let sub_entry = cf_table.lookup_sub(main_entry, remaining_bits as u64);
+                eprintln!(
+                    "[CF-SUBTABLE-TEST]     Sub entry: sym={}, bits={}, is_literal={}",
+                    sub_entry.symbol(),
+                    sub_entry.bits(),
+                    sub_entry.is_literal()
+                );
+                let total_bits = main_entry.bits() + sub_entry.bits();
+                eprintln!(
+                    "[CF-SUBTABLE-TEST]     Total bits: {} (main={}, sub={})",
+                    total_bits,
+                    main_entry.bits(),
+                    sub_entry.bits()
+                );
+
+                if !sub_entry.is_literal() || sub_entry.symbol() != sym as u16 {
+                    eprintln!("[CF-SUBTABLE-TEST]     ERROR: Symbol mismatch!");
+                    errors += 1;
+                }
+                if total_bits != 12 {
+                    eprintln!("[CF-SUBTABLE-TEST]     ERROR: Total bits should be 12!");
+                    errors += 1;
+                }
+            } else if !main_entry.is_literal() || main_entry.symbol() != sym as u16 {
+                eprintln!("[CF-SUBTABLE-TEST]     ERROR: Direct entry mismatch!");
+                errors += 1;
+            }
+        }
+
+        // Test symbol 100 (12-bit literal)
+        {
+            let sym = 100;
+            // After symbol 0 test, we're at code for symbol 1
+            // Skip to symbol 100 (need to skip 99 more)
+            for _ in 0..99 {
+                test_next_code[12] += 1;
+            }
+            let code = test_next_code[12];
+            test_next_code[12] += 1;
+            let reversed = reverse_bits(code, 12);
+
+            let main_entry = cf_table.lookup_main(reversed as u64);
+            eprintln!(
+                "[CF-SUBTABLE-TEST]   Literal (sym=100): code={:#b}, reversed={:#b}",
+                code, reversed
+            );
+            eprintln!(
+                "[CF-SUBTABLE-TEST]     Main entry: sym={}, bits={}, is_subtable={}",
+                main_entry.symbol(),
+                main_entry.bits(),
+                main_entry.is_subtable()
+            );
+
+            if main_entry.is_subtable() {
+                let remaining_bits = reversed >> 11;
+                let sub_entry = cf_table.lookup_sub(main_entry, remaining_bits as u64);
+                eprintln!(
+                    "[CF-SUBTABLE-TEST]     Sub entry: sym={}, bits={}, is_literal={}",
+                    sub_entry.symbol(),
+                    sub_entry.bits(),
+                    sub_entry.is_literal()
+                );
+
+                if !sub_entry.is_literal() || sub_entry.symbol() != sym as u16 {
+                    eprintln!("[CF-SUBTABLE-TEST]     ERROR: Symbol mismatch!");
+                    errors += 1;
+                }
+            }
+        }
+
+        assert_eq!(errors, 0, "Found {} subtable construction errors", errors);
+        eprintln!("[CF-SUBTABLE-TEST] PASSED");
+    }
+
+    /// Test: Mixed code lengths with subtables (like real deflate)
+    #[test]
+    fn test_cf_subtable_mixed() {
+        use crate::consume_first_table::ConsumeFirstTable;
+        use crate::two_level_table::TurboBits;
+
+        // Create a more realistic code length distribution:
+        // - Some short codes (frequent symbols)
+        // - Some long codes > 11 bits (rare symbols)
+        let mut code_lens = vec![0u8; 286];
+
+        // Common literals (0-127) get short 8-bit codes
+        for i in 0..128 {
+            code_lens[i] = 8;
+        }
+        // Less common (128-191) get 9-bit codes
+        for i in 128..192 {
+            code_lens[i] = 9;
+        }
+        // Rare (192-223) get 10-bit codes
+        for i in 192..224 {
+            code_lens[i] = 10;
+        }
+        // Very rare (224-255) get 12-bit codes (needs subtables!)
+        for i in 224..256 {
+            code_lens[i] = 12;
+        }
+        // EOB (256) gets 7 bits
+        code_lens[256] = 7;
+        // Length codes (257-285) get 8 bits
+        for i in 257..286 {
+            code_lens[i] = 8;
+        }
+
+        let cf_table = ConsumeFirstTable::build(&code_lens).expect("CF build failed");
+
+        eprintln!("\n[CF-MIXED-TEST] Mixed code lengths with subtables:");
+        eprintln!(
+            "[CF-MIXED-TEST]   Subtable size: {} entries",
+            cf_table.sub.len()
+        );
+
+        // Helper to reverse bits
+        fn reverse_bits(mut val: u32, n: u32) -> u32 {
+            let mut result = 0;
+            for _ in 0..n {
+                result = (result << 1) | (val & 1);
+                val >>= 1;
+            }
+            result
+        }
+
+        // Generate codewords using canonical Huffman algorithm
+        let mut bl_count = [0u32; 16];
+        for &len in &code_lens {
+            if len > 0 {
+                bl_count[len as usize] += 1;
+            }
+        }
+        let mut next_code = [0u32; 16];
+        let mut code = 0u32;
+        for bits in 1..=15 {
+            code = (code + bl_count[bits - 1]) << 1;
+            next_code[bits] = code;
+        }
+
+        // Store codes for each symbol
+        let mut symbol_codes: Vec<(u32, u8)> = Vec::with_capacity(286);
+        let mut next_code_temp = next_code;
+        for &len in code_lens.iter() {
+            if len > 0 {
+                let c = next_code_temp[len as usize];
+                next_code_temp[len as usize] += 1;
+                symbol_codes.push((reverse_bits(c, len as u32), len));
+            } else {
+                symbol_codes.push((0, 0));
+            }
+        }
+
+        let mut errors = 0;
+
+        // Test a 12-bit symbol (needs subtable)
+        let sym = 230;
+        let (reversed, len) = symbol_codes[sym];
+        eprintln!(
+            "[CF-MIXED-TEST]   Testing 12-bit symbol {}: code_len={}, reversed={:#b}",
+            sym, len, reversed
+        );
+
+        let main_entry = cf_table.lookup_main(reversed as u64);
+        eprintln!(
+            "[CF-MIXED-TEST]     Main entry: sym={}, bits={}, is_subtable={}",
+            main_entry.symbol(),
+            main_entry.bits(),
+            main_entry.is_subtable()
+        );
+
+        if main_entry.is_subtable() {
+            let remaining_bits = reversed >> 11;
+            let sub_entry = cf_table.lookup_sub(main_entry, remaining_bits as u64);
+            eprintln!(
+                "[CF-MIXED-TEST]     Sub entry: sym={}, bits={}, is_literal={}",
+                sub_entry.symbol(),
+                sub_entry.bits(),
+                sub_entry.is_literal()
+            );
+            let total_bits = main_entry.bits() + sub_entry.bits();
+            eprintln!("[CF-MIXED-TEST]     Total bits: {}", total_bits);
+
+            if !sub_entry.is_literal() || sub_entry.symbol() != sym as u16 {
+                eprintln!("[CF-MIXED-TEST]     ERROR: Symbol mismatch!");
+                errors += 1;
+            }
+        } else {
+            eprintln!("[CF-MIXED-TEST]     ERROR: Expected subtable for 12-bit code!");
+            errors += 1;
+        }
+
+        // Test that we can decode a sequence correctly
+        // Build a bitstream with: literal 'A' (8-bit), literal 230 (12-bit), EOB (7-bit)
+        let sym_a = 65;
+        let sym_rare = 230;
+        let (code_a, len_a) = symbol_codes[sym_a];
+        let (code_rare, len_rare) = symbol_codes[sym_rare];
+        let (code_eob, len_eob) = symbol_codes[256];
+
+        // Pack bits: A first (low bits), then rare, then EOB
+        let mut bitstream: u64 = 0;
+        let mut bit_pos = 0;
+        bitstream |= code_a as u64;
+        bit_pos += len_a as u32;
+        bitstream |= (code_rare as u64) << bit_pos;
+        bit_pos += len_rare as u32;
+        bitstream |= (code_eob as u64) << bit_pos;
+
+        eprintln!(
+            "[CF-MIXED-TEST]   Decoding sequence: A({} bits), 230({} bits), EOB({} bits)",
+            len_a, len_rare, len_eob
+        );
+        eprintln!("[CF-MIXED-TEST]     Bitstream: {:#066b}", bitstream);
+
+        // Create a fake input buffer for TurboBits
+        let buf = bitstream.to_le_bytes();
+        let mut bits = TurboBits::new(&buf);
+        bits.refill_branchless();
+
+        // Decode symbol 1: should be 'A'
+        let e1 = cf_table.lookup_main(bits.buffer());
+        bits.consume(e1.bits());
+        if e1.is_subtable() {
+            eprintln!("[CF-MIXED-TEST]     ERROR: 'A' should not need subtable!");
+            errors += 1;
+        } else if e1.symbol() != sym_a as u16 {
+            eprintln!(
+                "[CF-MIXED-TEST]     ERROR: Expected 'A' ({}), got {}!",
+                sym_a,
+                e1.symbol()
+            );
+            errors += 1;
+        } else {
+            eprintln!("[CF-MIXED-TEST]     Decoded 'A' correctly");
+        }
+
+        // Decode symbol 2: should be 230 (needs subtable)
+        let e2_main = cf_table.lookup_main(bits.buffer());
+        bits.consume(e2_main.bits());
+        if e2_main.is_subtable() {
+            let e2_sub = cf_table.lookup_sub(e2_main, bits.buffer());
+            bits.consume(e2_sub.bits());
+            if e2_sub.symbol() != sym_rare as u16 {
+                eprintln!(
+                    "[CF-MIXED-TEST]     ERROR: Expected {}, got {}!",
+                    sym_rare,
+                    e2_sub.symbol()
+                );
+                errors += 1;
+            } else {
+                eprintln!("[CF-MIXED-TEST]     Decoded {} correctly", sym_rare);
+            }
+        } else {
+            eprintln!("[CF-MIXED-TEST]     ERROR: Symbol 230 should need subtable!");
+            errors += 1;
+        }
+
+        // Decode symbol 3: should be EOB
+        let e3 = cf_table.lookup_main(bits.buffer());
+        bits.consume(e3.bits());
+        if e3.is_subtable() {
+            let e3_sub = cf_table.lookup_sub(e3, bits.buffer());
+            bits.consume(e3_sub.bits());
+            if !e3_sub.is_eob() {
+                eprintln!("[CF-MIXED-TEST]     ERROR: Expected EOB!");
+                errors += 1;
+            } else {
+                eprintln!("[CF-MIXED-TEST]     Decoded EOB correctly");
+            }
+        } else if !e3.is_eob() {
+            eprintln!("[CF-MIXED-TEST]     ERROR: Expected EOB!");
+            errors += 1;
+        } else {
+            eprintln!("[CF-MIXED-TEST]     Decoded EOB correctly");
+        }
+
+        assert_eq!(errors, 0, "Found {} errors in mixed subtable test", errors);
+        eprintln!("[CF-MIXED-TEST] PASSED");
     }
 
     /// Test: Verify distance table builds correctly
