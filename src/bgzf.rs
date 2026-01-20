@@ -1418,6 +1418,105 @@ mod tests {
         assert_eq!(&output[..actual_size], &original[..]);
     }
 
+    /// Test multi-literal decode correctness with various data patterns
+    #[test]
+    fn test_multi_literal_correctness() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as IoWrite;
+
+        // Test 1: Mostly literals (random-ish data)
+        let original1: Vec<u8> = (0..10_000).map(|i| (i % 256) as u8).collect();
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&original1).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut output = vec![0u8; original1.len() + 1000];
+        let size = inflate_into(&compressed, &mut output).unwrap();
+        assert_eq!(size, original1.len(), "Size mismatch for literals-only");
+        assert_eq!(&output[..size], &original1[..], "Content mismatch");
+
+        // Test 2: Highly repetitive (many back-references)
+        let original2: Vec<u8> = "ABCDEFGHIJ".repeat(1000).into_bytes();
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original2).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut output = vec![0u8; original2.len() + 1000];
+        let size = inflate_into(&compressed, &mut output).unwrap();
+        assert_eq!(size, original2.len(), "Size mismatch for repetitive");
+        assert_eq!(&output[..size], &original2[..], "Content mismatch");
+
+        // Test 3: Mixed patterns
+        let mut original3 = Vec::new();
+        for i in 0..100 {
+            original3.extend_from_slice(&[(i * 7) as u8; 50]);
+            original3.extend_from_slice(b"REPEAT_THIS_STRING_");
+        }
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original3).unwrap();
+        let compressed = encoder.finish().unwrap();
+        let mut output = vec![0u8; original3.len() + 1000];
+        let size = inflate_into(&compressed, &mut output).unwrap();
+        assert_eq!(size, original3.len(), "Size mismatch for mixed");
+        assert_eq!(&output[..size], &original3[..], "Content mismatch");
+    }
+
+    /// Benchmark inflate_into vs libdeflate
+    #[test]
+    fn benchmark_inflate_into() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write as IoWrite;
+
+        // Create 1MB of compressible data (same pattern as fast_inflate benchmark)
+        let original: Vec<u8> = (0..1_000_000)
+            .map(|i| ((i * 7 + i / 100) % 256) as u8)
+            .collect();
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        // Warm up
+        let mut output = vec![0u8; original.len() + 1000];
+        for _ in 0..3 {
+            let _ = inflate_into(&compressed, &mut output);
+        }
+
+        // Benchmark our implementation
+        let start = std::time::Instant::now();
+        let iterations = 50;
+        for _ in 0..iterations {
+            let _ = inflate_into(&compressed, &mut output);
+        }
+        let our_time = start.elapsed();
+        let our_speed =
+            original.len() as f64 * iterations as f64 / our_time.as_secs_f64() / 1_000_000.0;
+
+        // Benchmark libdeflate
+        let mut libdeflate = libdeflater::Decompressor::new();
+        let mut ld_output = vec![0u8; original.len() + 1000];
+
+        let start = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = libdeflate.deflate_decompress(&compressed, &mut ld_output);
+        }
+        let ld_time = start.elapsed();
+        let ld_speed =
+            original.len() as f64 * iterations as f64 / ld_time.as_secs_f64() / 1_000_000.0;
+
+        let ratio = our_time.as_secs_f64() / ld_time.as_secs_f64();
+
+        eprintln!("\n=== inflate_into vs libdeflate ===");
+        eprintln!("Our inflate_into: {:.1} MB/s", our_speed);
+        eprintln!("libdeflate:       {:.1} MB/s", ld_speed);
+        eprintln!("Ratio: {:.2}x slower than libdeflate", ratio);
+        eprintln!("Gap to close: {:.0}%", (ratio - 1.0) * 100.0);
+
+        // Verify correctness
+        let size = inflate_into(&compressed, &mut output).unwrap();
+        assert_eq!(size, original.len());
+    }
+
     #[test]
     fn test_bgzf_parallel() {
         // Test with a gzippy-compressed file if available
