@@ -229,110 +229,100 @@ jobs:
           print()
           
           # =================================================================
-          # Compression Summary
+          # Compression Summary - gzippy vs all alternatives
           # =================================================================
-          print("## 📦 Compression Performance")
+          print("## 📦 Compression: gzippy vs Alternatives")
           print()
           
-          # Group by level and threads
           levels = sorted(set(r['level'] for r in compression))
           threads = sorted(set(r['threads'] for r in compression))
-          tools = ['gzippy', 'pigz', 'igzip', 'gzip']
+          competitors = ['pigz', 'igzip', 'gzip']
           
           for t in threads:
             print(f"### {t} Thread{'s' if t > 1 else ''}")
             print()
-            print("| Level | Tool | Speed (MB/s) | Size | Ratio | vs pigz |")
-            print("|-------|------|--------------|------|-------|---------|")
+            print("| Level | gzippy Speed | gzippy Size | vs pigz | vs igzip | vs gzip |")
+            print("|-------|--------------|-------------|---------|----------|---------|")
             
             for level in levels:
               level_results = [r for r in compression if r['level'] == level and r['threads'] == t]
-              pigz_result = next((r for r in level_results if r['tool'] == 'pigz'), None)
+              gzippy = next((r for r in level_results if r['tool'] == 'gzippy'), None)
               
-              for tool in tools:
-                result = next((r for r in level_results if r['tool'] == tool), None)
-                if not result:
-                  continue
-                
-                speed = result['speed']
-                size = result['size']
-                ratio = result['ratio']
-                
-                # Compare to pigz
-                if pigz_result and tool != 'pigz':
-                  speed_diff = (speed / pigz_result['speed'] - 1) * 100
-                  size_diff = (size / pigz_result['size'] - 1) * 100
+              if not gzippy:
+                continue
+              
+              # Format gzippy results
+              gzippy_speed = f"{gzippy['speed']:.0f} MB/s"
+              gzippy_size = f"{gzippy['size']/1000000:.2f} MB" if gzippy['size'] > 1000000 else f"{gzippy['size']/1000:.1f} KB"
+              
+              # Compare to each competitor
+              comparisons = []
+              for comp in competitors:
+                comp_result = next((r for r in level_results if r['tool'] == comp), None)
+                if comp_result:
+                  speed_diff = (gzippy['speed'] / comp_result['speed'] - 1) * 100
+                  size_diff = (gzippy['size'] / comp_result['size'] - 1) * 100
                   
-                  if speed_diff >= 0:
-                    speed_icon = "🟢" if speed_diff > 10 else "🟡"
+                  # Icon: green if gzippy wins, red if loses
+                  if speed_diff >= 0 and size_diff <= 0:
+                    icon = "✅"  # Win on both
+                  elif speed_diff >= 0:
+                    icon = "🟢" if speed_diff > 20 else "🟡"  # Faster
+                  elif size_diff <= -2:
+                    icon = "🟢"  # Smaller
                   else:
-                    speed_icon = "🔴" if speed_diff < -10 else "🟡"
+                    icon = "🔴"  # Lose
                   
-                  if size_diff <= 0:
-                    size_icon = "🟢" if size_diff < -2 else "🟡"
-                  else:
-                    size_icon = "🔴" if size_diff > 2 else "🟡"
-                  
-                  vs_pigz = f"{speed_icon} {speed_diff:+.1f}% speed, {size_icon} {size_diff:+.1f}% size"
+                  comparisons.append(f"{icon} {speed_diff:+.0f}% speed")
                 else:
-                  vs_pigz = "—" if tool == 'pigz' else "N/A"
-                
-                # Format size
-                if size > 1000000:
-                  size_str = f"{size/1000000:.2f} MB"
-                else:
-                  size_str = f"{size/1000:.1f} KB"
-                
-                # Highlight gzippy
-                tool_name = f"**{tool}**" if tool == 'gzippy' else tool
-                
-                print(f"| L{level} | {tool_name} | {speed:.1f} | {size_str} | {ratio:.1f}% | {vs_pigz} |")
+                  comparisons.append("—")
+              
+              print(f"| L{level} | {gzippy_speed} | {gzippy_size} | {comparisons[0]} | {comparisons[1]} | {comparisons[2]} |")
             
             print()
           
           # =================================================================
-          # Decompression Summary
+          # Decompression Summary - gzippy vs all alternatives
           # =================================================================
-          print("## 📤 Decompression Performance")
+          print("## 📤 Decompression: gzippy vs Alternatives")
           print()
           
           sources = sorted(set(r['source'] for r in decompression))
           
-          print("| Source | gzippy | pigz | igzip | gzip | Winner |")
-          print("|--------|--------|------|-------|------|--------|")
+          print("| Source | gzippy Speed | vs pigz | vs igzip | vs gzip | Status |")
+          print("|--------|--------------|---------|----------|---------|--------|")
           
+          all_pass = True
           for source in sources:
             source_results = [r for r in decompression if r['source'] == source]
+            gzippy = next((r for r in source_results if r['tool'] == 'gzippy'), None)
             
-            row = [f"**{source}**-compressed"]
-            speeds = {}
+            if not gzippy:
+              continue
             
-            for tool in ['gzippy', 'pigz', 'igzip', 'gzip']:
-              result = next((r for r in source_results if r['tool'] == tool), None)
-              if result:
-                speed = result['speed']
-                speeds[tool] = speed
-                row.append(f"{speed:.0f} MB/s")
+            gzippy_speed = f"{gzippy['speed']:.0f} MB/s"
+            
+            # Compare to each competitor
+            comparisons = []
+            wins = 0
+            for comp in ['pigz', 'igzip', 'gzip']:
+              comp_result = next((r for r in source_results if r['tool'] == comp), None)
+              if comp_result and comp_result['speed'] > 0:
+                diff = (gzippy['speed'] / comp_result['speed'] - 1) * 100
+                if diff >= 0:
+                  wins += 1
+                  icon = "✅" if diff > 10 else "🟢"
+                else:
+                  icon = "🔴"
+                comparisons.append(f"{icon} {diff:+.0f}%")
               else:
-                row.append("—")
+                comparisons.append("—")
             
-            # Determine winner
-            if speeds:
-              winner = max(speeds, key=speeds.get)
-              winner_speed = speeds[winner]
-              
-              if winner == 'gzippy':
-                row.append(f"🏆 **gzippy**")
-              elif winner == 'igzip':
-                gzippy_speed = speeds.get('gzippy', 0)
-                diff = (gzippy_speed / winner_speed - 1) * 100 if winner_speed > 0 else 0
-                row.append(f"igzip ({diff:+.0f}%)")
-              else:
-                row.append(winner)
-            else:
-              row.append("—")
+            status = "✅ PASS" if wins >= 2 else "🔴 FAIL"
+            if wins < 2:
+              all_pass = False
             
-            print("| " + " | ".join(row) + " |")
+            print(f"| {source} | {gzippy_speed} | {comparisons[0]} | {comparisons[1]} | {comparisons[2]} | {status} |")
           
           print()
           
