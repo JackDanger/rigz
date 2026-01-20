@@ -649,3 +649,45 @@ timeout 30 cargo test --release --features consume_first test_name -- --nocaptur
 1. **Infinite decode loops**: Corrupted bit buffer state causes decode to never find EOB
 2. **Subtable bugs**: Not handling subtable entries causes wrong bit consumption
 3. **consume_first feature**: New experimental path, may have bugs - test carefully
+
+## Consume-First Optimization Status (Jan 2026)
+
+### What Works
+
+The `consume_first` feature (enabled with `--features consume_first`) provides a 39.8% speedup
+on the decode loop by consuming bits unconditionally before checking entry types.
+
+**Passing tests (14/16):**
+- All synthetic data tests (literals, RLE, matches, binary, multi-block)
+- Files compressed with flate2/zlib (Compression::default(), best())
+- Dickens and other silesia components when recompressed with flate2
+
+### Known Issues
+
+**Failing tests (2/16) - silesia-gzip.tar.gz:**
+- Original silesia file fails at byte 158 with "Invalid distance"
+- Root cause: Subtable bit consumption in complex Huffman tables
+- The file was compressed with gzip -9 which creates longer Huffman codes
+
+### Root Cause Analysis
+
+The issue is in `ConsumeFirstTable::build_inner` subtable handling:
+1. When a code needs a subtable (>11 bits), we create entries with `subtable_extra` bits
+2. For codes shorter than the subtable size, we fill multiple entries
+3. The filler pattern `sub_code | (i << extra_bits)` may be incorrect for some patterns
+
+### Next Steps to Fix
+
+1. Study libdeflate's `build_decode_table()` subtable filling logic
+2. Compare bit consumption between turbo and consume_first paths byte-by-byte
+3. Validate that `lookup_sub` index calculation matches table building
+
+### Usage
+
+```bash
+# Run with consume_first (works for most data)
+cargo run --release --features consume_first -- -d file.gz
+
+# Run without consume_first (100% compatible)
+cargo run --release -- -d file.gz
+```

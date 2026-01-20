@@ -149,8 +149,19 @@ pub struct ConsumeFirstTable {
 }
 
 impl ConsumeFirstTable {
-    /// Build table from code lengths
+    /// Build table from code lengths (for literal/length alphabet)
     pub fn build(code_lengths: &[u8]) -> io::Result<Self> {
+        Self::build_inner(code_lengths, false)
+    }
+
+    /// Build table from code lengths (for distance alphabet)
+    /// All symbols are treated as distance codes, not literals
+    pub fn build_distance(code_lengths: &[u8]) -> io::Result<Self> {
+        Self::build_inner(code_lengths, true)
+    }
+
+    /// Internal build function
+    fn build_inner(code_lengths: &[u8], is_distance_table: bool) -> io::Result<Self> {
         let mut main = vec![CFEntry::end_of_block(1); CF_TABLE_SIZE];
         let mut sub = Vec::with_capacity(SUBTABLE_ENOUGH);
 
@@ -176,7 +187,39 @@ impl ConsumeFirstTable {
             next_code[bits] = code;
         }
 
-        // Build entries
+        // PASS 1: Compute maximum extra_bits needed for each main table index
+        let mut max_extra_for_main = [0u8; CF_TABLE_SIZE];
+
+        {
+            let mut next_code_temp = next_code;
+            for &len in code_lengths.iter() {
+                if len == 0 || (len as usize) <= CF_TABLE_BITS {
+                    continue;
+                }
+
+                let code = next_code_temp[len as usize];
+                next_code_temp[len as usize] += 1;
+                let reversed = reverse_bits(code, len);
+                let main_idx = (reversed & ((1 << CF_TABLE_BITS) - 1)) as usize;
+                let extra_bits = len - CF_TABLE_BITS as u8;
+                max_extra_for_main[main_idx] = max_extra_for_main[main_idx].max(extra_bits);
+            }
+        }
+
+        // PASS 2: Create subtables with correct sizes
+        for main_idx in 0..CF_TABLE_SIZE {
+            let extra = max_extra_for_main[main_idx];
+            if extra > 0 {
+                let subtable_offset = sub.len() as u16;
+                let subtable_size = 1 << extra;
+                for _ in 0..subtable_size {
+                    sub.push(CFEntry::end_of_block(extra)); // Default with correct bits
+                }
+                main[main_idx] = CFEntry::subtable_ptr(CF_TABLE_BITS as u8, subtable_offset, extra);
+            }
+        }
+
+        // PASS 3: Fill entries
         for (symbol, &len) in code_lengths.iter().enumerate() {
             if len == 0 {
                 continue;
@@ -193,47 +236,33 @@ impl ConsumeFirstTable {
                 let filler_bits = CF_TABLE_BITS - len as usize;
                 let count = 1 << filler_bits;
 
-                let entry = create_entry(symbol, len);
+                let entry = create_entry(symbol, len, is_distance_table);
 
                 for i in 0..count {
                     let idx = reversed as usize | (i << len as usize);
                     main[idx] = entry;
                 }
             } else {
-                // Needs subtable
+                // Subtable entry
                 let main_bits = CF_TABLE_BITS as u8;
                 let extra_bits = len - main_bits;
-
-                // Main table entry points to subtable
                 let main_idx = (reversed & ((1 << main_bits) - 1)) as usize;
 
-                // Check if we need to create a new subtable
-                if !main[main_idx].is_subtable() {
-                    // Create subtable pointer
-                    let subtable_offset = sub.len() as u16;
-                    let subtable_size = 1 << extra_bits;
-
-                    // Reserve subtable space
-                    for _ in 0..subtable_size {
-                        sub.push(CFEntry::end_of_block(1));
-                    }
-
-                    // Update main table entry
-                    main[main_idx] = CFEntry::subtable_ptr(main_bits, subtable_offset, extra_bits);
-                }
-
-                // Get subtable info
+                // Get subtable info (already created in pass 2)
                 let subtable_offset = main[main_idx].subtable_offset() as usize;
                 let subtable_extra = main[main_idx].subtable_extra_bits() as usize;
 
                 // Fill subtable entries
+                // CONSUME-FIRST: Entry must consume subtable_extra bits (the full subtable width)
                 let sub_code = (reversed >> main_bits) as usize;
                 let filler_bits = subtable_extra.saturating_sub(extra_bits as usize);
                 let count = 1 << filler_bits;
 
-                let entry = create_entry(symbol, extra_bits);
+                // Entry consumes subtable_extra bits (the FULL subtable width)
+                let entry = create_entry(symbol, subtable_extra as u8, is_distance_table);
 
                 for i in 0..count {
+                    // Place entry at all positions where "don't care" bits vary
                     let sub_idx = subtable_offset + (sub_code | (i << extra_bits as usize));
                     if sub_idx < sub.len() {
                         sub[sub_idx] = entry;
@@ -267,8 +296,12 @@ impl ConsumeFirstTable {
 }
 
 /// Create appropriate entry based on symbol
-fn create_entry(symbol: usize, bits: u8) -> CFEntry {
-    if symbol < 256 {
+/// For distance tables, all symbols are treated as distance codes (using length type)
+fn create_entry(symbol: usize, bits: u8, is_distance_table: bool) -> CFEntry {
+    if is_distance_table {
+        // Distance table: all symbols are distance codes
+        CFEntry::length(bits, symbol as u16)
+    } else if symbol < 256 {
         CFEntry::literal(bits, symbol as u16)
     } else if symbol == 256 {
         CFEntry::end_of_block(bits)

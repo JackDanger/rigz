@@ -644,7 +644,7 @@ fn decode_dynamic_into_turbo(
     {
         use crate::consume_first_table::ConsumeFirstTable;
         let cf_lit_table = ConsumeFirstTable::build(lit_len_lens)?;
-        let cf_dist_table = ConsumeFirstTable::build(dist_lens)?;
+        let cf_dist_table = ConsumeFirstTable::build_distance(dist_lens)?;
         decode_huffman_consume_first(bits, output, out_pos, &cf_lit_table, &cf_dist_table)
     }
 
@@ -1305,6 +1305,10 @@ fn decode_huffman_consume_first(
     let out_end = output.len();
     let fastloop_end = out_end.saturating_sub(320);
 
+    // DEBUG: Track iterations to detect infinite loops
+    let mut iterations = 0u64;
+    let max_iterations = (out_end as u64 * 2).max(100_000); // Reasonable limit
+
     // Helper to resolve entry (handles subtables)
     #[inline(always)]
     fn resolve_entry(
@@ -1325,6 +1329,14 @@ fn decode_huffman_consume_first(
 
     // === FASTLOOP with consume-first pattern ===
     while out_pos < fastloop_end {
+        iterations += 1;
+        if iterations > max_iterations {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Infinite loop detected at out_pos={}", out_pos),
+            ));
+        }
+
         bits.ensure(56);
 
         let entry = resolve_entry(bits, lit_table);
@@ -1474,12 +1486,21 @@ fn decode_huffman_consume_first(
                     format!("Invalid distance: {} at out_pos={}", distance, out_pos),
                 ));
             }
+
             out_pos = copy_match_into(output, out_pos, distance, length);
         }
     }
 
     // === GENERIC LOOP (near end of output) ===
     loop {
+        iterations += 1;
+        if iterations > max_iterations {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Infinite loop in generic at out_pos={}", out_pos),
+            ));
+        }
+
         bits.ensure(32);
 
         let entry = resolve_entry(bits, lit_table);
@@ -1672,6 +1693,7 @@ fn decode_huffman_turbo(
                 if distance > out_pos {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad dist"));
                 }
+
                 out_pos = copy_match_into(output, out_pos, distance, length);
                 continue;
             }
@@ -1681,6 +1703,7 @@ fn decode_huffman_turbo(
             if distance > out_pos {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad dist"));
             }
+
             out_pos = copy_match_into(output, out_pos, distance, length);
             continue;
         }
@@ -1719,6 +1742,7 @@ fn decode_huffman_turbo(
             if distance > out_pos {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "Bad dist"));
             }
+
             out_pos = copy_match_into(output, out_pos, distance, length);
             continue;
         }
@@ -5302,6 +5326,823 @@ mod optimization_tests {
             "[BENCH]   Ratio: {:.1}%",
             turbo_mbs / libdeflate_mbs * 100.0
         );
+    }
+
+    // =========================================================================
+    // CONSUME-FIRST DEBUG TESTS
+    // These validate each assumption about the consume_first decode path
+    // =========================================================================
+
+    /// Test 1: Very small literal-only data (no matches)
+    #[test]
+    fn test_cf_small_literals_only() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Simple data: just "ABCD"
+        let original = b"ABCD".to_vec();
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        eprintln!("\n[CF-TEST] Small literals only:");
+        eprintln!("[CF-TEST]   Original: {:?}", original);
+        eprintln!("[CF-TEST]   Compressed: {:?}", compressed);
+
+        // Decompress with libdeflate (reference)
+        let mut libdeflate_out = vec![0u8; original.len() + 100];
+        let libdeflate_size = libdeflater::Decompressor::new()
+            .deflate_decompress(&compressed, &mut libdeflate_out)
+            .expect("libdeflate failed");
+
+        eprintln!("[CF-TEST]   libdeflate output: {} bytes", libdeflate_size);
+        assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
+
+        // Decompress with our turbo path
+        let mut turbo_out = vec![0u8; original.len() + 100];
+        let turbo_size =
+            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+
+        eprintln!("[CF-TEST]   turbo output: {} bytes", turbo_size);
+        assert_eq!(&turbo_out[..turbo_size], &original[..]);
+        eprintln!("[CF-TEST]   ✓ Passed");
+    }
+
+    /// Test 2: Data with simple RLE pattern (distance=1 matches)
+    #[test]
+    fn test_cf_rle_pattern() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // RLE pattern: "AAAAAAAAAA" (10 A's - should compress to match)
+        let original = b"AAAAAAAAAA".to_vec();
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        eprintln!("\n[CF-TEST] RLE pattern:");
+        eprintln!(
+            "[CF-TEST]   Original: {:?} ({} bytes)",
+            String::from_utf8_lossy(&original),
+            original.len()
+        );
+        eprintln!("[CF-TEST]   Compressed: {} bytes", compressed.len());
+
+        // Decompress with libdeflate
+        let mut libdeflate_out = vec![0u8; original.len() + 100];
+        let libdeflate_size = libdeflater::Decompressor::new()
+            .deflate_decompress(&compressed, &mut libdeflate_out)
+            .expect("libdeflate failed");
+
+        assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
+
+        // Decompress with turbo
+        let mut turbo_out = vec![0u8; original.len() + 100];
+        let turbo_size =
+            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+
+        assert_eq!(&turbo_out[..turbo_size], &original[..]);
+        eprintln!("[CF-TEST]   ✓ Passed");
+    }
+
+    /// Test 3: Data with back-references (typical deflate)
+    #[test]
+    fn test_cf_with_backrefs() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Pattern that creates back-references: "Hello Hello Hello"
+        let original = b"Hello Hello Hello".to_vec();
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        eprintln!("\n[CF-TEST] With back-references:");
+        eprintln!(
+            "[CF-TEST]   Original: {:?}",
+            String::from_utf8_lossy(&original)
+        );
+        eprintln!("[CF-TEST]   Compressed: {} bytes", compressed.len());
+
+        // Decompress with libdeflate
+        let mut libdeflate_out = vec![0u8; original.len() + 100];
+        let libdeflate_size = libdeflater::Decompressor::new()
+            .deflate_decompress(&compressed, &mut libdeflate_out)
+            .expect("libdeflate failed");
+
+        assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
+
+        // Decompress with turbo
+        let mut turbo_out = vec![0u8; original.len() + 100];
+        let turbo_size =
+            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+
+        assert_eq!(&turbo_out[..turbo_size], &original[..]);
+        eprintln!("[CF-TEST]   ✓ Passed");
+    }
+
+    /// Test 4: Larger data with complex patterns
+    #[test]
+    fn test_cf_complex_pattern() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Complex pattern
+        let original = b"The quick brown fox jumps over the lazy dog. ".repeat(10);
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        eprintln!("\n[CF-TEST] Complex pattern:");
+        eprintln!("[CF-TEST]   Original: {} bytes", original.len());
+        eprintln!("[CF-TEST]   Compressed: {} bytes", compressed.len());
+        eprintln!(
+            "[CF-TEST]   Ratio: {:.1}%",
+            compressed.len() as f64 / original.len() as f64 * 100.0
+        );
+
+        // Decompress with libdeflate
+        let mut libdeflate_out = vec![0u8; original.len() + 100];
+        let libdeflate_size = libdeflater::Decompressor::new()
+            .deflate_decompress(&compressed, &mut libdeflate_out)
+            .expect("libdeflate failed");
+
+        assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
+
+        // Decompress with turbo
+        let mut turbo_out = vec![0u8; original.len() + 100];
+        let turbo_size =
+            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+
+        assert_eq!(&turbo_out[..turbo_size], &original[..]);
+        eprintln!("[CF-TEST]   ✓ Passed");
+    }
+
+    /// Test 5: Binary data (all byte values)
+    #[test]
+    fn test_cf_binary_data() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Binary data with all byte values
+        let original: Vec<u8> = (0..=255).collect();
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        eprintln!("\n[CF-TEST] Binary data (0-255):");
+        eprintln!("[CF-TEST]   Original: {} bytes", original.len());
+        eprintln!("[CF-TEST]   Compressed: {} bytes", compressed.len());
+
+        // Decompress with libdeflate
+        let mut libdeflate_out = vec![0u8; original.len() + 100];
+        let libdeflate_size = libdeflater::Decompressor::new()
+            .deflate_decompress(&compressed, &mut libdeflate_out)
+            .expect("libdeflate failed");
+
+        assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
+
+        // Decompress with turbo
+        let mut turbo_out = vec![0u8; original.len() + 100];
+        let turbo_size =
+            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+
+        assert_eq!(&turbo_out[..turbo_size], &original[..]);
+        eprintln!("[CF-TEST]   ✓ Passed");
+    }
+
+    /// Test 6: Edge case - empty data
+    #[test]
+    fn test_cf_empty_data() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let original: Vec<u8> = vec![];
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        eprintln!("\n[CF-TEST] Empty data:");
+        eprintln!("[CF-TEST]   Original: {} bytes", original.len());
+        eprintln!("[CF-TEST]   Compressed: {} bytes", compressed.len());
+        eprintln!("[CF-TEST]   Compressed bytes: {:?}", compressed);
+
+        // Decompress with libdeflate
+        let mut libdeflate_out = vec![0u8; 100];
+        let libdeflate_size = libdeflater::Decompressor::new()
+            .deflate_decompress(&compressed, &mut libdeflate_out)
+            .expect("libdeflate failed");
+
+        assert_eq!(libdeflate_size, 0);
+
+        // Decompress with turbo
+        let mut turbo_out = vec![0u8; 100];
+        let turbo_size =
+            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+
+        assert_eq!(turbo_size, 0);
+        eprintln!("[CF-TEST]   ✓ Passed");
+    }
+
+    /// Test 7: Medium-sized repetitive data (stress test for matches)
+    #[test]
+    fn test_cf_medium_repetitive() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // 1KB of repetitive data
+        let original = b"ABCDEFGH".repeat(128);
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        eprintln!("\n[CF-TEST] Medium repetitive (1KB):");
+        eprintln!("[CF-TEST]   Original: {} bytes", original.len());
+        eprintln!("[CF-TEST]   Compressed: {} bytes", compressed.len());
+
+        // Decompress with libdeflate
+        let mut libdeflate_out = vec![0u8; original.len() + 100];
+        let libdeflate_size = libdeflater::Decompressor::new()
+            .deflate_decompress(&compressed, &mut libdeflate_out)
+            .expect("libdeflate failed");
+
+        assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
+
+        // Decompress with turbo
+        let mut turbo_out = vec![0u8; original.len() + 100];
+        let turbo_size =
+            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+
+        assert_eq!(&turbo_out[..turbo_size], &original[..]);
+        eprintln!("[CF-TEST]   ✓ Passed");
+    }
+
+    /// Test 8: Large data (10KB) - stress test
+    #[test]
+    fn test_cf_large_data() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // 10KB of varied data
+        let original: Vec<u8> = (0..10240).map(|i| ((i * 7 + 13) % 256) as u8).collect();
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        eprintln!("\n[CF-TEST] Large data (10KB):");
+        eprintln!("[CF-TEST]   Original: {} bytes", original.len());
+        eprintln!("[CF-TEST]   Compressed: {} bytes", compressed.len());
+
+        // Decompress with libdeflate
+        let mut libdeflate_out = vec![0u8; original.len() + 100];
+        let libdeflate_size = libdeflater::Decompressor::new()
+            .deflate_decompress(&compressed, &mut libdeflate_out)
+            .expect("libdeflate failed");
+
+        assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
+
+        // Decompress with turbo
+        let mut turbo_out = vec![0u8; original.len() + 100];
+        let turbo_size =
+            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+
+        assert_eq!(&turbo_out[..turbo_size], &original[..]);
+        eprintln!("[CF-TEST]   ✓ Passed");
+    }
+
+    /// Test: Dickens file from silesia with MAX compression
+    #[test]
+    fn test_cf_dickens_max() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Read dickens file (first 100KB to keep test fast)
+        let original = match std::fs::read("benchmark_data/dickens") {
+            Ok(d) => d[..100_000.min(d.len())].to_vec(),
+            Err(_) => {
+                eprintln!("[CF-TEST] Skipping - no dickens file");
+                return;
+            }
+        };
+
+        eprintln!("\n[CF-TEST] Dickens MAX compression test:");
+        eprintln!("[CF-TEST]   Original: {} bytes", original.len());
+
+        // Use BEST compression like silesia-gzip.tar.gz
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        eprintln!("[CF-TEST]   Compressed: {} bytes", compressed.len());
+
+        // Decompress with libdeflate
+        let mut libdeflate_out = vec![0u8; original.len() + 100];
+        let libdeflate_size = libdeflater::Decompressor::new()
+            .deflate_decompress(&compressed, &mut libdeflate_out)
+            .expect("libdeflate failed");
+
+        assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
+
+        // Decompress with our turbo path
+        let mut turbo_out = vec![0u8; original.len() + 100];
+        let result = super::inflate_into_turbo(&compressed, &mut turbo_out);
+
+        match result {
+            Ok(turbo_size) => {
+                if turbo_out[..turbo_size] != original[..] {
+                    // Find first mismatch
+                    let first_mismatch = turbo_out[..turbo_size]
+                        .iter()
+                        .zip(original.iter())
+                        .enumerate()
+                        .find(|(_, (a, b))| a != b);
+
+                    if let Some((pos, (got, exp))) = first_mismatch {
+                        eprintln!(
+                            "[CF-TEST]   First mismatch at byte {}: got {} exp {}",
+                            pos, got, exp
+                        );
+                        panic!("Content mismatch at byte {}", pos);
+                    }
+                }
+                eprintln!("[CF-TEST]   ✓ Passed");
+            }
+            Err(e) => {
+                panic!("Decompression failed: {:?}", e);
+            }
+        }
+    }
+
+    /// Test: Multi-block deflate stream
+    #[test]
+    fn test_cf_multi_block() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Create data that will produce multiple deflate blocks
+        // By using different data patterns, we force block boundaries
+        let mut original = Vec::new();
+        for _ in 0..10 {
+            // Each iteration adds ~8KB of varied data
+            original.extend(b"The quick brown fox jumps over the lazy dog. ".repeat(200));
+            original.extend((0u8..=255).collect::<Vec<_>>().repeat(30));
+        }
+
+        eprintln!("\n[CF-TEST] Multi-block test:");
+        eprintln!("[CF-TEST]   Original: {} bytes", original.len());
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::best());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        eprintln!("[CF-TEST]   Compressed: {} bytes", compressed.len());
+
+        // Decompress with libdeflate (reference)
+        let mut libdeflate_out = vec![0u8; original.len() + 100];
+        let libdeflate_size = libdeflater::Decompressor::new()
+            .deflate_decompress(&compressed, &mut libdeflate_out)
+            .expect("libdeflate failed");
+
+        assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
+
+        // Decompress with our turbo path
+        let mut turbo_out = vec![0u8; original.len() + 100];
+        let result = super::inflate_into_turbo(&compressed, &mut turbo_out);
+
+        match result {
+            Ok(turbo_size) => {
+                assert_eq!(turbo_size, original.len());
+                assert_eq!(&turbo_out[..turbo_size], &original[..]);
+                eprintln!("[CF-TEST]   ✓ Passed");
+            }
+            Err(e) => {
+                // Find first mismatch
+                let cmp_size = turbo_out.len().min(libdeflate_out.len());
+                let first_mismatch = turbo_out[..cmp_size]
+                    .iter()
+                    .zip(libdeflate_out[..cmp_size].iter())
+                    .enumerate()
+                    .find(|(_, (a, b))| a != b);
+
+                if let Some((pos, _)) = first_mismatch {
+                    eprintln!("[CF-TEST]   First mismatch at byte {}", pos);
+                }
+                panic!("Decompression failed: {:?}", e);
+            }
+        }
+    }
+
+    /// Test 10: Gzip format (not just deflate) - like the failing test
+    #[test]
+    fn test_cf_gzip_format() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // 1MB of varied data (like silesia)
+        let original: Vec<u8> = (0..1_000_000)
+            .map(|i| ((i * 17 + 13) % 256) as u8)
+            .collect();
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        eprintln!("\n[CF-TEST] Gzip format:");
+        eprintln!("[CF-TEST]   Original: {} bytes", original.len());
+        eprintln!("[CF-TEST]   Compressed: {} bytes", compressed.len());
+
+        // Decompress with libdeflate (reference)
+        let mut libdeflate_out = vec![0u8; original.len() + 100];
+        let libdeflate_size = libdeflater::Decompressor::new()
+            .gzip_decompress(&compressed, &mut libdeflate_out)
+            .expect("libdeflate failed");
+
+        assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
+
+        // Decompress with our gzip preallocated function
+        let mut our_out = Vec::new();
+        let our_size =
+            crate::ultra_fast_inflate::inflate_gzip_preallocated(&compressed, &mut our_out)
+                .expect("our inflate failed");
+
+        assert_eq!(our_size, original.len());
+        assert_eq!(&our_out[..our_size], &original[..]);
+        eprintln!("[CF-TEST]   ✓ Passed");
+    }
+
+    /// Test: Compare ConsumeFirstTable and TwoLevelTable decode results
+    #[test]
+    fn test_cf_table_comparison() {
+        use crate::consume_first_table::ConsumeFirstTable;
+        use crate::two_level_table::TwoLevelTable;
+
+        // Use the same code lengths as would be built for a real stream
+        // Standard fixed Huffman: 0-143 have 8 bits, 144-255 have 9 bits, etc.
+        let mut lit_len_lens = vec![0u8; 286];
+        for i in 0..144 {
+            lit_len_lens[i] = 8;
+        }
+        for i in 144..256 {
+            lit_len_lens[i] = 9;
+        }
+        for i in 256..280 {
+            lit_len_lens[i] = 7;
+        }
+        for i in 280..286 {
+            lit_len_lens[i] = 8;
+        }
+
+        let cf_table = ConsumeFirstTable::build(&lit_len_lens).expect("CF build failed");
+        let tl_table = TwoLevelTable::build(&lit_len_lens).expect("TL build failed");
+
+        // Compare what both tables decode for various bit patterns
+        let mut mismatches = 0;
+        for bits in 0u64..2048 {
+            let cf_entry = cf_table.lookup_main(bits);
+            let (tl_sym, tl_len) = tl_table.decode(bits);
+
+            // CF might return a subtable pointer - skip those for now
+            if cf_entry.is_subtable() {
+                continue;
+            }
+
+            // For EOB, CF stores type but not symbol; symbol() returns 0, TL returns 256
+            // Map CF symbol to match TL's convention
+            let cf_sym = if cf_entry.is_eob() {
+                256
+            } else {
+                cf_entry.symbol()
+            };
+            let cf_len = cf_entry.bits() as u16;
+
+            // Skip invalid TL entries (len=0 means code doesn't exist)
+            if tl_len == 0 {
+                continue;
+            }
+
+            if cf_sym != tl_sym || cf_len as u32 != tl_len {
+                if mismatches < 10 {
+                    eprintln!("[TABLE-CMP] bits={:#06x} CF(sym={}, len={}, lit={}, eob={}, length={}) TL(sym={}, len={})",
+                        bits, cf_sym, cf_len, cf_entry.is_literal(), cf_entry.is_eob(), cf_entry.is_length(), tl_sym, tl_len);
+                }
+                mismatches += 1;
+            }
+        }
+
+        if mismatches > 0 {
+            panic!("Found {} table mismatches!", mismatches);
+        }
+        eprintln!("[CF-TEST] Tables match for all 2048 patterns");
+    }
+
+    /// Test: Verify distance table builds correctly
+    #[test]
+    fn test_cf_distance_table() {
+        use crate::consume_first_table::ConsumeFirstTable;
+
+        // Standard 5-bit distance codes
+        let dist_lens: Vec<u8> = vec![5; 30];
+
+        let table =
+            ConsumeFirstTable::build_distance(&dist_lens).expect("Failed to build distance table");
+
+        // Helper to reverse bits
+        fn reverse_bits(mut val: u32, n: u32) -> u32 {
+            let mut result = 0;
+            for _ in 0..n {
+                result = (result << 1) | (val & 1);
+                val >>= 1;
+            }
+            result
+        }
+
+        // Verify a few distance symbols
+        for sym in 0..10 {
+            let code = reverse_bits(sym as u32, 5);
+            let entry = table.lookup_main(code as u64);
+
+            // All distance symbols should be length codes (not literals)
+            assert!(
+                entry.is_length(),
+                "Distance symbol {} should be length type",
+                sym
+            );
+            assert_eq!(
+                entry.symbol(),
+                sym,
+                "Distance symbol {} decoded incorrectly",
+                sym
+            );
+            assert_eq!(
+                entry.bits(),
+                5,
+                "Distance symbol {} should consume 5 bits",
+                sym
+            );
+        }
+
+        eprintln!("[CF-TEST] Distance table builds correctly");
+    }
+
+    /// Test: Raw deflate from silesia
+    #[test]
+    fn test_cf_silesia_raw() {
+        // Read silesia-gzip.tar.gz and extract raw deflate data
+        let gzip_data = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("[CF-TEST] Skipping - no silesia file");
+                return;
+            }
+        };
+
+        eprintln!("\n[CF-TEST] Silesia raw deflate:");
+        eprintln!("[CF-TEST]   Gzip file: {} bytes", gzip_data.len());
+
+        // Parse gzip header to find deflate start
+        let flags = gzip_data[3];
+        let mut pos = 10;
+
+        // Skip FEXTRA
+        if flags & 0x04 != 0 {
+            let xlen = u16::from_le_bytes([gzip_data[pos], gzip_data[pos + 1]]) as usize;
+            pos += 2 + xlen;
+        }
+        // Skip FNAME
+        if flags & 0x08 != 0 {
+            while gzip_data[pos] != 0 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+        // Skip FCOMMENT
+        if flags & 0x10 != 0 {
+            while gzip_data[pos] != 0 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+        // Skip FHCRC
+        if flags & 0x02 != 0 {
+            pos += 2;
+        }
+
+        let deflate_start = pos;
+        let deflate_end = gzip_data.len() - 8; // Subtract CRC32 + ISIZE trailer
+        let deflate_data = &gzip_data[deflate_start..deflate_end];
+
+        eprintln!(
+            "[CF-TEST]   Deflate data: {} bytes (start at {})",
+            deflate_data.len(),
+            deflate_start
+        );
+
+        // Get expected output from libdeflate
+        let mut libdeflate_out = vec![0u8; 212_000_000]; // Big enough
+        let libdeflate_size = libdeflater::Decompressor::new()
+            .deflate_decompress(deflate_data, &mut libdeflate_out)
+            .expect("libdeflate failed");
+
+        eprintln!("[CF-TEST]   Expected output: {} bytes", libdeflate_size);
+
+        // Test with our turbo path - only first 100KB to find first mismatch
+        let test_size = 100_000.min(libdeflate_size);
+        let mut turbo_out = vec![0u8; libdeflate_size + 1000];
+
+        match super::inflate_into_turbo(deflate_data, &mut turbo_out) {
+            Ok(size) => {
+                eprintln!("[CF-TEST]   Our output: {} bytes", size);
+
+                // Compare first 100KB
+                let first_mismatch = turbo_out[..test_size]
+                    .iter()
+                    .zip(libdeflate_out[..test_size].iter())
+                    .enumerate()
+                    .find(|(_, (a, b))| a != b);
+
+                if let Some((pos, (got, exp))) = first_mismatch {
+                    eprintln!(
+                        "[CF-TEST]   FIRST MISMATCH at byte {}: got {} expected {}",
+                        pos, got, exp
+                    );
+                    panic!("Mismatch at byte {}", pos);
+                }
+                eprintln!("[CF-TEST]   ✓ First {} bytes match", test_size);
+            }
+            Err(e) => {
+                // Still compare what we have
+                let cmp_size = turbo_out.len().min(libdeflate_out.len());
+                let first_mismatch = turbo_out[..cmp_size]
+                    .iter()
+                    .zip(libdeflate_out[..cmp_size].iter())
+                    .enumerate()
+                    .find(|(_, (a, b))| a != b);
+
+                if let Some((pos, _)) = first_mismatch {
+                    eprintln!("[CF-TEST]   First mismatch at byte {}", pos);
+                }
+                panic!("Decompression failed: {:?}", e);
+            }
+        }
+    }
+
+    /// Test 11: Actual silesia data (first 1MB only for faster testing)
+    #[test]
+    fn test_cf_silesia_small() {
+        // Read first 1MB of silesia-gzip.tar.gz (compressed)
+        let data = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+            Ok(d) => d[..1_000_000.min(d.len())].to_vec(),
+            Err(_) => {
+                eprintln!("[CF-TEST] Skipping - no silesia file");
+                return;
+            }
+        };
+
+        eprintln!("\n[CF-TEST] Silesia (first 1MB compressed):");
+        eprintln!("[CF-TEST]   Compressed chunk: {} bytes", data.len());
+
+        // We can't decompress a partial gzip, so let's try the full file
+        // but only compare first 10MB of output
+        let full_data = std::fs::read("benchmark_data/silesia-gzip.tar.gz").unwrap();
+
+        // Get expected output from flate2 (first 10MB)
+        use std::io::Read;
+        let mut flate2_dec = flate2::read::GzDecoder::new(&full_data[..]);
+        let mut expected = Vec::new();
+        flate2_dec.read_to_end(&mut expected).unwrap();
+        let check_size = 10_000_000.min(expected.len());
+        eprintln!(
+            "[CF-TEST]   Expected total: {} bytes, checking first {} bytes",
+            expected.len(),
+            check_size
+        );
+
+        // Decompress with our function
+        let mut our_out = Vec::new();
+        let result = crate::ultra_fast_inflate::inflate_gzip_preallocated(&full_data, &mut our_out);
+
+        match result {
+            Ok(our_size) => {
+                eprintln!("[CF-TEST]   Our output: {} bytes", our_size);
+                // Check first 10MB
+                if our_size >= check_size {
+                    assert_eq!(
+                        &our_out[..check_size],
+                        &expected[..check_size],
+                        "Mismatch in first {} bytes",
+                        check_size
+                    );
+                    eprintln!("[CF-TEST]   ✓ First {} bytes match", check_size);
+                } else {
+                    panic!(
+                        "Output too small: {} vs expected {}",
+                        our_size,
+                        expected.len()
+                    );
+                }
+            }
+            Err(e) => {
+                // Find where the error occurred
+                eprintln!("[CF-TEST]   Error: {:?}", e);
+                eprintln!("[CF-TEST]   Output so far: {} bytes", our_out.len());
+
+                // Find first mismatch
+                let cmp_size = our_out.len().min(expected.len());
+                if cmp_size > 0 {
+                    let first_mismatch = our_out[..cmp_size]
+                        .iter()
+                        .zip(expected[..cmp_size].iter())
+                        .enumerate()
+                        .find(|(_, (a, b))| a != b);
+
+                    if let Some((pos, _)) = first_mismatch {
+                        eprintln!("[CF-TEST]   FIRST MISMATCH at byte {}:", pos);
+                        eprintln!(
+                            "[CF-TEST]   Got: {:?}",
+                            &our_out[pos..pos.saturating_add(20).min(cmp_size)]
+                        );
+                        eprintln!(
+                            "[CF-TEST]   Exp: {:?}",
+                            &expected[pos..pos.saturating_add(20).min(cmp_size)]
+                        );
+
+                        // Show context before
+                        let ctx_start = pos.saturating_sub(10);
+                        eprintln!("[CF-TEST]   Context before ({}-{}):", ctx_start, pos);
+                        eprintln!(
+                            "[CF-TEST]   Got: {:?}",
+                            String::from_utf8_lossy(&our_out[ctx_start..pos])
+                        );
+                        eprintln!(
+                            "[CF-TEST]   Exp: {:?}",
+                            String::from_utf8_lossy(&expected[ctx_start..pos])
+                        );
+                    } else {
+                        eprintln!("[CF-TEST]   First {} bytes match perfectly", cmp_size);
+                    }
+                }
+
+                panic!("Decompression failed: {:?}", e);
+            }
+        }
+    }
+
+    /// Test 9: Large repetitive data (100KB) - more stress
+    #[test]
+    fn test_cf_very_large_repetitive() {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // 100KB of repetitive text
+        let original = b"The quick brown fox jumps over the lazy dog. ".repeat(2000);
+
+        let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        eprintln!("\n[CF-TEST] Very large repetitive (100KB):");
+        eprintln!("[CF-TEST]   Original: {} bytes", original.len());
+        eprintln!("[CF-TEST]   Compressed: {} bytes", compressed.len());
+        eprintln!(
+            "[CF-TEST]   Ratio: {:.1}%",
+            compressed.len() as f64 / original.len() as f64 * 100.0
+        );
+
+        // Decompress with libdeflate
+        let mut libdeflate_out = vec![0u8; original.len() + 100];
+        let libdeflate_size = libdeflater::Decompressor::new()
+            .deflate_decompress(&compressed, &mut libdeflate_out)
+            .expect("libdeflate failed");
+
+        assert_eq!(&libdeflate_out[..libdeflate_size], &original[..]);
+
+        // Decompress with turbo
+        let mut turbo_out = vec![0u8; original.len() + 100];
+        let turbo_size =
+            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+
+        assert_eq!(&turbo_out[..turbo_size], &original[..]);
+        eprintln!("[CF-TEST]   ✓ Passed");
     }
 
     /// Benchmark valid-entries table with consume-first decode loop
