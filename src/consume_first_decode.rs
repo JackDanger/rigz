@@ -386,8 +386,10 @@ fn decode_huffman_cf(
             if distance == 0 || distance as usize > out_pos {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
-                    format!("Invalid distance {} at pos {} (subtable={}, dist_entry={:#x}, dist_saved={:#x}, extra_saved={:#x})", 
-                        distance, out_pos, is_subtable, dist_entry.raw(), dist_saved, dist_extra_saved),
+                    format!(
+                        "Invalid distance {} at pos {} from subtable",
+                        distance, out_pos
+                    ),
                 ));
             }
 
@@ -418,17 +420,10 @@ fn decode_huffman_cf(
         bits.consume_entry(dist_entry.raw());
         let distance = dist_entry.decode_distance(dist_extra_saved);
 
-        // Validate
         if distance == 0 || distance as usize > out_pos {
             return Err(Error::new(
                 ErrorKind::InvalidData,
-                format!(
-                    "Invalid distance {} at pos {}, len={}, dist_entry={:#x}",
-                    distance,
-                    out_pos,
-                    length,
-                    dist_entry.raw()
-                ),
+                format!("Invalid distance {} at pos {}", distance, out_pos),
             ));
         }
 
