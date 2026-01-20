@@ -1,0 +1,397 @@
+# =============================================================================
+# Unified Benchmarks: Compression + Decompression in one efficient workflow
+# =============================================================================
+# Architecture:
+#   Stage 1: Build all tools ONCE
+#   Stage 2: Prepare test data ONCE per data_type
+#   Stage 3: Benchmark matrix (level × threads × data_type)
+#   Stage 4: Guards - apply threshold assertions
+#   Stage 5: Summary - aggregate and post to PR
+#
+# This replaces: compression.yml, decompression.yml, performance-regression.yml
+# =============================================================================
+name: Benchmarks
+
+on:
+  push:
+    branches: ["*"]
+  pull_request:
+    branches: ["*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ============================================================================
+  # STAGE 1: Build all tools once, share via artifacts
+  # ============================================================================
+  build:
+    name: Build Tools
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake nasm zlib1g-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build all tools
+        run: |
+          # Build gzippy
+          cargo build --release
+          
+          # Build pigz
+          make -C pigz
+          
+          # Build igzip (static)
+          cd isa-l
+          rm -rf build && mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+          make -j$(nproc) igzip || echo "igzip build failed"
+          cd ../..
+          
+          # Build rapidgzip
+          cd rapidgzip/librapidarchive
+          rm -rf build && mkdir -p build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DWITH_ISAL=OFF
+          make -j$(nproc) rapidgzip || echo "rapidgzip build failed"
+          cd ../../..
+          
+          # Build zopfli
+          make -C zopfli zopfli || echo "zopfli build failed"
+
+      - name: Package binaries
+        run: |
+          mkdir -p binaries
+          cp target/release/gzippy binaries/
+          cp pigz/pigz pigz/unpigz binaries/
+          cp isa-l/build/igzip binaries/ 2>/dev/null || echo "igzip not available"
+          cp rapidgzip/librapidarchive/build/src/tools/rapidgzip binaries/ 2>/dev/null || echo "rapidgzip not available"
+          cp zopfli/zopfli binaries/ 2>/dev/null || echo "zopfli not available"
+          ls -la binaries/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: binaries/
+          retention-days: 1
+
+  # ============================================================================
+  # STAGE 2: Prepare test data and all compressed variants
+  # ============================================================================
+  prepare-data:
+    name: Prepare ${{ matrix.data_type }} ${{ matrix.size }}MB
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      matrix:
+        data_type: [text, tarball]
+        size: [10, 100]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: ./bin
+
+      - name: Setup binaries
+        run: chmod +x ./bin/*
+
+      - name: Generate test data
+        run: |
+          SIZE_BYTES=$((${{ matrix.size }} * 1024 * 1024))
+          
+          if [ "${{ matrix.data_type }}" = "text" ]; then
+            python3 -c "
+          import random
+          random.seed(42)
+          words = ['the', 'quick', 'brown', 'fox', 'jumps', 'over', 'lazy', 'dog', 'and', 'cat']
+          target = $SIZE_BYTES
+          with open('/tmp/test-data.bin', 'w') as f:
+              written = 0
+              while written < target:
+                  line = ' '.join(random.choices(words, k=10)) + '\n'
+                  f.write(line)
+                  written += len(line)
+          "
+          else
+            # Tarball from /usr/share
+            tar cf - /usr/share 2>/dev/null | head -c $((SIZE_BYTES * 2)) > /tmp/seed.tar || true
+            python3 -c "
+          target = $SIZE_BYTES
+          with open('/tmp/seed.tar', 'rb') as f:
+              seed = f.read()
+          with open('/tmp/test-data.bin', 'wb') as f:
+              written = 0
+              while written < target:
+                  chunk = seed[:target - written]
+                  f.write(chunk)
+                  written += len(chunk)
+          "
+            rm -f /tmp/seed.tar
+          fi
+          ls -lh /tmp/test-data.bin
+
+      - name: Create all compressed variants
+        run: |
+          mkdir -p /tmp/compressed
+          
+          # gzippy at key levels
+          for level in 1 6 9; do
+            ./bin/gzippy -$level -c /tmp/test-data.bin > /tmp/compressed/gzippy-L${level}.gz
+          done
+          
+          # pigz at key levels
+          for level in 1 6 9; do
+            ./bin/pigz -$level -c /tmp/test-data.bin > /tmp/compressed/pigz-L${level}.gz
+          done
+          
+          # gzip at key levels
+          for level in 1 6 9; do
+            gzip -$level -c /tmp/test-data.bin > /tmp/compressed/gzip-L${level}.gz
+          done
+          
+          # igzip if available (only level 3)
+          if [ -x ./bin/igzip ]; then
+            ./bin/igzip -3 -c /tmp/test-data.bin > /tmp/compressed/igzip-L3.gz
+          fi
+          
+          ls -lh /tmp/compressed/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: data-${{ matrix.data_type }}-${{ matrix.size }}mb
+          path: |
+            /tmp/test-data.bin
+            /tmp/compressed/
+          retention-days: 1
+
+  # ============================================================================
+  # STAGE 3: Run benchmarks (compression + decompression)
+  # ============================================================================
+  benchmark:
+    name: Bench ${{ matrix.data_type }} ${{ matrix.size }}MB L${{ matrix.level }} T${{ matrix.threads }}
+    runs-on: ubuntu-latest
+    needs: prepare-data
+    strategy:
+      fail-fast: false
+      matrix:
+        data_type: [text, tarball]
+        size: [10, 100]
+        level: [1, 6, 9]
+        threads: [1, 0]  # 0 = max cores
+        exclude:
+          # Skip 100MB single-thread at L1 (too noisy)
+          - size: 100
+            level: 1
+            threads: 1
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: ./bin
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: data-${{ matrix.data_type }}-${{ matrix.size }}mb
+          path: ./data
+
+      - name: Setup
+        run: |
+          chmod +x ./bin/*
+          mkdir -p results
+          
+          # Resolve data paths (artifacts have varying structure)
+          if [ -f "./data/test-data.bin" ]; then
+            echo "DATA_FILE=./data/test-data.bin" >> $GITHUB_ENV
+            echo "COMPRESSED_DIR=./data/compressed" >> $GITHUB_ENV
+          else
+            echo "DATA_FILE=./data/tmp/test-data.bin" >> $GITHUB_ENV
+            echo "COMPRESSED_DIR=./data/tmp/compressed" >> $GITHUB_ENV
+          fi
+          
+          # Resolve thread count
+          if [ "${{ matrix.threads }}" = "0" ]; then
+            echo "THREADS=$(nproc)" >> $GITHUB_ENV
+          else
+            echo "THREADS=${{ matrix.threads }}" >> $GITHUB_ENV
+          fi
+
+      - name: Run unified benchmark
+        run: |
+          python3 scripts/run_benchmarks.py \
+            --binaries ./bin \
+            --data-file "$DATA_FILE" \
+            --compressed-dir "$COMPRESSED_DIR" \
+            --level ${{ matrix.level }} \
+            --threads $THREADS \
+            --size ${{ matrix.size }} \
+            --data-type ${{ matrix.data_type }} \
+            --output results/benchmark.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: results-${{ matrix.data_type }}-${{ matrix.size }}mb-l${{ matrix.level }}-t${{ matrix.threads }}
+          path: results/
+          retention-days: 7
+
+  # ============================================================================
+  # STAGE 3b: Random data edge cases
+  # ============================================================================
+  random-data:
+    name: Random Data L${{ matrix.level }} T${{ matrix.threads }}
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        level: [1, 9]
+        threads: [1, 4]
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: ./bin
+
+      - name: Setup
+        run: chmod +x ./bin/*
+
+      - name: Test random data
+        run: |
+          # Generate 10MB random data
+          dd if=/dev/urandom of=/tmp/random.bin bs=1M count=10 2>/dev/null
+          
+          # Compress
+          cat /tmp/random.bin | ./bin/gzippy -${{ matrix.level }} -p${{ matrix.threads }} > /tmp/random.gz
+          
+          # Decompress with gzippy
+          ./bin/gzippy -d < /tmp/random.gz > /tmp/random.out
+          diff /tmp/random.bin /tmp/random.out
+          echo "✓ gzippy roundtrip OK"
+          
+          # Verify gzip compatibility
+          gzip -d < /tmp/random.gz > /tmp/random.gzip.out
+          diff /tmp/random.bin /tmp/random.gzip.out
+          echo "✓ gzip can decompress gzippy output"
+
+  # ============================================================================
+  # STAGE 4: Apply performance guards (threshold assertions)
+  # ============================================================================
+  guards:
+    name: Performance Guards
+    runs-on: ubuntu-latest
+    needs: [benchmark, random-data]
+    if: always() && needs.benchmark.result == 'success'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          path: results/
+          merge-multiple: true
+
+      - name: Collect system info
+        run: python3 scripts/collect_system_info.py --output results/system.json
+
+      - name: Aggregate results
+        run: |
+          python3 scripts/aggregate_benchmark_results.py \
+            --input-dir results \
+            --output-dir aggregated
+
+      - name: Check performance guards
+        id: guards
+        run: |
+          python3 scripts/check_guards.py \
+            --compression aggregated/compression.json \
+            --decompression aggregated/decompression.json \
+            --output guards-report.json
+
+      - name: Generate summary
+        run: |
+          python3 scripts/generate_summary.py \
+            --system results/system.json \
+            --compression aggregated/compression.json \
+            --decompression aggregated/decompression.json \
+            --output summary.md
+          
+          cat summary.md >> $GITHUB_STEP_SUMMARY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-summary
+          path: |
+            aggregated/
+            results/system.json
+            guards-report.json
+            summary.md
+          retention-days: 30
+
+      - name: Post to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            
+            let summary;
+            try {
+              summary = fs.readFileSync('summary.md', 'utf8');
+            } catch {
+              summary = '## gzippy Performance Summary\n\nNo results available.';
+            }
+            
+            const body = summary + '\n\n---\n*Updated: ' + new Date().toISOString() + '*';
+            
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            
+            const marker = '# 🚀 gzippy Performance Summary';
+            const existing = comments.find(c => 
+              c.user.type === 'Bot' && c.body && c.body.includes(marker)
+            );
+            
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body
+              });
+            }
