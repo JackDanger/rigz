@@ -620,9 +620,9 @@ fn get_fixed_double_lit_cache() -> &'static crate::double_literal::DoubleLitCach
 
 fn decode_fixed(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
     let tables = crate::libdeflate_decode::get_fixed_tables();
-    // Note: DoubleLitCache is available via get_fixed_double_lit_cache() for fixed blocks
-    // but silesia is mostly dynamic blocks, so the benefit is limited
-    decode_huffman_cf(bits, output, out_pos, &tables.0, &tables.1)
+    // USE the DoubleLitCache for fixed blocks - decodes 2 literals per lookup
+    let double_cache = get_fixed_double_lit_cache();
+    decode_huffman_cf_double(bits, output, out_pos, &tables.0, &tables.1, double_cache)
 }
 
 /// Huffman decode with double-literal cache optimization
