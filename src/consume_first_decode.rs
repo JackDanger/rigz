@@ -150,8 +150,10 @@ fn prefetch_read(ptr: *const u8) {
 #[inline(always)]
 fn prefetch_read(_ptr: *const u8) {}
 
+/// Fast match copy for fastloop - may write up to 40 bytes beyond length
+/// ONLY use when you have FASTLOOP_MARGIN bytes of buffer margin!
 #[inline(always)]
-fn copy_match(output: &mut [u8], out_pos: usize, distance: u32, length: u32) -> usize {
+fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32) -> usize {
     let dist = distance as usize;
     let len = length as usize;
 
@@ -231,6 +233,32 @@ fn copy_match(output: &mut [u8], out_pos: usize, distance: u32, length: u32) -> 
     out_pos + len
 }
 
+/// Safe match copy for generic loop - writes exactly `length` bytes, no overwrite
+#[inline(always)]
+fn copy_match_safe(output: &mut [u8], out_pos: usize, distance: u32, length: u32) -> usize {
+    let dist = distance as usize;
+    let len = length as usize;
+    let src_start = out_pos - dist;
+
+    if dist >= len {
+        // Non-overlapping - direct copy
+        output.copy_within(src_start..src_start + len, out_pos);
+    } else if dist == 1 {
+        // RLE - fill with single byte
+        let byte = output[src_start];
+        for i in 0..len {
+            output[out_pos + i] = byte;
+        }
+    } else {
+        // Overlapping copy - must go byte by byte
+        for i in 0..len {
+            output[out_pos + i] = output[src_start + (i % dist)];
+        }
+    }
+
+    out_pos + len
+}
+
 // =============================================================================
 // Main Decode Function - Matching libdeflate's Structure EXACTLY
 // =============================================================================
@@ -245,7 +273,8 @@ fn decode_huffman_cf(
     litlen: &LitLenTable,
     dist: &DistTable,
 ) -> Result<usize> {
-    const FASTLOOP_MARGIN: usize = 274; // max match + safety
+    // CRITICAL: Must be >= max_match(258) + copy_match_fast overwrite(40) + safety
+    const FASTLOOP_MARGIN: usize = 320;
 
     // PRELOAD first entry BEFORE loop
     bits.refill();
@@ -397,7 +426,8 @@ fn decode_huffman_cf(
             bits.refill();
             entry = litlen.lookup(bits.peek());
 
-            out_pos = copy_match(output, out_pos, distance, length);
+            // Use safe copy to avoid corrupting data that will be backreferenced later
+            out_pos = copy_match_safe(output, out_pos, distance, length);
             continue; // NEVER fall through
         }
 
@@ -432,29 +462,42 @@ fn decode_huffman_cf(
         bits.refill();
         entry = litlen.lookup(bits.peek());
 
-        // Copy match (overlaps with memory latency of table lookup)
-        out_pos = copy_match(output, out_pos, distance, length);
+        // Use safe copy - fast copy corrupts future backreference data
+        out_pos = copy_match_safe(output, out_pos, distance, length);
     }
 
     // GENERIC LOOP (near end of output)
+    // This loop handles bytes near the end where we can't afford copy overwrites
+    // KEY: Always refill at start of each iteration (like libdeflate's generic_loop)
     loop {
-        if bits.available() < 15 {
-            bits.refill();
-        }
+        // Always refill - handles end-of-input gracefully
+        bits.refill();
 
-        let saved_bitbuf = bits.peek();
+        let mut saved_bitbuf = bits.peek();
         entry = litlen.lookup(saved_bitbuf);
 
         if entry.is_subtable_ptr() {
+            // Consume main table bits FIRST
+            bits.consume(LitLenTable::TABLE_BITS as u32);
             entry = litlen.lookup_subtable(entry, saved_bitbuf);
+            // Capture saved_bitbuf AFTER main bits for extra bits extraction
+            saved_bitbuf = bits.peek();
+            bits.consume_entry(entry.raw()); // subtable entry bits only
+        } else {
+            bits.consume_entry(entry.raw()); // main entry bits
         }
-
-        bits.consume_entry(entry.raw());
 
         if (entry.raw() as i32) < 0 {
             // Literal
             if out_pos >= output.len() {
-                return Err(Error::new(ErrorKind::WriteZero, "Output full"));
+                return Err(Error::new(
+                    ErrorKind::WriteZero,
+                    format!(
+                        "Generic literal overflow: out_pos={} output.len={}",
+                        out_pos,
+                        output.len()
+                    ),
+                ));
             }
             output[out_pos] = entry.literal_value();
             out_pos += 1;
@@ -465,13 +508,10 @@ fn decode_huffman_cf(
             return Ok(out_pos);
         }
 
-        // Length
+        // Length code - decode from saved_bitbuf
         let length = entry.decode_length(saved_bitbuf);
 
-        if bits.available() < 15 {
-            bits.refill();
-        }
-
+        bits.refill();
         let dist_saved = bits.peek();
         let mut dist_entry = dist.lookup(dist_saved);
         if dist_entry.is_subtable_ptr() {
@@ -490,10 +530,19 @@ fn decode_huffman_cf(
         }
 
         if out_pos + length as usize > output.len() {
-            return Err(Error::new(ErrorKind::WriteZero, "Output full"));
+            return Err(Error::new(
+                ErrorKind::WriteZero,
+                format!(
+                    "Generic match overflow: out_pos={} length={} output.len={}",
+                    out_pos,
+                    length,
+                    output.len()
+                ),
+            ));
         }
 
-        out_pos = copy_match(output, out_pos, distance, length);
+        // SAFE copy in generic loop - no buffer margin here
+        out_pos = copy_match_safe(output, out_pos, distance, length);
     }
 }
 
@@ -988,5 +1037,80 @@ mod tests {
         eprintln!("libdeflate throughput: {:>8.1} MB/s", lib_throughput);
         eprintln!("Ratio: {:.1}%", 100.0 * our_throughput / lib_throughput);
         eprintln!("=============================\n");
+    }
+
+    #[test]
+    fn test_cf_single_bgzf_block() {
+        // Test on a BGZF block to match what parallel decompress does
+        let data = match std::fs::read("benchmark_data/test-gzippy-l1-t14.gz") {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("Skip - no file");
+                return;
+            }
+        };
+
+        // Get expected from flate2 MultiGzDecoder
+        use std::io::Read;
+        let mut expected = Vec::new();
+        let mut decoder = flate2::read::MultiGzDecoder::new(&data[..]);
+        decoder.read_to_end(&mut expected).unwrap();
+
+        // Parse first BGZF block manually
+        // Header: 1f 8b 08 04 (gzip with FEXTRA)
+        let xlen = u16::from_le_bytes([data[10], data[11]]) as usize;
+        let header_end = 12 + xlen;
+
+        // Find block size from extra field
+        let mut pos = 12;
+        let mut bsize = None;
+        while pos < header_end {
+            let slen = u16::from_le_bytes([data[pos + 2], data[pos + 3]]) as usize;
+            let si = [data[pos], data[pos + 1]];
+            if si == *b"GZ" && slen >= 4 {
+                // Our BGZF uses GZ with 4-byte block size
+                bsize = Some(u32::from_le_bytes([
+                    data[pos + 4],
+                    data[pos + 5],
+                    data[pos + 6],
+                    data[pos + 7],
+                ]) as usize);
+            } else if si == *b"BC" && slen == 2 {
+                // Standard BGZF uses BC with 2-byte block size
+                bsize = Some(u16::from_le_bytes([data[pos + 4], data[pos + 5]]) as usize + 1);
+            }
+            pos += 4 + slen;
+        }
+
+        let bsize = bsize.expect("No block size in BGZF header");
+        let isize_expected = u32::from_le_bytes([
+            data[bsize - 4],
+            data[bsize - 3],
+            data[bsize - 2],
+            data[bsize - 1],
+        ]) as usize;
+
+        let deflate_data = &data[header_end..bsize - 8];
+
+        // Test decoding a single BGZF block
+
+        // Test with libdeflate first (reference)
+        let mut lib_out = vec![0u8; isize_expected];
+        let lib_size = libdeflater::Decompressor::new()
+            .deflate_decompress(deflate_data, &mut lib_out)
+            .expect("libdeflate failed");
+        assert_eq!(lib_size, isize_expected, "libdeflate size mismatch");
+
+        // Test with our decoder - exact size
+        let mut our_out = vec![0u8; isize_expected];
+        let our_size =
+            inflate_consume_first(deflate_data, &mut our_out).expect("our decoder failed");
+
+        assert_eq!(our_size, isize_expected, "size mismatch");
+        assert_eq!(
+            &our_out[..our_size],
+            &lib_out[..lib_size],
+            "content mismatch"
+        );
     }
 }

@@ -2889,10 +2889,8 @@ pub fn decompress_bgzf_parallel<W: Write>(
                         std::slice::from_raw_parts_mut(output_ptr.add(out_start), out_size)
                     };
 
-                    // Use libdeflate for now until we fix our decoder
-                    let result = libdeflater::Decompressor::new()
-                        .deflate_decompress(deflate_data, out_slice);
-                    if let Err(e) = result {
+                    // Use our pure Rust consume_first decoder - NO LIBDEFLATE!
+                    if let Err(e) = inflate_into(deflate_data, out_slice) {
                         eprintln!(
                             "Block {} failed: {:?} deflate_len={} out_size={}",
                             idx,

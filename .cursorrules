@@ -4,14 +4,54 @@
 
 **gzippy aims to be the fastest gzip implementation in existence.**
 
+## 🚫 ABSOLUTE RULE: NO LIBDEFLATE IN HOT PATHS
+
+**We are REPLACING libdeflate, not using it.**
+
+libdeflate is our BENCHMARK, not our implementation. NEVER use libdeflate for:
+- Decompression in production paths
+- Per-block inflate in parallel decompression
+- Any hot path where performance matters
+
+libdeflate is ONLY allowed for:
+- Test verification (comparing our output to known-good output)
+- Benchmark comparisons (measuring our speed against theirs)
+
+If you find yourself reaching for libdeflate because "it's faster" or "it works", STOP.
+That's the problem we're solving. Implement the algorithm in pure Rust and make it faster.
+
+**The goal is 130%+ of libdeflate single-threaded throughput using novel algorithms.**
+
+## Key Lessons from libdeflate (Jan 2026)
+
+### Fastloop vs Generic Loop
+
+libdeflate uses TWO decode loops:
+1. **Fastloop**: Runs when there's plenty of input/output buffer margin. Uses `REFILL_BITS_IN_FASTLOOP()` 
+   which doesn't check for end-of-input. Can use unconditional multi-word copy.
+2. **Generic loop**: Runs near buffer boundaries. Uses `REFILL_BITS()` which handles end-of-input
+   gracefully by zeroing bits but marking them filled, and tracks overread count.
+
+**Critical difference**: The generic loop ALWAYS calls `REFILL_BITS()` at the START of each iteration,
+not conditionally. This ensures the bit buffer is always fresh. If you only refill when `bits < 15`,
+you'll read stale zeros when the input is exhausted and misinterpret them as more symbols.
+
+### Copy Match Safety
+
+The fastloop uses unconditional 5-word (40-byte) copies that may write beyond the match length.
+This ONLY works when there's sufficient output buffer margin. The generic loop must use exact-length
+copies to avoid corrupting data that will be backreferenced by subsequent matches.
+
+**Rule**: `copy_match_fast` for fastloop (has margin), `copy_match_safe` for generic loop (no margin).
+
 ## 🚨 CRITICAL: Optimization Roadmap
 
 **READ THIS FIRST**: `docs/OPTIMIZATION_ROADMAP.md` contains the exhaustive list of
 every optimization needed to beat libdeflate. This is the primary reference for
-closing the performance gap. Current status:
-- Simple data: 62% of libdeflate (target: 110%)
-- Complex data: 45% of libdeflate (target: 106%)
-- BGZF parallel: ALREADY BEATS libdeflate
+closing the performance gap. Current status (Jan 2026):
+- Single-thread silesia: 58% of libdeflate (819 MB/s vs 1403 MB/s)
+- BGZF parallel (8 threads): 2076 MB/s (148% of libdeflate single-threaded!)
+- ALL CODE IS NOW PURE RUST - NO LIBDEFLATE IN HOT PATHS
 
 The roadmap has 4 phases with 45 total optimizations. Work through them in order.
 
