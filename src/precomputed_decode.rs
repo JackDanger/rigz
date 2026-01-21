@@ -160,6 +160,122 @@ fn reverse_bits(code: u16, n: u8) -> u16 {
     result
 }
 
+/// Decode fixed Huffman block using precomputed 16-bit lookup table
+/// For literals, decodes 1-2 at once. For matches, falls back to regular tables.
+#[allow(dead_code)]
+pub fn decode_fixed_precomputed(
+    input: &[u8],
+    input_pos: &mut usize,
+    bitbuf: &mut u64,
+    bitsleft: &mut u32,
+    output: &mut [u8],
+    out_pos: &mut usize,
+) -> std::io::Result<()> {
+    let table = get_fixed_precompute();
+    let fixed_tables = crate::libdeflate_decode::get_fixed_tables();
+
+    // Refill helper
+    let refill = |pos: &mut usize, buf: &mut u64, left: &mut u32| {
+        while *left <= 56 && *pos < input.len() {
+            *buf |= (input[*pos] as u64) << *left;
+            *pos += 1;
+            *left += 8;
+        }
+    };
+
+    refill(input_pos, bitbuf, bitsleft);
+
+    loop {
+        // Ensure we have 16 bits for lookup
+        if *bitsleft < 16 {
+            refill(input_pos, bitbuf, bitsleft);
+        }
+
+        let peek = *bitbuf & PRECOMPUTE_MASK;
+        let entry = table[peek as usize];
+
+        match entry.count {
+            2 => {
+                // Double literal - fastest path
+                if *out_pos + 2 > output.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "Output full",
+                    ));
+                }
+                unsafe {
+                    *output.as_mut_ptr().add(*out_pos) = entry.lit1;
+                    *output.as_mut_ptr().add(*out_pos + 1) = entry.lit2;
+                }
+                *out_pos += 2;
+                *bitbuf >>= entry.bits;
+                *bitsleft -= entry.bits as u32;
+            }
+            1 => {
+                // Single literal
+                if *out_pos >= output.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "Output full",
+                    ));
+                }
+                output[*out_pos] = entry.lit1;
+                *out_pos += 1;
+                *bitbuf >>= entry.bits;
+                *bitsleft -= entry.bits as u32;
+            }
+            0 => {
+                // Special case: match or EOB - use regular table decode
+                let saved = *bitbuf;
+                let lit_entry = fixed_tables.0.lookup(saved);
+                let total_bits = lit_entry.codeword_bits() as u32;
+                *bitbuf >>= total_bits as u8;
+                *bitsleft -= total_bits;
+
+                if lit_entry.is_end_of_block() {
+                    return Ok(());
+                }
+
+                // It's a length code - decode length and distance
+                let length = lit_entry.decode_length(saved);
+
+                refill(input_pos, bitbuf, bitsleft);
+
+                let dist_saved = *bitbuf;
+                let dist_entry = fixed_tables.1.lookup(dist_saved);
+                let dist_total_bits = dist_entry.codeword_bits() as u32;
+                *bitbuf >>= dist_total_bits as u8;
+                *bitsleft -= dist_total_bits;
+
+                let distance = dist_entry.decode_distance(dist_saved);
+
+                if distance == 0 || distance as usize > *out_pos {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid distance",
+                    ));
+                }
+
+                // Copy match
+                let dist = distance as usize;
+                let len = length as usize;
+                if *out_pos + len > output.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "Output full",
+                    ));
+                }
+
+                for i in 0..len {
+                    output[*out_pos + i] = output[*out_pos - dist + i];
+                }
+                *out_pos += len;
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
