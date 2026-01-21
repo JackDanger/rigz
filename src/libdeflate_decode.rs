@@ -187,7 +187,7 @@ impl<'a> LibdeflateBits<'a> {
 /// - distance>=8: word-at-a-time copy with overlapping writes
 /// - distance 2-7: pattern expansion
 #[inline(always)]
-fn copy_match(output: &mut [u8], out_pos: usize, distance: u32, length: u32) -> usize {
+pub fn copy_match(output: &mut [u8], out_pos: usize, distance: u32, length: u32) -> usize {
     let dist = distance as usize;
     let len = length as usize;
 

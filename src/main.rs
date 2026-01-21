@@ -45,6 +45,7 @@ mod simd_copy;
 mod simd_huffman;
 mod simd_inflate;
 mod simple_optimizations;
+mod speculative_batch;
 mod thread_pool;
 mod turbo_inflate;
 mod two_level_table;
