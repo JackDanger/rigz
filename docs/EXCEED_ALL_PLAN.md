@@ -114,10 +114,23 @@
 ### Key Finding
 
 **Simple micro-optimizations REGRESS performance.** The current code is already well-tuned.
-The remaining 30% gap requires novel approaches:
-- Compiler-level optimizations (target-cpu=native)
-- JIT code generation for specific Huffman tables
-- SIMD parallel decoding (multiple streams)
+
+Tested optimizations that made things WORSE:
+| Optimization | Expected | Actual | Notes |
+|--------------|----------|--------|-------|
+| `#[cold]` on error paths | +5% | **-4%** | Added function call overhead |
+| Table-free fixed Huffman | +20% | **-325%** | Bit reversal kills performance |
+| Unconditional refill | +5% | **-12%** | Conditional was better |
+
+What this tells us:
+1. **LLVM is already optimizing our code well** - manual "improvements" interfere
+2. **L1/L2 cache is critical** - table lookups beat computation
+3. **Branch prediction is working** - conditional code isn't the bottleneck
+
+The remaining 30% gap requires **novel approaches** that change the algorithmic structure:
+- Precomputed multi-symbol decode (16-bit lookup → 2 symbols)
+- SIMD parallel decode (multiple streams in lockstep)
+- JIT code generation (no table lookups at all)
 
 ---
 
