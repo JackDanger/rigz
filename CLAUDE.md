@@ -20,6 +20,7 @@ Every change must be benchmarked. Every optimization must be measured. Speed is 
 
 ## Current Performance Status (Jan 2026)
 
+### ARM (Apple M3) - Primary Development Platform
 ```
 Dataset          Our MB/s    libdeflate MB/s    Ratio
 SILESIA          1400        1400               ~99%    ✓ AT PARITY
@@ -27,8 +28,24 @@ SOFTWARE         21500       20200              ~106%   ✓ EXCEEDS
 LOGS             9100        8000               ~114%   ✓ EXCEEDS
 
 Decoder: consume_first_decode.rs → decode_huffman_libdeflate_style
-Status: PARITY ACHIEVED!
+Status: PARITY ACHIEVED on ARM!
 ```
+
+### x86 (Intel i7-13700T) - Secondary Platform
+```
+Dataset          Our MB/s    libdeflate MB/s    Ratio      Notes
+SILESIA          580-620     620-680            ~90-98%    High variance
+SOFTWARE         1900-2300   1900-2200          100-115%   ✓ Often exceeds
+LOGS             1500-2000   1700-2300          ~90-95%    High variance
+
+Status: Near parity, high variance due to 35W TDP thermal throttling
+```
+
+**x86 Observations:**
+- BMI2 `bzhi` is used (verified in assembly)
+- High measurement variance (~10-20%) due to thermal throttling
+- 8-literal batching works well; 2-3 literal batching hurts SOFTWARE
+- 5-word match copy unrolling hurts cache performance
 
 ### Key Optimizations That Worked
 
@@ -60,6 +77,8 @@ Status: PARITY ACHIEVED!
 | `bitsleft -= entry` (full) | +5% | **BROKE** | Refill shift corrupted by high bytes |
 | copy_match 5-word unroll | +10% | **-15%** | Overwrites data used by later matches |
 | Combined match lookup | +20% | **-10%** | Extra table lookups canceled gains |
+| x86 2-3 literal batching | +5% | **-20%** | Hurts SOFTWARE; libdeflate's advice is x86-specific |
+| x86 5-word loop unroll | +5% | **-10%** | Extra writes hurt cache on short matches |
 
 **KEY LESSON: Micro-optimizations often REGRESS. LLVM already optimizes well.**
 
