@@ -611,17 +611,32 @@ fn decode_huffman_libdeflate_style(
     let mut bitsleft = bits.bitsleft;
     let mut in_pos = bits.pos;
     let in_data = bits.data;
+    let in_ptr = in_data.as_ptr();
 
-    // Inline branchless refill matching libdeflate exactly
-    macro_rules! refill_branchless {
+    // Calculate fastloop input end - need margin for branchless refill
+    // We use 32 bytes margin to account for multiple refills per iteration
+    // (up to 3 refills in 8-literal path, each reading up to 8 bytes)
+    let in_fastloop_end = in_data.len().saturating_sub(32);
+
+    // Truly branchless refill for fastloop - ONLY use when in_pos < in_fastloop_end
+    macro_rules! refill_branchless_fast {
         () => {
-            if in_pos + 8 <= in_data.len() {
-                let word = unsafe { (in_data.as_ptr().add(in_pos) as *const u64).read_unaligned() };
+            unsafe {
+                let word = (in_ptr.add(in_pos) as *const u64).read_unaligned();
                 let word = u64::from_le(word);
                 bitbuf |= word << (bitsleft as u8);
                 in_pos += 7;
                 in_pos -= ((bitsleft >> 3) & 0x7) as usize;
                 bitsleft |= 56; // MAX_BITSLEFT & !7
+            }
+        };
+    }
+
+    // Safe refill with bounds checking - for generic loop
+    macro_rules! refill_branchless {
+        () => {
+            if in_pos + 8 <= in_data.len() {
+                refill_branchless_fast!();
             } else {
                 // Slow path for end of input
                 while (bitsleft as u8) <= 56 && in_pos < in_data.len() {
@@ -644,8 +659,8 @@ fn decode_huffman_libdeflate_style(
     refill_branchless!();
     let mut entry = lookup!();
 
-    // FASTLOOP
-    while out_pos + FASTLOOP_MARGIN <= out_end {
+    // FASTLOOP - check BOTH input and output bounds to enable truly branchless refill
+    while in_pos < in_fastloop_end && out_pos + FASTLOOP_MARGIN <= out_end {
         // Save bitbuf for extra bits extraction
         let saved_bitbuf = bitbuf;
 
@@ -681,7 +696,7 @@ fn decode_huffman_libdeflate_style(
                         let lit4 = (entry >> 16) as u8;
                         entry = lookup!();
                         // Always refill before 5th literal - we need bits for potential length/distance
-                        refill_branchless!();
+                        refill_branchless_fast!();
 
                         if (entry as i32) < 0 {
                             // 5th literal
@@ -704,7 +719,7 @@ fn decode_huffman_libdeflate_style(
                                     bitsleft = bitsleft.wrapping_sub(entry);
                                     let lit7 = (entry >> 16) as u8;
                                     entry = lookup!();
-                                    refill_branchless!();
+                                    refill_branchless_fast!();
 
                                     if (entry as i32) < 0 {
                                         // 8th literal - write all 8 at once
@@ -756,7 +771,7 @@ fn decode_huffman_libdeflate_style(
                                     (out_ptr.add(out_pos) as *mut u64).write_unaligned(packed);
                                 }
                                 out_pos += 6;
-                                refill_branchless!();
+                                refill_branchless_fast!();
                                 continue;
                             }
 
@@ -770,7 +785,7 @@ fn decode_huffman_libdeflate_style(
                                 (out_ptr.add(out_pos) as *mut u64).write_unaligned(packed);
                             }
                             out_pos += 5;
-                            refill_branchless!();
+                            refill_branchless_fast!();
                             continue;
                         }
 
@@ -794,7 +809,7 @@ fn decode_huffman_libdeflate_style(
                     out_pos += 3;
                     // Conditional refill - only if we need more bits
                     if (bitsleft as u8) < 32 {
-                        refill_branchless!();
+                        refill_branchless_fast!();
                     }
                     continue;
                 }
@@ -807,7 +822,7 @@ fn decode_huffman_libdeflate_style(
                 out_pos += 2;
                 // Conditional refill - only if we need more bits
                 if (bitsleft as u8) < 32 {
-                    refill_branchless!();
+                    refill_branchless_fast!();
                 }
                 continue;
             }
@@ -819,7 +834,7 @@ fn decode_huffman_libdeflate_style(
             out_pos += 1;
             // Conditional refill - only if we need more bits
             if (bitsleft as u8) < 32 {
-                refill_branchless!();
+                refill_branchless_fast!();
             }
             continue;
         }
@@ -849,7 +864,7 @@ fn decode_huffman_libdeflate_style(
                 // Literal from subtable
                 let lit = ((entry >> 16) & 0xFF) as u8;
                 entry = lookup!();
-                refill_branchless!();
+                refill_branchless_fast!();
                 unsafe {
                     *out_ptr.add(out_pos) = lit;
                 }
@@ -869,7 +884,7 @@ fn decode_huffman_libdeflate_style(
                 + (extract_bits(saved_sub, (entry as u8) as u32) >> ((entry >> 8) as u8)) as u32;
 
             // Decode distance
-            refill_branchless!();
+            refill_branchless_fast!();
             let mut dist_entry = dist.lookup(bitbuf);
 
             if dist_entry.is_subtable_ptr() {
@@ -895,7 +910,7 @@ fn decode_huffman_libdeflate_style(
 
             // Preload next entry before copy
             entry = lookup!();
-            refill_branchless!();
+            refill_branchless_fast!();
 
             // Fast copy
             out_pos = copy_match_fast(output, out_pos, distance, length);
@@ -912,7 +927,7 @@ fn decode_huffman_libdeflate_style(
 
         // Conditional refill after length computation
         if (bitsleft as u8) < 32 {
-            refill_branchless!();
+            refill_branchless_fast!();
         }
 
         if dist_entry.is_subtable_ptr() {
@@ -940,7 +955,7 @@ fn decode_huffman_libdeflate_style(
 
         // Preload next entry BEFORE copy (hide latency)
         entry = lookup!();
-        refill_branchless!();
+        refill_branchless_fast!();
 
         // Fast copy
         out_pos = copy_match_fast(output, out_pos, distance, length);
