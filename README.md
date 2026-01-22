@@ -70,4 +70,4 @@ We study their code, learn from their optimizations, and try to combine the best
 
 ## About
 
-Made by [Jack Danger](https://github.com/jackdanger) together with Claude. The human provided direction and judgment; the AI contributed implementation and iteration.
+Made by [Jack Danger](https://github.com/jackdanger) as a [centaur](https://doctorow.medium.com/https-pluralistic-net-2025-12-05-pop-that-bubble-u-washington-8b6b75abc28e) on a mix of current models and tools.
