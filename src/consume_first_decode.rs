@@ -1921,77 +1921,50 @@ fn decode_with_specialized_tables(
     refill!();
 
     // FASTLOOP with specialized flat tables
+    // Key optimizations from libdeflate:
+    // 1. Single-bit literal check (LITERAL and EOB flags are mutually exclusive)
+    // 2. Limit to 2 extra fast literals (3 hurts branch prediction)
+    // 3. Preload next entry BEFORE writing current literal
     while out_pos + FASTLOOP_MARGIN <= out_end {
         // Decode litlen using flat 11-bit table (no subtables!)
-        let entry = spec.litlen[(bitbuf & 0x7FF) as usize];
+        let mut entry = spec.litlen[(bitbuf & 0x7FF) as usize];
         let bits_used = entry.total_bits() as u32;
         bitbuf >>= bits_used;
         bitsleft = bitsleft.wrapping_sub(bits_used);
 
-        // CRITICAL: Check EOB BEFORE literal - EOB's symbol 0xFFFF has the literal flag set!
-        if entry.is_eob() {
-            bits.bitbuf = bitbuf;
-            bits.bitsleft = bitsleft;
-            bits.pos = in_pos;
-            return Ok(out_pos);
-        }
-
+        // Check literal FIRST (most common case) - single bit check!
+        // LITERAL and EOB flags are now mutually exclusive.
         if entry.is_literal() {
-            // LITERAL - fast path
             let lit1 = entry.literal_value();
+            // PRELOAD next entry BEFORE writing (hides memory latency)
+            entry = spec.litlen[(bitbuf & 0x7FF) as usize];
             unsafe {
                 *out_ptr.add(out_pos) = lit1;
             }
             out_pos += 1;
 
-            // Try more literals - must also check for EOB!
-            let entry2 = spec.litlen[(bitbuf & 0x7FF) as usize];
-            if entry2.is_literal() && !entry2.is_eob() {
-                let bits2 = entry2.total_bits() as u32;
+            // 1st extra fast literal (single bit check, no EOB check needed!)
+            if entry.is_literal() {
+                let bits2 = entry.total_bits() as u32;
                 bitbuf >>= bits2;
                 bitsleft = bitsleft.wrapping_sub(bits2);
+                let lit2 = entry.literal_value();
+                // PRELOAD before write
+                entry = spec.litlen[(bitbuf & 0x7FF) as usize];
                 unsafe {
-                    *out_ptr.add(out_pos) = entry2.literal_value();
+                    *out_ptr.add(out_pos) = lit2;
                 }
                 out_pos += 1;
 
-                let entry3 = spec.litlen[(bitbuf & 0x7FF) as usize];
-                if entry3.is_literal() && !entry3.is_eob() {
-                    let bits3 = entry3.total_bits() as u32;
+                // 2nd extra fast literal (libdeflate says 3 hurts branch prediction)
+                if entry.is_literal() {
+                    let bits3 = entry.total_bits() as u32;
                     bitbuf >>= bits3;
                     bitsleft = bitsleft.wrapping_sub(bits3);
                     unsafe {
-                        *out_ptr.add(out_pos) = entry3.literal_value();
+                        *out_ptr.add(out_pos) = entry.literal_value();
                     }
                     out_pos += 1;
-
-                    // Try 4th literal
-                    let entry4 = spec.litlen[(bitbuf & 0x7FF) as usize];
-                    if entry4.is_literal() && !entry4.is_eob() {
-                        let bits4 = entry4.total_bits() as u32;
-                        bitbuf >>= bits4;
-                        bitsleft = bitsleft.wrapping_sub(bits4);
-                        unsafe {
-                            *out_ptr.add(out_pos) = entry4.literal_value();
-                        }
-                        out_pos += 1;
-
-                        // Try 5th literal (then refill)
-                        let entry5 = spec.litlen[(bitbuf & 0x7FF) as usize];
-                        if entry5.is_literal() && !entry5.is_eob() {
-                            let bits5 = entry5.total_bits() as u32;
-                            bitbuf >>= bits5;
-                            bitsleft = bitsleft.wrapping_sub(bits5);
-                            unsafe {
-                                *out_ptr.add(out_pos) = entry5.literal_value();
-                            }
-                            out_pos += 1;
-                            refill!();
-                            continue;
-                        }
-                        refill!();
-                        continue;
-                    }
                     refill!();
                     continue;
                 }
@@ -2000,6 +1973,14 @@ fn decode_with_specialized_tables(
             }
             refill!();
             continue;
+        }
+
+        // Check EOB (single bit check - mutually exclusive with literal)
+        if entry.is_eob() {
+            bits.bitbuf = bitbuf;
+            bits.bitsleft = bitsleft;
+            bits.pos = in_pos;
+            return Ok(out_pos);
         }
 
         // LENGTH - decode with extra bits

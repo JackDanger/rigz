@@ -41,6 +41,15 @@ use std::io::{Error, ErrorKind, Result};
 #[derive(Clone, Copy)]
 pub struct SpecEntry(u32);
 
+/// Entry format (redesigned for single-bit checks):
+/// - Bit 31: LITERAL flag (mutually exclusive with EOB)
+/// - Bit 30: EOB flag (mutually exclusive with LITERAL)
+/// - Bits 16-29: symbol/value (14 bits, enough for literals 0-255 and lengths 3-258)
+/// - Bits 8-15: extra bits count
+/// - Bits 0-7: total bits consumed
+const LITERAL_FLAG: u32 = 0x8000_0000;
+const EOB_FLAG: u32 = 0x4000_0000;
+
 impl SpecEntry {
     #[inline(always)]
     pub const fn new(symbol: u16, extra_bits: u8, total_bits: u8) -> Self {
@@ -49,34 +58,37 @@ impl SpecEntry {
 
     #[inline(always)]
     pub const fn literal(value: u8, bits: u8) -> Self {
-        // Mark as literal with high bit of symbol
-        Self::new(0x8000 | (value as u16), 0, bits)
+        // Set LITERAL flag (bit 31), value in bits 16-23
+        Self(LITERAL_FLAG | ((value as u32) << 16) | (bits as u32))
     }
 
     #[inline(always)]
     pub const fn length(base: u16, extra: u8, bits: u8) -> Self {
-        Self::new(base, extra, bits)
+        // No flags set, just base/extra/bits
+        Self(((base as u32) << 16) | ((extra as u32) << 8) | (bits as u32))
     }
 
     #[inline(always)]
     pub const fn end_of_block(bits: u8) -> Self {
-        // Special marker: symbol = 0xFFFF
-        Self::new(0xFFFF, 0, bits)
+        // Set EOB flag (bit 30), no symbol needed
+        Self(EOB_FLAG | (bits as u32))
     }
 
     #[inline(always)]
     pub const fn symbol(self) -> u16 {
-        (self.0 >> 16) as u16
+        ((self.0 >> 16) & 0x3FFF) as u16 // Mask off flag bits
     }
 
     #[inline(always)]
     pub const fn is_literal(self) -> bool {
-        (self.0 & 0x8000_0000) != 0
+        // Single AND instruction - LITERAL flag is bit 31
+        (self.0 & LITERAL_FLAG) != 0
     }
 
     #[inline(always)]
     pub const fn is_eob(self) -> bool {
-        self.symbol() == 0xFFFF
+        // Single AND instruction - EOB flag is bit 30
+        (self.0 & EOB_FLAG) != 0
     }
 
     #[inline(always)]
