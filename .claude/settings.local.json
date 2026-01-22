@@ -30,7 +30,8 @@
       "Bash(do RUSTFLAGS=\"-C target-cpu=native\" cargo test --release bench_cf_silesia -- --nocapture)",
       "Bash(for i in 1 2 3 4 5 6 7 8)",
       "Bash(for i in 1 2 3 4 5 6 7 8 9 10)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(cargo check:*)"
     ]
   }
 }

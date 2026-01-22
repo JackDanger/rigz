@@ -151,6 +151,7 @@ impl MultiEntry {
 }
 
 /// Multi-symbol lookup table
+#[derive(Clone)]
 pub struct MultiSymbolLUT {
     /// Primary table (2048 entries for 11 bits)
     pub table: Vec<MultiEntry>,

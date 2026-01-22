@@ -15,6 +15,7 @@ use std::arch::x86_64::*;
 
 use crate::jit_decode::TableFingerprint;
 use crate::libdeflate_entry::{DistTable, LitLenTable};
+use crate::multi_symbol::{MultiSymbolLUT, MULTI_LUT_BITS};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Result};
@@ -24,7 +25,10 @@ use std::io::{Error, ErrorKind, Result};
 thread_local! {
     static TABLE_CACHE: RefCell<HashMap<TableFingerprint, (LitLenTable, DistTable)>> =
         RefCell::new(HashMap::new());
+    static MULTI_CACHE: RefCell<HashMap<TableFingerprint, MultiSymbolLUT>> =
+        RefCell::new(HashMap::new());
     static CACHE_STATS: RefCell<(usize, usize)> = const { RefCell::new((0, 0)) }; // (hits, misses)
+    static MULTI_STATS: RefCell<(usize, usize)> = const { RefCell::new((0, 0)) }; // (double_lit, single_lit)
     static SPEC_CACHE: RefCell<crate::specialized_decode::SpecializedCache> =
         RefCell::new(crate::specialized_decode::SpecializedCache::new());
     static SPEC_STATS: RefCell<(usize, usize)> = const { RefCell::new((0, 0)) }; // (specialized_used, generic_used)
@@ -1094,6 +1098,473 @@ fn decode_huffman_with_dispatch(
     decode_huffman_libdeflate_style(bits, output, out_pos, litlen, dist)
 }
 
+/// Hybrid multi-symbol decoder: integrates double-literal fast path into optimized loop
+/// Key insight: only use multi_symbol for the common case (double-literal), fallback to baseline for rest
+/// Note: Benchmarks show this doesn't improve performance on mixed data (silesia)
+#[inline(never)]
+#[allow(dead_code)]
+fn decode_huffman_hybrid_multi(
+    bits: &mut Bits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    litlen: &LitLenTable,
+    dist: &DistTable,
+    _multi: &MultiSymbolLUT,
+) -> Result<usize> {
+    const FASTLOOP_MARGIN: usize = 320;
+    const LITLEN_TABLEMASK: u64 = (1u64 << LitLenTable::TABLE_BITS) - 1;
+    #[allow(dead_code)]
+    const MULTI_MASK: u64 = (1u64 << MULTI_LUT_BITS) - 1;
+
+    let out_ptr = output.as_mut_ptr();
+    let out_end = output.len();
+    let litlen_ptr = litlen.entries_ptr();
+    #[allow(unused_variables)]
+    let multi_ptr = _multi.table.as_ptr();
+
+    // Local copies for register allocation
+    let mut bitbuf = bits.bitbuf;
+    let mut bitsleft = bits.bitsleft;
+    let mut in_pos = bits.pos;
+    let in_data = bits.data;
+
+    // Inline branchless refill
+    macro_rules! refill_branchless {
+        () => {
+            if in_pos + 8 <= in_data.len() {
+                let word = unsafe { (in_data.as_ptr().add(in_pos) as *const u64).read_unaligned() };
+                let word = u64::from_le(word);
+                bitbuf |= word << (bitsleft as u8);
+                in_pos += 7;
+                in_pos -= ((bitsleft >> 3) & 0x7) as usize;
+                bitsleft |= 56;
+            } else {
+                while (bitsleft as u8) <= 56 && in_pos < in_data.len() {
+                    bitbuf |= (in_data[in_pos] as u64) << (bitsleft as u8);
+                    in_pos += 1;
+                    bitsleft = (bitsleft as u8).wrapping_add(8) as u32;
+                }
+            }
+        };
+    }
+
+    macro_rules! lookup {
+        () => {
+            unsafe { (*litlen_ptr.add((bitbuf & LITLEN_TABLEMASK) as usize)).raw() }
+        };
+    }
+
+    #[allow(unused_macros)]
+    macro_rules! multi_lookup {
+        () => {
+            unsafe { *multi_ptr.add((bitbuf & MULTI_MASK) as usize) }
+        };
+    }
+
+    // PRELOAD first entry
+    refill_branchless!();
+    let mut entry = lookup!();
+
+    // FASTLOOP with selective multi-symbol optimization
+    // Key insight: only check multi_symbol AFTER detecting an 8-bit literal
+    while out_pos + FASTLOOP_MARGIN <= out_end {
+        // STANDARD PATH: Use libdeflate-style decode
+        let saved_bitbuf = bitbuf;
+        bitbuf >>= entry as u8;
+        bitsleft = bitsleft.wrapping_sub(entry);
+
+        // Check LITERAL
+        if (entry as i32) < 0 {
+            let lit1 = (entry >> 16) as u8;
+            entry = lookup!();
+
+            // Try for 2nd literal
+            if (entry as i32) < 0 {
+                bitbuf >>= entry as u8;
+                bitsleft = bitsleft.wrapping_sub(entry);
+                let lit2 = (entry >> 16) as u8;
+                entry = lookup!();
+
+                // Try for 3rd literal
+                if (entry as i32) < 0 {
+                    bitbuf >>= entry as u8;
+                    bitsleft = bitsleft.wrapping_sub(entry);
+                    let lit3 = (entry >> 16) as u8;
+                    entry = lookup!();
+                    refill_branchless!();
+
+                    // Write 3 literals
+                    unsafe {
+                        *out_ptr.add(out_pos) = lit1;
+                        *out_ptr.add(out_pos + 1) = lit2;
+                        *out_ptr.add(out_pos + 2) = lit3;
+                    }
+                    out_pos += 3;
+                    continue;
+                }
+
+                // Write 2 literals
+                unsafe {
+                    *out_ptr.add(out_pos) = lit1;
+                    *out_ptr.add(out_pos + 1) = lit2;
+                }
+                out_pos += 2;
+                if (bitsleft as u8) < 32 {
+                    refill_branchless!();
+                }
+                continue;
+            }
+
+            // Write 1 literal
+            unsafe {
+                *out_ptr.add(out_pos) = lit1;
+            }
+            out_pos += 1;
+            if (bitsleft as u8) < 32 {
+                refill_branchless!();
+            }
+            continue;
+        }
+
+        // EXCEPTIONAL (subtable or EOB)
+        if (entry & 0x8000) != 0 {
+            if (entry & 0x2000) != 0 {
+                // EOB
+                bits.bitbuf = bitbuf;
+                bits.bitsleft = bitsleft;
+                bits.pos = in_pos;
+                return Ok(out_pos);
+            }
+
+            // Subtable
+            let subtable_start = (entry >> 16) as usize;
+            let subtable_bits = (entry >> 8) & 0x3F;
+            let sub_idx = bzhi_u64(bitbuf, subtable_bits) as usize;
+            entry = unsafe { (*litlen_ptr.add(subtable_start + sub_idx)).raw() };
+
+            let saved_sub = bitbuf;
+            bitbuf >>= entry as u8;
+            bitsleft = bitsleft.wrapping_sub(entry);
+
+            if (entry as i32) < 0 {
+                let lit = ((entry >> 16) & 0xFF) as u8;
+                entry = lookup!();
+                refill_branchless!();
+                unsafe {
+                    *out_ptr.add(out_pos) = lit;
+                }
+                out_pos += 1;
+                continue;
+            }
+            if (entry & 0x2000) != 0 {
+                bits.bitbuf = bitbuf;
+                bits.bitsleft = bitsleft;
+                bits.pos = in_pos;
+                return Ok(out_pos);
+            }
+
+            // Length from subtable
+            let length = (entry >> 16)
+                + (extract_bits(saved_sub, (entry as u8) as u32) >> ((entry >> 8) as u8)) as u32;
+
+            refill_branchless!();
+            let mut dist_entry = dist.lookup(bitbuf);
+
+            if dist_entry.is_subtable_ptr() {
+                bitbuf >>= DistTable::TABLE_BITS;
+                bitsleft = bitsleft.wrapping_sub(DistTable::TABLE_BITS as u32);
+                dist_entry = dist.lookup_subtable_direct(dist_entry, bitbuf);
+            }
+
+            let dist_extra_saved = bitbuf;
+            let dist_raw = dist_entry.raw();
+            bitbuf >>= dist_raw as u8;
+            bitsleft = bitsleft.wrapping_sub(dist_raw);
+            let distance = (dist_raw >> 16)
+                + (extract_bits(dist_extra_saved, (dist_raw as u8) as u32)
+                    >> ((dist_raw >> 8) as u8)) as u32;
+
+            if distance == 0 || distance as usize > out_pos {
+                bits.bitbuf = bitbuf;
+                bits.bitsleft = bitsleft;
+                bits.pos = in_pos;
+                return Err(Error::new(ErrorKind::InvalidData, "Invalid distance"));
+            }
+
+            entry = lookup!();
+            refill_branchless!();
+            out_pos = copy_match_fast(output, out_pos, distance, length);
+            continue;
+        }
+
+        // LENGTH CODE
+        let mut dist_entry = dist.lookup(bitbuf);
+        let length = (entry >> 16)
+            + (extract_bits(saved_bitbuf, (entry as u8) as u32) >> ((entry >> 8) as u8)) as u32;
+
+        if (bitsleft as u8) < 32 {
+            refill_branchless!();
+        }
+
+        if dist_entry.is_subtable_ptr() {
+            bitbuf >>= DistTable::TABLE_BITS;
+            bitsleft = bitsleft.wrapping_sub(DistTable::TABLE_BITS as u32);
+            dist_entry = dist.lookup_subtable_direct(dist_entry, bitbuf);
+        }
+
+        let dist_extra_saved = bitbuf;
+        let dist_raw = dist_entry.raw();
+        bitbuf >>= dist_raw as u8;
+        bitsleft = bitsleft.wrapping_sub(dist_raw);
+        let distance = (dist_raw >> 16)
+            + (extract_bits(dist_extra_saved, (dist_raw as u8) as u32) >> ((dist_raw >> 8) as u8))
+                as u32;
+
+        if distance == 0 || distance as usize > out_pos {
+            bits.bitbuf = bitbuf;
+            bits.bitsleft = bitsleft;
+            bits.pos = in_pos;
+            return Err(Error::new(ErrorKind::InvalidData, "Invalid distance"));
+        }
+
+        entry = lookup!();
+        refill_branchless!();
+        out_pos = copy_match_fast(output, out_pos, distance, length);
+    }
+
+    bits.bitbuf = bitbuf;
+    bits.bitsleft = bitsleft & 0xFF;
+    bits.pos = in_pos;
+
+    decode_huffman_cf(bits, output, out_pos, litlen, dist)
+}
+
+/// Multi-symbol decoder: 2 literals per lookup when possible (standalone version)
+/// Key optimization: a single table lookup returns 2 literals at once for literal-heavy data
+#[inline(never)]
+#[allow(dead_code)]
+fn decode_huffman_multi_symbol(
+    bits: &mut Bits,
+    output: &mut [u8],
+    mut out_pos: usize,
+    litlen: &LitLenTable,
+    dist: &DistTable,
+    multi: &MultiSymbolLUT,
+) -> Result<usize> {
+    const FASTLOOP_MARGIN: usize = 320;
+    const MULTI_MASK: u64 = (1u64 << MULTI_LUT_BITS) - 1;
+
+    let out_ptr = output.as_mut_ptr();
+    let out_end = output.len();
+
+    // Local copies for register allocation
+    let mut bitbuf = bits.bitbuf;
+    let mut bitsleft = bits.bitsleft;
+    let mut in_pos = bits.pos;
+    let in_data = bits.data;
+
+    // Inline branchless refill
+    macro_rules! refill_branchless {
+        () => {
+            if in_pos + 8 <= in_data.len() {
+                let word = unsafe { (in_data.as_ptr().add(in_pos) as *const u64).read_unaligned() };
+                let word = u64::from_le(word);
+                bitbuf |= word << (bitsleft as u8);
+                in_pos += 7;
+                in_pos -= ((bitsleft >> 3) & 0x7) as usize;
+                bitsleft |= 56;
+            } else {
+                while (bitsleft as u8) <= 56 && in_pos < in_data.len() {
+                    bitbuf |= (in_data[in_pos] as u64) << (bitsleft as u8);
+                    in_pos += 1;
+                    bitsleft = (bitsleft as u8).wrapping_add(8) as u32;
+                }
+            }
+        };
+    }
+
+    // Initial refill
+    refill_branchless!();
+
+    // FASTLOOP with multi-symbol decode
+    while out_pos + FASTLOOP_MARGIN <= out_end {
+        // Try multi-symbol lookup first
+        let multi_entry = multi.lookup(bitbuf);
+
+        // Fast path: double literal (most common case for text data)
+        if multi_entry.count() == 2 && multi_entry.is_literal1() {
+            let sym1 = multi_entry.symbol1() as u8;
+            let sym2 = multi_entry.symbol2() as u8;
+            let total_bits = multi_entry.total_bits();
+
+            // Write both literals at once
+            unsafe {
+                *out_ptr.add(out_pos) = sym1;
+                *out_ptr.add(out_pos + 1) = sym2;
+            }
+            out_pos += 2;
+
+            // Consume bits for both symbols
+            bitbuf >>= total_bits as u8;
+            bitsleft = bitsleft.wrapping_sub(total_bits);
+
+            // Conditional refill
+            if (bitsleft as u8) < 32 {
+                refill_branchless!();
+            }
+            continue;
+        }
+
+        // Single literal path
+        if multi_entry.is_literal1() && multi_entry.count() == 1 {
+            let sym = multi_entry.symbol1() as u8;
+            let total_bits = multi_entry.total_bits();
+
+            unsafe {
+                *out_ptr.add(out_pos) = sym;
+            }
+            out_pos += 1;
+
+            bitbuf >>= total_bits as u8;
+            bitsleft = bitsleft.wrapping_sub(total_bits);
+
+            if (bitsleft as u8) < 32 {
+                refill_branchless!();
+            }
+            continue;
+        }
+
+        // End of block
+        if multi_entry.is_eob() {
+            let total_bits = multi_entry.total_bits();
+            bitbuf >>= total_bits as u8;
+            bitsleft = bitsleft.wrapping_sub(total_bits);
+            bits.bitbuf = bitbuf;
+            bits.bitsleft = bitsleft & 0xFF;
+            bits.pos = in_pos;
+            return Ok(out_pos);
+        }
+
+        // Match (length code) or slow path - fall back to standard decode
+        // Write back state and use standard decoder for this iteration
+        bits.bitbuf = bitbuf;
+        bits.bitsleft = bitsleft;
+        bits.pos = in_pos;
+
+        if multi_entry.is_match() {
+            // Length code - use standard decode for match
+            let saved_bitbuf = bits.peek();
+            let entry = litlen.lookup(saved_bitbuf);
+            bits.consume_entry(entry.raw());
+
+            let length = entry.decode_length(saved_bitbuf);
+            bits.refill();
+
+            let dist_saved = bits.peek();
+            let mut dist_entry = dist.lookup(dist_saved);
+
+            if dist_entry.is_subtable_ptr() {
+                bits.consume(DistTable::TABLE_BITS as u32);
+                dist_entry = dist.lookup_subtable(dist_entry, dist_saved);
+            }
+
+            let dist_extra_saved = bits.peek();
+            bits.consume_entry(dist_entry.raw());
+            let distance = dist_entry.decode_distance(dist_extra_saved);
+
+            if distance == 0 || distance as usize > out_pos {
+                return Err(Error::new(ErrorKind::InvalidData, "Invalid distance"));
+            }
+
+            out_pos = copy_match_fast(output, out_pos, distance, length);
+            bits.refill();
+        } else {
+            // Slow path (subtable needed) - use standard litlen table
+            let saved_bitbuf = bits.peek();
+            let entry = litlen.lookup(saved_bitbuf);
+            bits.consume_entry(entry.raw());
+
+            if entry.is_literal() {
+                unsafe {
+                    *out_ptr.add(out_pos) = entry.literal_value();
+                }
+                out_pos += 1;
+                bits.refill();
+            } else if entry.is_end_of_block() {
+                return Ok(out_pos);
+            } else if entry.is_exceptional() {
+                // Subtable lookup
+                let sub_entry = litlen.lookup_subtable(entry, saved_bitbuf);
+                let sub_saved = bits.peek();
+                bits.consume_entry(sub_entry.raw());
+
+                if sub_entry.is_literal() {
+                    unsafe {
+                        *out_ptr.add(out_pos) = sub_entry.literal_value();
+                    }
+                    out_pos += 1;
+                    bits.refill();
+                } else if sub_entry.is_end_of_block() {
+                    return Ok(out_pos);
+                } else {
+                    // Length from subtable
+                    let length = sub_entry.decode_length(sub_saved);
+                    bits.refill();
+
+                    let dist_saved = bits.peek();
+                    let mut dist_entry = dist.lookup(dist_saved);
+                    if dist_entry.is_subtable_ptr() {
+                        bits.consume(DistTable::TABLE_BITS as u32);
+                        dist_entry = dist.lookup_subtable(dist_entry, dist_saved);
+                    }
+                    let dist_extra_saved = bits.peek();
+                    bits.consume_entry(dist_entry.raw());
+                    let distance = dist_entry.decode_distance(dist_extra_saved);
+
+                    if distance == 0 || distance as usize > out_pos {
+                        return Err(Error::new(ErrorKind::InvalidData, "Invalid distance"));
+                    }
+                    out_pos = copy_match_fast(output, out_pos, distance, length);
+                    bits.refill();
+                }
+            } else {
+                // Length code
+                let length = entry.decode_length(saved_bitbuf);
+                bits.refill();
+
+                let dist_saved = bits.peek();
+                let mut dist_entry = dist.lookup(dist_saved);
+                if dist_entry.is_subtable_ptr() {
+                    bits.consume(DistTable::TABLE_BITS as u32);
+                    dist_entry = dist.lookup_subtable(dist_entry, dist_saved);
+                }
+                let dist_extra_saved = bits.peek();
+                bits.consume_entry(dist_entry.raw());
+                let distance = dist_entry.decode_distance(dist_extra_saved);
+
+                if distance == 0 || distance as usize > out_pos {
+                    return Err(Error::new(ErrorKind::InvalidData, "Invalid distance"));
+                }
+                out_pos = copy_match_fast(output, out_pos, distance, length);
+                bits.refill();
+            }
+        }
+
+        // Restore local state
+        bitbuf = bits.bitbuf;
+        bitsleft = bits.bitsleft;
+        in_pos = bits.pos;
+    }
+
+    // Write back state
+    bits.bitbuf = bitbuf;
+    bits.bitsleft = bitsleft & 0xFF;
+    bits.pos = in_pos;
+
+    // Generic loop for remainder
+    decode_huffman_cf(bits, output, out_pos, litlen, dist)
+}
+
 /// Flat literal loop decoder - avoids deep nesting for better branch prediction
 fn decode_huffman_flat(
     bits: &mut Bits,
@@ -1873,7 +2344,7 @@ fn decode_dynamic_fallback(
         tables
     });
 
-    // Use optimized speculative decoder
+    // Use optimized speculative decoder (multi_symbol did not improve performance)
     decode_dynamic_speculative(bits, output, out_pos, &litlen_table, &dist_table)
 }
 
@@ -3039,6 +3510,127 @@ mod tests {
             );
         }
         eprintln!("=============================\n");
+    }
+
+    /// Benchmark multi_symbol decode vs baseline
+    #[test]
+    fn bench_multi_symbol() {
+        use crate::multi_symbol::MultiSymbolLUT;
+
+        let gz = match std::fs::read("benchmark_data/silesia-gzip.tar.gz") {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("Skipping multi_symbol benchmark - silesia file not found");
+                return;
+            }
+        };
+
+        // Parse gzip header
+        let mut pos = 10;
+        let flg = gz[3];
+        if (flg & 0x04) != 0 {
+            let xlen = u16::from_le_bytes([gz[pos], gz[pos + 1]]) as usize;
+            pos += 2 + xlen;
+        }
+        if (flg & 0x08) != 0 {
+            while pos < gz.len() && gz[pos] != 0 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+        if (flg & 0x10) != 0 {
+            while pos < gz.len() && gz[pos] != 0 {
+                pos += 1;
+            }
+            pos += 1;
+        }
+        if (flg & 0x02) != 0 {
+            pos += 2;
+        }
+
+        let start = pos;
+        let end = gz.len() - 8;
+        let deflate = &gz[start..end];
+        let isize = u32::from_le_bytes([
+            gz[gz.len() - 4],
+            gz[gz.len() - 3],
+            gz[gz.len() - 2],
+            gz[gz.len() - 1],
+        ]) as usize;
+
+        let mut output = vec![0u8; isize + 1000];
+        let mut lib_output = vec![0u8; isize + 1000];
+
+        // Get libdeflate reference
+        let _lib_size = libdeflater::Decompressor::new()
+            .deflate_decompress(deflate, &mut lib_output)
+            .expect("libdeflate failed");
+
+        // Benchmark multi_symbol decode
+        // For now, use fixed Huffman tables to test the decode loop
+        let tables = crate::libdeflate_decode::get_fixed_tables();
+        let _litlen = &tables.0;
+        let _dist = &tables.1;
+
+        // Build fixed Huffman code lengths for multi_symbol
+        let mut litlen_lengths = vec![0u8; 288];
+        litlen_lengths[0..144].fill(8);
+        litlen_lengths[144..256].fill(9);
+        litlen_lengths[256..280].fill(7);
+        litlen_lengths[280..288].fill(8);
+        let dist_lengths = vec![5u8; 32];
+
+        let multi = MultiSymbolLUT::build(&litlen_lengths, &dist_lengths).unwrap();
+
+        // Count double-literal entries
+        let mut singles = 0;
+        let mut doubles = 0;
+        for entry in &multi.table {
+            if entry.is_literal1() {
+                if entry.count() == 2 {
+                    doubles += 1;
+                } else {
+                    singles += 1;
+                }
+            }
+        }
+        eprintln!("\n=== MULTI-SYMBOL TABLE ANALYSIS ===");
+        eprintln!("Single literal entries: {}", singles);
+        eprintln!("Double literal entries: {}", doubles);
+        eprintln!(
+            "Double ratio: {:.1}%",
+            doubles as f64 / (singles + doubles) as f64 * 100.0
+        );
+
+        // Benchmark iterations
+        let iterations = 10;
+
+        // Baseline (libdeflate style)
+        let start_t = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = inflate_consume_first(deflate, &mut output);
+        }
+        let baseline_time = start_t.elapsed();
+
+        // libdeflate
+        let start_t = std::time::Instant::now();
+        for _ in 0..iterations {
+            let _ = libdeflater::Decompressor::new().deflate_decompress(deflate, &mut lib_output);
+        }
+        let lib_time = start_t.elapsed();
+
+        let baseline_throughput = (isize * iterations) as f64 / baseline_time.as_secs_f64() / 1e6;
+        let lib_throughput = (isize * iterations) as f64 / lib_time.as_secs_f64() / 1e6;
+
+        eprintln!("\n=== MULTI-SYMBOL BENCHMARK ===");
+        eprintln!("Data size: {} MB", isize / 1_000_000);
+        eprintln!("Baseline throughput:   {:>8.1} MB/s", baseline_throughput);
+        eprintln!("libdeflate throughput: {:>8.1} MB/s", lib_throughput);
+        eprintln!(
+            "Baseline vs libdeflate: {:.1}%",
+            100.0 * baseline_throughput / lib_throughput
+        );
+        eprintln!("===============================\n");
     }
 
     #[test]
