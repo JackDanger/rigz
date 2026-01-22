@@ -629,7 +629,7 @@ mod tests {
         let size = inflate_ultra(&compressed, &mut output).expect("Decode failed");
 
         assert_eq!(size, original.len());
-        assert_eq!(&output[..size], original.as_slice());
+        assert_slices_eq!(&output[..size], original.as_slice());
     }
 
     #[test]
@@ -648,7 +648,7 @@ mod tests {
         let size = inflate_ultra(&compressed, &mut output).expect("Decode failed");
 
         assert_eq!(size, original.len());
-        assert_eq!(&output[..size], original.as_slice());
+        assert_slices_eq!(&output[..size], original.as_slice());
     }
 
     #[test]

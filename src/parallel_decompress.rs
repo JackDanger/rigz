@@ -464,7 +464,7 @@ mod tests {
         let mut output = Vec::new();
         decompress_parallel(&compressed, &mut output, 4).unwrap();
 
-        assert_eq!(output, original);
+        assert_slices_eq!(output, original);
     }
 
     #[test]
@@ -496,7 +496,7 @@ mod tests {
 
         if result.is_ok() {
             assert_eq!(output.len(), expected.len(), "Size mismatch");
-            assert_eq!(output, expected, "Content mismatch");
+            assert_slices_eq!(output, expected, "Content mismatch");
         }
     }
 
@@ -544,6 +544,7 @@ fn test_benchmark_parallel_vs_sequential() {
     decompress_parallel(&data, &mut output, 8).unwrap();
     let parallel_time = start.elapsed();
     let parallel_speed = expected_size as f64 / parallel_time.as_secs_f64() / 1_000_000.0;
+    assert_slices_eq!(output, output); // Just to verify macro works
 
     // Benchmark libdeflate
     let start = std::time::Instant::now();

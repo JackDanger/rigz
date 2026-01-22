@@ -857,7 +857,7 @@ mod tests {
         let mut output = Vec::new();
         inflate_gzip_fast(&compressed, &mut output).unwrap();
 
-        assert_eq!(&output[..], &original[..]);
+        assert_slices_eq!(&output[..], &original[..]);
     }
 
     #[test]
@@ -871,7 +871,7 @@ mod tests {
         let mut output = Vec::new();
         inflate_gzip_fast(&compressed, &mut output).unwrap();
 
-        assert_eq!(output, original);
+        assert_slices_eq!(output, original);
     }
 
     #[test]
@@ -885,7 +885,7 @@ mod tests {
         let mut output = Vec::new();
         inflate_gzip_fast(&compressed, &mut output).unwrap();
 
-        assert_eq!(output, original);
+        assert_slices_eq!(output, original);
     }
 
     #[test]

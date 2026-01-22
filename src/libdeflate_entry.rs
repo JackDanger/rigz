@@ -674,7 +674,7 @@ fn reverse_bits(code: u32, n: u8) -> u32 {
 }
 
 /// Length base values and extra bits (RFC 1951)
-const LENGTH_TABLE: [(u16, u8); 29] = [
+pub const LENGTH_TABLE: [(u16, u8); 29] = [
     (3, 0),
     (4, 0),
     (5, 0),
@@ -707,7 +707,7 @@ const LENGTH_TABLE: [(u16, u8); 29] = [
 ];
 
 /// Distance base values and extra bits (RFC 1951)
-const DISTANCE_TABLE: [(u16, u8); 30] = [
+pub const DISTANCE_TABLE: [(u16, u8); 30] = [
     (1, 0),
     (2, 0),
     (3, 0),

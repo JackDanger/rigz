@@ -19,6 +19,11 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind, Result};
 
+#[inline(always)]
+fn unlikely(b: bool) -> bool {
+    b
+}
+
 // Thread-local cache for built Huffman tables
 // Avoids rebuilding the same table when fingerprint matches
 thread_local! {
@@ -85,6 +90,16 @@ pub fn get_spec_stats() -> (usize, usize) {
 /// Get block type statistics
 pub fn get_block_stats() -> BlockStats {
     BLOCK_STATS.with(|stats| *stats.borrow())
+}
+
+/// Get TABLE_CACHE size (number of unique fingerprints)
+pub fn get_table_cache_size() -> usize {
+    TABLE_CACHE.with(|cache| cache.borrow().len())
+}
+
+/// Get SPEC_CACHE detailed stats: (decoders, failed, total_uses, max_uses)
+pub fn get_spec_cache_stats() -> (usize, usize, usize, usize) {
+    SPEC_CACHE.with(|cache| cache.borrow().detailed_stats())
 }
 
 /// Reset all statistics (cache, spec, block)
@@ -1873,10 +1888,11 @@ fn decode_dynamic(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<
     // Try specialized decoder first (flat tables, no subtables)
     let use_specialized = SPEC_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
+        // Only use specialized if it doesn't need subtables (very fast)
         cache.get_or_create(litlen_lengths, dist_lengths).is_some()
     });
 
-    if use_specialized {
+    if use_specialized && litlen_lengths.iter().copied().max().unwrap_or(0) <= 11 {
         SPEC_STATS.with(|s| s.borrow_mut().0 += 1);
         // Use specialized flat table decoder
         return SPEC_CACHE.with(|cache| {
@@ -1983,54 +1999,77 @@ fn decode_with_specialized_tables(
     // Initial refill
     refill!();
 
-    // FASTLOOP with specialized flat tables
-    // Key optimizations from libdeflate:
-    // 1. Single-bit literal check (LITERAL and EOB flags are mutually exclusive)
-    // 2. Limit to 2 extra fast literals (3 hurts branch prediction)
-    // 3. Preload next entry BEFORE writing current literal
+    // FASTLOOP with specialized main tables
     while out_pos + FASTLOOP_MARGIN <= out_end {
-        // Decode litlen using flat 11-bit table (no subtables!)
-        let mut entry = spec.litlen[(bitbuf & 0x7FF) as usize];
+        // Decode litlen using flat 11-bit main table
+        let mut entry = unsafe { *spec.litlen.get_unchecked((bitbuf & 0x7FF) as usize) };
+
         let bits_used = entry.total_bits() as u32;
         bitbuf >>= bits_used;
         bitsleft = bitsleft.wrapping_sub(bits_used);
 
-        // Check literal FIRST (most common case) - single bit check!
-        // LITERAL and EOB flags are now mutually exclusive.
+        // Check literal FIRST (most common case)
         if entry.is_literal() {
-            let lit1 = entry.literal_value();
-            // PRELOAD next entry BEFORE writing (hides memory latency)
-            entry = spec.litlen[(bitbuf & 0x7FF) as usize];
-            unsafe {
-                *out_ptr.add(out_pos) = lit1;
+            if entry.is_double() {
+                unsafe {
+                    let ptr = out_ptr.add(out_pos);
+                    ptr.write(entry.lit1());
+                    ptr.add(1).write(entry.lit2());
+                }
+                out_pos += 2;
+            } else {
+                unsafe {
+                    *out_ptr.add(out_pos) = entry.literal_value();
+                }
+                out_pos += 1;
             }
-            out_pos += 1;
 
-            // 1st extra fast literal (single bit check, no EOB check needed!)
+            // PRELOAD next entry BEFORE writing (hides memory latency)
+            entry = unsafe { *spec.litlen.get_unchecked((bitbuf & 0x7FF) as usize) };
+
             if entry.is_literal() {
                 let bits2 = entry.total_bits() as u32;
                 bitbuf >>= bits2;
                 bitsleft = bitsleft.wrapping_sub(bits2);
-                let lit2 = entry.literal_value();
-                // PRELOAD before write
-                entry = spec.litlen[(bitbuf & 0x7FF) as usize];
-                unsafe {
-                    *out_ptr.add(out_pos) = lit2;
-                }
-                out_pos += 1;
 
-                // 2nd extra fast literal (libdeflate says 3 hurts branch prediction)
-                if entry.is_literal() {
-                    let bits3 = entry.total_bits() as u32;
-                    bitbuf >>= bits3;
-                    bitsleft = bitsleft.wrapping_sub(bits3);
+                if entry.is_double() {
+                    unsafe {
+                        let ptr = out_ptr.add(out_pos);
+                        ptr.write(entry.lit1());
+                        ptr.add(1).write(entry.lit2());
+                    }
+                    out_pos += 2;
+                } else {
                     unsafe {
                         *out_ptr.add(out_pos) = entry.literal_value();
                     }
                     out_pos += 1;
-                    refill!();
-                    continue;
                 }
+
+                // Try one more literal batch if we have enough bits (up to 6 total literals)
+                if bitsleft >= 32 {
+                    let next_entry =
+                        unsafe { *spec.litlen.get_unchecked((bitbuf & 0x7FF) as usize) };
+                    if next_entry.is_literal() {
+                        let bits3 = next_entry.total_bits() as u32;
+                        bitbuf >>= bits3;
+                        bitsleft = bitsleft.wrapping_sub(bits3);
+                        if next_entry.is_double() {
+                            unsafe {
+                                let ptr = out_ptr.add(out_pos);
+                                ptr.write(next_entry.lit1());
+                                ptr.add(1).write(next_entry.lit2());
+                            }
+                            out_pos += 2;
+                        } else {
+                            unsafe {
+                                *out_ptr.add(out_pos) = next_entry.literal_value();
+                            }
+                            out_pos += 1;
+                        }
+                    }
+                }
+
                 refill!();
                 continue;
             }
@@ -2038,7 +2077,7 @@ fn decode_with_specialized_tables(
             continue;
         }
 
-        // Check EOB (single bit check - mutually exclusive with literal)
+        // Check EOB
         if entry.is_eob() {
             bits.bitbuf = bitbuf;
             bits.bitsleft = bitsleft;
@@ -2060,8 +2099,14 @@ fn decode_with_specialized_tables(
 
         refill!();
 
-        // DISTANCE - flat 9-bit table
-        let dist_entry = spec.dist[(bitbuf & 0x1FF) as usize];
+        // DISTANCE - flat 11-bit table + subtables
+        let mut dist_entry = spec.dist[(bitbuf & 0x7FF) as usize];
+        if unlikely(dist_entry.is_subtable()) {
+            let offset = dist_entry.subtable_offset() as usize;
+            let sub_bits = dist_entry.subtable_bits();
+            let idx = (bitbuf >> 11) & ((1 << sub_bits) - 1);
+            dist_entry = spec.dist[offset + idx as usize];
+        }
         let dist_bits = dist_entry.total_bits() as u32;
         bitbuf >>= dist_bits;
         bitsleft = bitsleft.wrapping_sub(dist_bits);
@@ -2109,7 +2154,7 @@ fn decode_generic_with_spec(
     loop {
         bits.refill();
 
-        let entry = spec.litlen[(bits.peek() & 0x7FF) as usize];
+        let entry = spec.decode_symbol(bits.peek());
         let bits_used = entry.total_bits() as u32;
         bits.consume(bits_used);
 
@@ -2119,11 +2164,17 @@ fn decode_generic_with_spec(
         }
 
         if entry.is_literal() {
-            if out_pos >= output.len() {
+            if out_pos + 2 > output.len() {
                 return Err(Error::new(ErrorKind::InvalidData, "Output overflow"));
             }
-            output[out_pos] = entry.literal_value();
-            out_pos += 1;
+            if entry.is_double() {
+                output[out_pos] = entry.lit1();
+                output[out_pos + 1] = entry.lit2();
+                out_pos += 2;
+            } else {
+                output[out_pos] = entry.literal_value();
+                out_pos += 1;
+            }
             continue;
         }
 
@@ -2141,7 +2192,7 @@ fn decode_generic_with_spec(
         bits.refill();
 
         // Distance
-        let dist_entry = spec.dist[(bits.peek() & 0x1FF) as usize];
+        let dist_entry = spec.decode_distance(bits.peek());
         let dist_bits = dist_entry.total_bits() as u32;
         bits.consume(dist_bits);
 

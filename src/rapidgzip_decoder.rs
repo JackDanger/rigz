@@ -1084,7 +1084,7 @@ mod tests {
 
         let mut output = Vec::new();
         decompress_rapidgzip(&compressed, &mut output, 1).unwrap();
-        assert_eq!(&output, original);
+        assert_slices_eq!(&output, original);
     }
 
     #[test]
@@ -1096,6 +1096,6 @@ mod tests {
 
         let mut output = Vec::new();
         decompress_rapidgzip(&compressed, &mut output, 4).unwrap();
-        assert_eq!(output, original);
+        assert_slices_eq!(output, original);
     }
 }

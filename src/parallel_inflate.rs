@@ -640,6 +640,6 @@ mod tests {
             output.len()
         );
         assert_eq!(output.len(), expected.len(), "Output size mismatch");
-        assert_eq!(output, expected, "Output content mismatch");
+        assert_slices_eq!(output, expected, "Output content mismatch");
     }
 }

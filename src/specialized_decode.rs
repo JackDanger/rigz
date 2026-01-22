@@ -41,59 +41,97 @@ use std::io::{Error, ErrorKind, Result};
 #[derive(Clone, Copy)]
 pub struct SpecEntry(u32);
 
-/// Entry format (redesigned for single-bit checks):
-/// - Bit 31: LITERAL flag (mutually exclusive with EOB)
-/// - Bit 30: EOB flag (mutually exclusive with LITERAL)
-/// - Bits 16-29: symbol/value (14 bits, enough for literals 0-255 and lengths 3-258)
-/// - Bits 8-15: extra bits count
-/// - Bits 0-7: total bits consumed
-const LITERAL_FLAG: u32 = 0x8000_0000;
-const EOB_FLAG: u32 = 0x4000_0000;
+/// Entry format (redesigned for multi-literal and subtable support):
+/// - Bit 31: LITERAL flag
+/// - Bit 30: EOB flag
+/// - Bit 29: SUBTABLE flag
+/// - Bit 28: DOUBLE_LITERAL flag
+/// - Bits 20-27: lit1 / symbol / subtable offset (low 8 bits)
+/// - Bits 12-19: lit2 / symbol / subtable offset (high 8 bits)
+/// - Bits 5-11: Extra bits count / sub_bits (7 bits)
+/// - Bits 0-4: Total bits consumed (5 bits, 0-31)
+const LITERAL_FLAG: u32 = 1 << 31;
+const EOB_FLAG: u32 = 1 << 30;
+const SUBTABLE_FLAG: u32 = 1 << 29;
+const DOUBLE_FLAG: u32 = 1 << 28;
 
 impl SpecEntry {
     #[inline(always)]
     pub const fn new(symbol: u16, extra_bits: u8, total_bits: u8) -> Self {
-        Self(((symbol as u32) << 16) | ((extra_bits as u32) << 8) | (total_bits as u32))
+        Self(((symbol as u32) << 12) | ((extra_bits as u32) << 5) | (total_bits as u32))
     }
 
     #[inline(always)]
     pub const fn literal(value: u8, bits: u8) -> Self {
-        // Set LITERAL flag (bit 31), value in bits 16-23
-        Self(LITERAL_FLAG | ((value as u32) << 16) | (bits as u32))
+        Self(LITERAL_FLAG | ((value as u32) << 20) | (bits as u32))
+    }
+
+    #[inline(always)]
+    pub const fn double_literal(lit1: u8, lit2: u8, bits: u8) -> Self {
+        Self(
+            LITERAL_FLAG
+                | DOUBLE_FLAG
+                | ((lit1 as u32) << 20)
+                | ((lit2 as u32) << 12)
+                | (bits as u32),
+        )
     }
 
     #[inline(always)]
     pub const fn length(base: u16, extra: u8, bits: u8) -> Self {
-        // No flags set, just base/extra/bits
-        Self(((base as u32) << 16) | ((extra as u32) << 8) | (bits as u32))
+        Self(((base as u32) << 12) | ((extra as u32) << 5) | (bits as u32))
     }
 
     #[inline(always)]
     pub const fn end_of_block(bits: u8) -> Self {
-        // Set EOB flag (bit 30), no symbol needed
         Self(EOB_FLAG | (bits as u32))
     }
 
     #[inline(always)]
-    pub const fn symbol(self) -> u16 {
-        ((self.0 >> 16) & 0x3FFF) as u16 // Mask off flag bits
+    pub const fn subtable_ptr(offset: u16, sub_bits: u8, main_bits: u8) -> Self {
+        Self(
+            SUBTABLE_FLAG | ((offset as u32) << 12) | ((sub_bits as u32) << 5) | (main_bits as u32),
+        )
     }
 
     #[inline(always)]
     pub const fn is_literal(self) -> bool {
-        // Single AND instruction - LITERAL flag is bit 31
         (self.0 & LITERAL_FLAG) != 0
     }
 
     #[inline(always)]
+    pub const fn is_double(self) -> bool {
+        (self.0 & DOUBLE_FLAG) != 0
+    }
+
+    #[inline(always)]
     pub const fn is_eob(self) -> bool {
-        // Single AND instruction - EOB flag is bit 30
         (self.0 & EOB_FLAG) != 0
     }
 
     #[inline(always)]
+    pub const fn is_subtable(self) -> bool {
+        (self.0 & SUBTABLE_FLAG) != 0
+    }
+
+    #[inline(always)]
     pub const fn literal_value(self) -> u8 {
-        (self.symbol() & 0xFF) as u8
+        ((self.0 >> 20) & 0xFF) as u8
+    }
+
+    #[inline(always)]
+    pub const fn lit1(self) -> u8 {
+        self.literal_value()
+    }
+
+    #[inline(always)]
+    pub const fn lit2(self) -> u8 {
+        ((self.0 >> 12) & 0xFF) as u8
+    }
+
+    #[inline(always)]
+    pub const fn symbol(self) -> u16 {
+        ((self.0 >> 12) & 0xFFFF) as u16
     }
 
     #[inline(always)]
@@ -102,25 +140,39 @@ impl SpecEntry {
     }
 
     #[inline(always)]
+    pub const fn subtable_offset(self) -> u16 {
+        self.symbol()
+    }
+
+    #[inline(always)]
     pub const fn extra_bits(self) -> u8 {
-        ((self.0 >> 8) & 0xFF) as u8
+        ((self.0 >> 5) & 0x7F) as u8
+    }
+
+    #[inline(always)]
+    pub const fn subtable_bits(self) -> u8 {
+        self.extra_bits()
     }
 
     #[inline(always)]
     pub const fn total_bits(self) -> u8 {
-        (self.0 & 0xFF) as u8
+        (self.0 & 0x1F) as u8
+    }
+
+    #[inline(always)]
+    pub const fn raw(self) -> u32 {
+        self.0
     }
 }
 
 /// A specialized decoder for a specific Huffman table fingerprint
-/// Uses a flat 2048-entry lookup table (11 bits) with no subtables
+/// Uses an 11-bit main table + subtables for 100% coverage
 pub struct SpecializedDecoder {
     pub fingerprint: TableFingerprint,
-    /// Litlen lookup: 2048 entries (11-bit lookup)
-    /// Each entry is a SpecEntry
-    pub litlen: Box<[SpecEntry; 2048]>,
-    /// Distance lookup: 512 entries (9-bit lookup)
-    pub dist: Box<[SpecEntry; 512]>,
+    /// Litlen table (main + subtables)
+    pub litlen: Box<[SpecEntry]>,
+    /// Distance table (main + subtables)
+    pub dist: Box<[SpecEntry]>,
     /// Number of times this decoder has been used
     pub use_count: usize,
 }
@@ -130,11 +182,9 @@ impl SpecializedDecoder {
     pub fn build(litlen_lens: &[u8], dist_lens: &[u8]) -> Option<Self> {
         let fingerprint = TableFingerprint::combined(litlen_lens, dist_lens);
 
-        // Build flat litlen table (11 bits, no subtables)
-        let litlen = build_flat_litlen_table(litlen_lens)?;
-
-        // Build flat distance table (9 bits)
-        let dist = build_flat_dist_table(dist_lens)?;
+        // Build tables with subtables at the end (like LitLenTable)
+        let litlen = build_table_with_subtables(litlen_lens, false)?;
+        let dist = build_table_with_subtables(dist_lens, true)?;
 
         Some(Self {
             fingerprint,
@@ -147,46 +197,38 @@ impl SpecializedDecoder {
     /// Decode using this specialized table
     #[inline(always)]
     pub fn decode_symbol(&self, bitbuf: u64) -> SpecEntry {
-        self.litlen[(bitbuf & 0x7FF) as usize]
+        unsafe { *self.litlen.get_unchecked((bitbuf & 0x7FF) as usize) }
     }
 
     /// Decode distance using this specialized table
     #[inline(always)]
     pub fn decode_distance(&self, bitbuf: u64) -> SpecEntry {
-        self.dist[(bitbuf & 0x1FF) as usize]
+        unsafe { *self.dist.get_unchecked((bitbuf & 0x7FF) as usize) }
     }
 }
 
-/// Build a flat 11-bit litlen lookup table
-fn build_flat_litlen_table(lengths: &[u8]) -> Option<Box<[SpecEntry; 2048]>> {
-    const TABLE_BITS: usize = 11;
-    const TABLE_SIZE: usize = 1 << TABLE_BITS;
+#[inline(always)]
+fn unlikely(b: bool) -> bool {
+    b
+}
 
-    let mut table = Box::new([SpecEntry::new(0, 0, 0); TABLE_SIZE]);
+/// Internal table building logic with subtable support
+fn build_table_with_subtables(lengths: &[u8], is_distance: bool) -> Option<Box<[SpecEntry]>> {
+    const MAIN_BITS: usize = 11;
+    const MAIN_SIZE: usize = 1 << MAIN_BITS;
+    const MAX_SUB_BITS: usize = 4; // 15 - 11
 
-    // Length base values for symbols 257-285
-    const LENGTH_BASES: [u16; 29] = [
-        3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115,
-        131, 163, 195, 227, 258,
-    ];
-    const LENGTH_EXTRA: [u8; 29] = [
-        0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0,
-    ];
+    let mut table = vec![SpecEntry::end_of_block(15); MAIN_SIZE];
 
-    // Count codes at each length
-    let max_len = lengths.iter().copied().max().unwrap_or(0) as usize;
-    if max_len > 15 {
-        return None; // Invalid
-    }
-
+    // Count codes
     let mut bl_count = [0u32; 16];
     for &len in lengths {
-        if len > 0 {
+        if len > 0 && len <= 15 {
             bl_count[len as usize] += 1;
         }
     }
 
-    // Compute first code for each length
+    // Compute first code
     let mut next_code = [0u32; 16];
     let mut code = 0u32;
     for bits in 1..=15 {
@@ -194,131 +236,116 @@ fn build_flat_litlen_table(lengths: &[u8]) -> Option<Box<[SpecEntry; 2048]>> {
         next_code[bits] = code;
     }
 
-    // Assign codes to symbols and fill table
+    // Pass 1: Handle codes <= 11 bits
     for (symbol, &len) in lengths.iter().enumerate() {
-        if len == 0 {
+        if len == 0 || len as usize > MAIN_BITS {
             continue;
         }
-        let len = len as usize;
-        if len > TABLE_BITS {
-            // Code too long for flat table - can't use specialized decoder
-            return None;
-        }
 
-        let code = next_code[len];
-        next_code[len] += 1;
+        let code = next_code[len as usize];
+        next_code[len as usize] += 1;
+        let rev = reverse_bits(code, len);
 
-        // Reverse code bits for LSB-first reading
-        let mut rev_code = 0u32;
-        for i in 0..len {
-            if (code >> i) & 1 != 0 {
-                rev_code |= 1 << (len - 1 - i);
-            }
-        }
-
-        // Create entry based on symbol type
-        let entry = if symbol < 256 {
-            // Literal
-            SpecEntry::literal(symbol as u8, len as u8)
+        let entry = if is_distance {
+            let (base, extra) = if symbol < 30 {
+                (
+                    crate::libdeflate_entry::DISTANCE_TABLE[symbol].0,
+                    crate::libdeflate_entry::DISTANCE_TABLE[symbol].1,
+                )
+            } else {
+                (0, 0)
+            };
+            SpecEntry::new(base, extra, len)
+        } else if symbol < 256 {
+            SpecEntry::literal(symbol as u8, len)
         } else if symbol == 256 {
-            // End of block
-            SpecEntry::end_of_block(len as u8)
-        } else if symbol <= 285 {
-            // Length code
-            let idx = symbol - 257;
-            SpecEntry::length(LENGTH_BASES[idx], LENGTH_EXTRA[idx], len as u8)
+            SpecEntry::end_of_block(len)
         } else {
-            continue; // Invalid symbol
+            let idx = symbol - 257;
+            let (base, extra) = (
+                crate::libdeflate_entry::LENGTH_TABLE[idx].0,
+                crate::libdeflate_entry::LENGTH_TABLE[idx].1,
+            );
+            SpecEntry::length(base, extra, len)
         };
 
-        // Fill all table slots that match this code (handles shorter codes)
-        let step = 1usize << len;
-        let mut idx = rev_code as usize;
-        while idx < TABLE_SIZE {
+        let step = 1 << len;
+        let mut idx = rev as usize;
+        while idx < MAIN_SIZE {
             table[idx] = entry;
             idx += step;
         }
     }
 
-    Some(table)
-}
-
-/// Build a flat 9-bit distance lookup table
-fn build_flat_dist_table(lengths: &[u8]) -> Option<Box<[SpecEntry; 512]>> {
-    const TABLE_BITS: usize = 9;
-    const TABLE_SIZE: usize = 1 << TABLE_BITS;
-
-    let mut table = Box::new([SpecEntry::new(0, 0, 0); TABLE_SIZE]);
-
-    // Distance base values for symbols 0-29
-    const DIST_BASES: [u16; 30] = [
-        1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537,
-        2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577,
-    ];
-    const DIST_EXTRA: [u8; 30] = [
-        0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12,
-        13, 13,
-    ];
-
-    // Count codes at each length
-    let max_len = lengths.iter().copied().max().unwrap_or(0) as usize;
-    if max_len > 15 {
-        return None;
-    }
-
-    let mut bl_count = [0u32; 16];
-    for &len in lengths {
-        if len > 0 {
-            bl_count[len as usize] += 1;
-        }
-    }
-
-    // Compute first code for each length
-    let mut next_code = [0u32; 16];
-    let mut code = 0u32;
-    for bits in 1..=15 {
-        code = (code + bl_count[bits - 1]) << 1;
-        next_code[bits] = code;
-    }
-
-    // Assign codes to symbols and fill table
+    // Pass 2: Handle codes > 11 bits (create subtables)
+    let mut sub_next = MAIN_SIZE;
     for (symbol, &len) in lengths.iter().enumerate() {
-        if len == 0 || symbol >= 30 {
+        if (len as usize) <= MAIN_BITS || len == 0 {
             continue;
         }
-        let len = len as usize;
-        if len > TABLE_BITS {
-            // Code too long for flat table - can't use specialized decoder
-            return None;
+
+        let code = next_code[len as usize];
+        next_code[len as usize] += 1;
+        let rev = reverse_bits(code, len);
+        let main_idx = (rev & 0x7FF) as usize;
+
+        if !table[main_idx].is_subtable() {
+            // New subtable
+            let offset = sub_next;
+            let size = 1 << MAX_SUB_BITS;
+            table.resize(sub_next + size, SpecEntry::end_of_block(15));
+            table[main_idx] = SpecEntry::subtable_ptr(offset as u16, MAX_SUB_BITS as u8, 11);
+            sub_next += size;
         }
 
-        let code = next_code[len];
-        next_code[len] += 1;
+        let ptr = table[main_idx];
+        let offset = ptr.subtable_offset() as usize;
+        let sub_bits = ptr.subtable_bits();
+        let sub_idx = (rev >> 11) as usize;
 
-        // Reverse code bits
-        let mut rev_code = 0u32;
-        for i in 0..len {
-            if (code >> i) & 1 != 0 {
-                rev_code |= 1 << (len - 1 - i);
-            }
-        }
+        let entry = if is_distance {
+            let (base, extra) = if symbol < 30 {
+                (
+                    crate::libdeflate_entry::DISTANCE_TABLE[symbol].0,
+                    crate::libdeflate_entry::DISTANCE_TABLE[symbol].1,
+                )
+            } else {
+                (0, 0)
+            };
+            SpecEntry::new(base, extra, len) // Store FULL len
+        } else if symbol < 256 {
+            SpecEntry::literal(symbol as u8, len)
+        } else if symbol == 256 {
+            SpecEntry::end_of_block(len)
+        } else {
+            let idx = symbol - 257;
+            let (base, extra) = (
+                crate::libdeflate_entry::LENGTH_TABLE[idx].0,
+                crate::libdeflate_entry::LENGTH_TABLE[idx].1,
+            );
+            SpecEntry::length(base, extra, len)
+        };
 
-        let entry = SpecEntry::new(
-            DIST_BASES[symbol],
-            DIST_EXTRA[symbol],
-            len as u8, // Only Huffman code length, extra bits read separately
-        );
-
-        // Fill all matching slots
-        let step = 1usize << len;
-        let mut idx = rev_code as usize;
-        while idx < TABLE_SIZE {
-            table[idx] = entry;
+        let step = 1 << (len - 11);
+        let mut idx = sub_idx;
+        while idx < (1 << sub_bits) {
+            table[offset + idx] = entry;
             idx += step;
         }
     }
 
-    Some(table)
+    Some(table.into_boxed_slice())
+}
+
+/// Reverse bits in a code
+fn reverse_bits(code: u32, len: u8) -> u32 {
+    let mut res = 0;
+    let mut c = code;
+    for _ in 0..len {
+        res = (res << 1) | (c & 1);
+        c >>= 1;
+    }
+    res
 }
 
 /// Cache of specialized decoders
@@ -385,6 +412,18 @@ impl SpecializedCache {
         (self.decoders.len(), self.failed.len())
     }
 
+    /// Get detailed stats: (decoders_count, failed_count, total_uses, max_uses)
+    pub fn detailed_stats(&self) -> (usize, usize, usize, usize) {
+        let total_uses: usize = self.decoders.values().map(|d| d.use_count).sum();
+        let max_uses = self
+            .decoders
+            .values()
+            .map(|d| d.use_count)
+            .max()
+            .unwrap_or(0);
+        (self.decoders.len(), self.failed.len(), total_uses, max_uses)
+    }
+
     /// Get a decoder by fingerprint (immutable reference)
     pub fn get_decoder(&self, fp: &TableFingerprint) -> Option<&SpecializedDecoder> {
         self.decoders.get(fp)
@@ -430,7 +469,7 @@ pub fn decode_with_specialized(
         refill!();
 
         // Decode literal/length
-        let entry = spec.decode_symbol(bitbuf);
+        let entry = spec.litlen[(bitbuf & 0x1FFF) as usize];
         let bits = entry.total_bits() as u32;
         bitbuf >>= bits;
         bitsleft = bitsleft.wrapping_sub(bits);
@@ -441,7 +480,7 @@ pub fn decode_with_specialized(
             out_pos += 1;
 
             // Try to decode more literals inline
-            let entry2 = spec.decode_symbol(bitbuf);
+            let entry2 = spec.litlen[(bitbuf & 0x1FFF) as usize];
             if entry2.is_literal() {
                 let bits2 = entry2.total_bits() as u32;
                 bitbuf >>= bits2;
@@ -449,7 +488,7 @@ pub fn decode_with_specialized(
                 output[out_pos] = entry2.literal_value();
                 out_pos += 1;
 
-                let entry3 = spec.decode_symbol(bitbuf);
+                let entry3 = spec.litlen[(bitbuf & 0x1FFF) as usize];
                 if entry3.is_literal() {
                     let bits3 = entry3.total_bits() as u32;
                     bitbuf >>= bits3;
@@ -480,7 +519,7 @@ pub fn decode_with_specialized(
         refill!();
 
         // Decode distance
-        let dist_entry = spec.decode_distance(bitbuf);
+        let dist_entry = spec.dist[(bitbuf & 0x7FF) as usize];
         let dist_bits = dist_entry.total_bits() as u32;
         bitbuf >>= dist_bits;
         bitsleft = bitsleft.wrapping_sub(dist_bits);

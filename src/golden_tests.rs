@@ -55,12 +55,12 @@ mod tests {
 
         // Byte-exact comparison
         assert_eq!(turbo_size, libdeflate_size, "Size mismatch");
-        assert_eq!(
+        assert_slices_eq!(
             &turbo_out[..turbo_size],
             &libdeflate_out[..libdeflate_size],
             "Content mismatch"
         );
-        assert_eq!(
+        assert_slices_eq!(
             &turbo_out[..turbo_size],
             original.as_slice(),
             "Original mismatch"
@@ -89,7 +89,7 @@ mod tests {
         let turbo_size = crate::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
 
         assert_eq!(turbo_size, libdeflate_size);
-        assert_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
+        assert_slices_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
 
         eprintln!("[GOLDEN] rle_pattern: ✓ {} bytes verified", turbo_size);
     }
@@ -113,7 +113,7 @@ mod tests {
         let turbo_size = crate::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
 
         assert_eq!(turbo_size, libdeflate_size);
-        assert_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
+        assert_slices_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
 
         eprintln!("[GOLDEN] short_distance: ✓ {} bytes verified", turbo_size);
     }
@@ -145,7 +145,7 @@ mod tests {
         let turbo_size = crate::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
 
         assert_eq!(turbo_size, libdeflate_size);
-        assert_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
+        assert_slices_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
 
         eprintln!("[GOLDEN] long_distance: ✓ {} bytes verified", turbo_size);
     }
@@ -230,7 +230,7 @@ mod tests {
         let turbo_size = crate::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
 
         assert_eq!(turbo_size, libdeflate_size);
-        assert_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
+        assert_slices_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
 
         eprintln!("[GOLDEN] multi_block: ✓ {} bytes verified", turbo_size);
     }
@@ -259,7 +259,7 @@ mod tests {
         let turbo_size = crate::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
 
         assert_eq!(turbo_size, libdeflate_size);
-        assert_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
+        assert_slices_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
 
         eprintln!("[GOLDEN] binary: ✓ {} bytes verified", turbo_size);
     }
@@ -283,7 +283,7 @@ mod tests {
         let turbo_size = crate::bgzf::inflate_into_pub(&compressed, &mut turbo_out).unwrap();
 
         assert_eq!(turbo_size, libdeflate_size);
-        assert_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
+        assert_slices_eq!(&turbo_out[..turbo_size], &libdeflate_out[..libdeflate_size]);
 
         eprintln!("[GOLDEN] max_length: ✓ {} bytes verified", turbo_size);
     }

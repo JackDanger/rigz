@@ -1048,7 +1048,7 @@ mod tests {
         let mut output = Vec::new();
         inflate_gzip_ultra_fast(&compressed, &mut output).unwrap();
 
-        assert_eq!(&output[..], &original[..]);
+        assert_slices_eq!(&output[..], &original[..]);
     }
 
     #[test]
@@ -1062,7 +1062,7 @@ mod tests {
         let mut output = Vec::new();
         inflate_gzip_combined(&compressed, &mut output).unwrap();
 
-        assert_eq!(&output[..], &original[..]);
+        assert_slices_eq!(&output[..], &original[..]);
     }
 
     #[test]
@@ -1076,7 +1076,7 @@ mod tests {
         let mut output = Vec::new();
         inflate_gzip_combined(&compressed, &mut output).unwrap();
 
-        assert_eq!(output, original);
+        assert_slices_eq!(output, original);
     }
 
     #[test]
@@ -1090,7 +1090,7 @@ mod tests {
         let mut output = Vec::new();
         inflate_gzip_ultra_fast(&compressed, &mut output).unwrap();
 
-        assert_eq!(output, original);
+        assert_slices_eq!(output, original);
     }
 
     #[test]
@@ -1104,7 +1104,7 @@ mod tests {
         let mut output = Vec::new();
         inflate_gzip_ultra_fast(&compressed, &mut output).unwrap();
 
-        assert_eq!(output, original);
+        assert_slices_eq!(output, original);
     }
 
     #[test]
@@ -1440,7 +1440,7 @@ mod dictionary_tests {
         // Decompress entire thing normally
         let mut output = Vec::new();
         inflate_ultra_fast(&compressed, &mut output).unwrap();
-        assert_eq!(&output, original, "Normal inflate should work");
+        assert_slices_eq!(&output, original, "Normal inflate should work");
 
         // TODO: Test with dictionary once inflate_with_dictionary is implemented
     }
@@ -1486,7 +1486,7 @@ mod dictionary_tests {
         let mut output = Vec::new();
         inflate_gzip_ultra_fast(&compressed, &mut output).unwrap();
 
-        assert_eq!(output, original, "Output should match original");
+        assert_slices_eq!(output, original, "Output should match original");
     }
 }
 
@@ -1511,25 +1511,7 @@ mod content_verification {
         let mut output = Vec::new();
         inflate_gzip_ultra_fast(&data, &mut output).unwrap();
 
-        assert_eq!(
-            output.len(),
-            expected.len(),
-            "Size mismatch: got {} expected {}",
-            output.len(),
-            expected.len()
-        );
-
-        // Find first mismatch
-        for (i, (&a, &b)) in output.iter().zip(expected.iter()).enumerate() {
-            if a != b {
-                eprintln!("First mismatch at position {}", i);
-                let start = i.saturating_sub(20);
-                let end = (i + 20).min(expected.len());
-                eprintln!("Expected[{}..{}]: {:?}", start, end, &expected[start..end]);
-                eprintln!("Got[{}..{}]:      {:?}", start, end, &output[start..end]);
-                panic!("Content mismatch at {}", i);
-            }
-        }
+        assert_slices_eq!(output, expected, "Data mismatch");
         eprintln!("All {} bytes match!", output.len());
     }
 }

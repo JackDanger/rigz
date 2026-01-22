@@ -8,6 +8,8 @@ use std::path::Path;
 use std::process;
 
 mod algebraic_decode;
+#[macro_use]
+mod test_utils;
 mod benchmark_datasets;
 mod bgzf;
 mod block_finder;

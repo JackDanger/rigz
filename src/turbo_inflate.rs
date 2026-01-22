@@ -1194,7 +1194,7 @@ mod tests {
         inflate_turbo(&compressed, &mut output).unwrap();
 
         assert_eq!(output.len(), original.len());
-        assert_eq!(&output[..], &original[..]);
+        assert_slices_eq!(&output[..], &original[..]);
     }
 
     #[test]
@@ -1215,20 +1215,7 @@ mod tests {
             .unwrap();
         output_ref.truncate(size);
 
-        assert_eq!(
-            output_turbo.len(),
-            output_ref.len(),
-            "Size mismatch: turbo={}, ref={}",
-            output_turbo.len(),
-            output_ref.len()
-        );
-
-        // Check for mismatches
-        for (i, (&a, &b)) in output_turbo.iter().zip(output_ref.iter()).enumerate() {
-            if a != b {
-                panic!("Mismatch at byte {}: turbo={}, ref={}", i, a, b);
-            }
-        }
+        assert_slices_eq!(output_turbo, output_ref, "Turbo vs libdeflate mismatch");
 
         eprintln!(
             "Turbo inflate correctness verified: {} bytes match",

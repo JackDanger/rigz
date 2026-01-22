@@ -551,7 +551,7 @@ mod tests {
         let mut output = Vec::new();
         decompressor.decompress(&compressed, &mut output).unwrap();
 
-        assert_eq!(&output, original);
+        assert_slices_eq!(&output, original);
     }
 
     #[test]

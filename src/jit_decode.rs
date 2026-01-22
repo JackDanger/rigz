@@ -49,10 +49,24 @@ impl TableFingerprint {
     }
 
     /// Combined fingerprint for litlen + distance tables
+    /// Normalizes to fixed lengths (286 litlen, 30 dist) so blocks with
+    /// different hlit/hdist but same actual codes get the same fingerprint.
     pub fn combined(litlen: &[u8], dist: &[u8]) -> Self {
         let mut hasher = DefaultHasher::new();
-        litlen.hash(&mut hasher);
-        dist.hash(&mut hasher);
+
+        // Normalize litlen to 286 elements (symbols 0-285)
+        // Symbols beyond litlen.len() have implicit length 0
+        let mut litlen_norm = [0u8; 286];
+        let litlen_len = litlen.len().min(286);
+        litlen_norm[..litlen_len].copy_from_slice(&litlen[..litlen_len]);
+        litlen_norm.hash(&mut hasher);
+
+        // Normalize dist to 30 elements (symbols 0-29)
+        let mut dist_norm = [0u8; 30];
+        let dist_len = dist.len().min(30);
+        dist_norm[..dist_len].copy_from_slice(&dist[..dist_len]);
+        dist_norm.hash(&mut hasher);
+
         Self(hasher.finish())
     }
 

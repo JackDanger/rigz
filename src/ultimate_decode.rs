@@ -904,7 +904,7 @@ mod tests {
 
         let mut out = vec![0u8; orig.len() + 100];
         let size = inflate_ultimate(&comp, &mut out).expect("decode failed");
-        assert_eq!(&out[..size], orig.as_slice());
+        assert_slices_eq!(&out[..size], orig.as_slice());
     }
 
     #[test]
@@ -916,7 +916,7 @@ mod tests {
 
         let mut out = vec![0u8; orig.len() + 100];
         let size = inflate_ultimate(&comp, &mut out).expect("decode failed");
-        assert_eq!(&out[..size], orig.as_slice());
+        assert_slices_eq!(&out[..size], orig.as_slice());
     }
 
     #[test]
@@ -928,7 +928,7 @@ mod tests {
 
         let mut out = vec![0u8; orig.len() + 100];
         let size = inflate_ultimate(&comp, &mut out).expect("decode failed");
-        assert_eq!(&out[..size], orig.as_slice());
+        assert_slices_eq!(&out[..size], orig.as_slice());
     }
 
     #[test]
@@ -947,7 +947,7 @@ mod tests {
             .expect("libdeflate");
 
         assert_eq!(our_size, lib_size);
-        assert_eq!(&our[..our_size], &lib[..lib_size]);
+        assert_slices_eq!(&our[..our_size], &lib[..lib_size]);
     }
 
     #[test]

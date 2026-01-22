@@ -3287,7 +3287,7 @@ mod tests {
                 Ok(size) => {
                     eprintln!("Decoded {} bytes", size);
                     assert_eq!(size, original.len(), "Size mismatch");
-                    assert_eq!(&output[..size], &original[..], "Content mismatch");
+                    assert_slices_eq!(&output[..size], &original[..], "Content mismatch");
                 }
                 Err(e) => {
                     panic!("decode_huffman_turbo failed: {}", e);
@@ -3431,7 +3431,7 @@ mod tests {
         let actual_size = inflate_into(&compressed, &mut output).unwrap();
 
         assert_eq!(actual_size, original.len());
-        assert_eq!(&output[..actual_size], &original[..]);
+        assert_slices_eq!(&output[..actual_size], &original[..]);
     }
 
     /// Test x86_64 ASM decoder with full LZ77 match handling
@@ -3534,7 +3534,7 @@ mod tests {
         ] {
             let mut output = vec![0u8; original.len() + 1000];
             let size = inflate_into(compressed, &mut output).unwrap();
-            assert_eq!(&output[..size], original, "{} mismatch", name);
+            assert_slices_eq!(&output[..size], original, format!("{} mismatch", name));
         }
     }
 
@@ -3964,7 +3964,7 @@ mod tests {
         decompress_multi_member_parallel(&multi, &mut output, 4).unwrap();
 
         assert_eq!(output.len(), expected.len(), "Size mismatch");
-        assert_eq!(output, expected, "Content mismatch");
+        assert_slices_eq!(output, expected, "Content mismatch");
     }
 
     #[test]
@@ -3997,7 +3997,7 @@ mod tests {
         decompress_multi_member_parallel(&multi, &mut output, 8).unwrap();
 
         assert_eq!(output.len(), expected.len(), "Size mismatch");
-        assert_eq!(output, expected, "Content mismatch");
+        assert_slices_eq!(output, expected, "Content mismatch");
     }
 
     /// Main decompression benchmark - compares gzippy vs libdeflater crate
@@ -4131,7 +4131,8 @@ mod tests {
     #[test]
     fn bench_analyze() {
         use crate::consume_first_decode::{
-            get_block_stats, get_cache_stats, get_spec_stats, reset_cache_stats,
+            get_block_stats, get_cache_stats, get_spec_cache_stats, get_spec_stats,
+            get_table_cache_size, reset_cache_stats,
         };
 
         let _ = crate::benchmark_datasets::prepare_datasets();
@@ -4256,6 +4257,7 @@ mod tests {
 
             // Cache stats
             let total_cache = cache_hits + cache_misses;
+            let cache_size = get_table_cache_size();
             if total_cache > 0 {
                 eprintln!("│  TABLE CACHE:");
                 eprintln!(
@@ -4264,16 +4266,31 @@ mod tests {
                     cache_rate * 100.0
                 );
                 eprintln!("│    Misses:   {:>5}", cache_misses);
+                eprintln!("│    Unique:   {:>5} fingerprints", cache_size);
                 eprintln!("│");
             }
 
             // Specialized decoder stats
             let total_spec = spec_used + spec_fallback;
+            let (spec_decoders, spec_failed, spec_total_uses, spec_max_uses) =
+                get_spec_cache_stats();
             if total_spec > 0 {
                 let spec_rate = spec_used as f64 / total_spec as f64 * 100.0;
                 eprintln!("│  DECODE PATH:");
                 eprintln!("│    Specialized: {:>5} ({:.1}%)", spec_used, spec_rate);
                 eprintln!("│    Generic:     {:>5}", spec_fallback);
+                if spec_decoders > 0 || spec_failed > 0 {
+                    eprintln!("│  SPEC CACHE:");
+                    eprintln!("│    Decoders:  {:>5} unique tables", spec_decoders);
+                    eprintln!("│    Failed:    {:>5} (tables too complex)", spec_failed);
+                    if spec_decoders > 0 {
+                        let avg_uses = spec_total_uses as f64 / spec_decoders as f64;
+                        eprintln!(
+                            "│    Reuse:     {:>5.1}x avg, {}x max",
+                            avg_uses, spec_max_uses
+                        );
+                    }
+                }
                 eprintln!("│");
             }
 
@@ -4525,7 +4542,7 @@ mod optimization_tests {
         let size = inflate_into_pub(deflate_data, &mut output).unwrap();
         output.truncate(size);
 
-        assert_eq!(output, original, "BMI2 path produced different output");
+        assert_slices_eq!(output, original, "BMI2 path produced different output");
     }
 
     /// Test variable shift operation (simulating BMI2 shrx)
