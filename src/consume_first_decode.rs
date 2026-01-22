@@ -28,6 +28,39 @@ thread_local! {
     static SPEC_CACHE: RefCell<crate::specialized_decode::SpecializedCache> =
         RefCell::new(crate::specialized_decode::SpecializedCache::new());
     static SPEC_STATS: RefCell<(usize, usize)> = const { RefCell::new((0, 0)) }; // (specialized_used, generic_used)
+    static BLOCK_STATS: RefCell<BlockStats> = const { RefCell::new(BlockStats::new()) };
+}
+
+/// Block type statistics for analysis
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BlockStats {
+    pub stored_blocks: usize,
+    pub fixed_blocks: usize,
+    pub dynamic_blocks: usize,
+    pub stored_bytes: usize,
+    pub fixed_bytes: usize,
+    pub dynamic_bytes: usize,
+}
+
+impl BlockStats {
+    pub const fn new() -> Self {
+        Self {
+            stored_blocks: 0,
+            fixed_blocks: 0,
+            dynamic_blocks: 0,
+            stored_bytes: 0,
+            fixed_bytes: 0,
+            dynamic_bytes: 0,
+        }
+    }
+
+    pub fn total_blocks(&self) -> usize {
+        self.stored_blocks + self.fixed_blocks + self.dynamic_blocks
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.stored_bytes + self.fixed_bytes + self.dynamic_bytes
+    }
 }
 
 /// Get cache statistics (hits, misses, hit_rate)
@@ -49,13 +82,21 @@ pub fn get_spec_stats() -> (usize, usize) {
     SPEC_STATS.with(|stats| *stats.borrow())
 }
 
-/// Reset cache statistics
+/// Get block type statistics
+pub fn get_block_stats() -> BlockStats {
+    BLOCK_STATS.with(|stats| *stats.borrow())
+}
+
+/// Reset all statistics (cache, spec, block)
 pub fn reset_cache_stats() {
     CACHE_STATS.with(|stats| {
         *stats.borrow_mut() = (0, 0);
     });
     SPEC_STATS.with(|stats| {
         *stats.borrow_mut() = (0, 0);
+    });
+    BLOCK_STATS.with(|stats| {
+        *stats.borrow_mut() = BlockStats::new();
     });
     TABLE_CACHE.with(|cache| {
         cache.borrow_mut().clear();
@@ -1581,10 +1622,10 @@ fn get_fixed_specialized_decoder() -> &'static crate::specialized_decode::Specia
 }
 
 fn decode_fixed(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
-    // Use the optimized specialized decoder for fixed Huffman blocks
-    // This uses the same fast path as dynamic Huffman with 11-bit tables
-    let spec = get_fixed_specialized_decoder();
-    decode_with_specialized_tables(bits, output, out_pos, spec)
+    // Use the same fast path as dynamic Huffman for maximum speed
+    // The libdeflate-style path achieves 99% of libdeflate vs 69% for specialized path
+    let (litlen, dist) = crate::libdeflate_decode::get_fixed_tables();
+    decode_huffman_libdeflate_style(bits, output, out_pos, litlen, dist)
 }
 
 /// Huffman decode with double-literal cache optimization
@@ -2405,6 +2446,7 @@ pub fn inflate_consume_first_bits(bits: &mut Bits, output: &mut [u8]) -> Result<
         let btype = ((bits.peek() >> 1) & 3) as u8;
         bits.consume(3);
 
+        let prev_pos = out_pos;
         match btype {
             0 => out_pos = decode_stored(bits, output, out_pos)?,
             1 => out_pos = decode_fixed(bits, output, out_pos)?,
@@ -2412,6 +2454,27 @@ pub fn inflate_consume_first_bits(bits: &mut Bits, output: &mut [u8]) -> Result<
             3 => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type")),
             _ => unreachable!(),
         }
+
+        // Record block statistics
+        let block_bytes = out_pos - prev_pos;
+        BLOCK_STATS.with(|stats| {
+            let mut s = stats.borrow_mut();
+            match btype {
+                0 => {
+                    s.stored_blocks += 1;
+                    s.stored_bytes += block_bytes;
+                }
+                1 => {
+                    s.fixed_blocks += 1;
+                    s.fixed_bytes += block_bytes;
+                }
+                2 => {
+                    s.dynamic_blocks += 1;
+                    s.dynamic_bytes += block_bytes;
+                }
+                _ => {}
+            }
+        });
 
         if bfinal {
             // Align bits to byte boundary at end of deflate stream

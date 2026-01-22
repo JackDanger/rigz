@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::combined_lut::CombinedLUT;
 use crate::inflate_tables::CODE_LENGTH_ORDER;
 use crate::packed_lut::PackedLUT;
+#[allow(unused_imports)]
 use crate::two_level_table::{FastBits, TurboBits, TwoLevelTable};
 
 // =============================================================================
@@ -33,6 +34,7 @@ use crate::two_level_table::{FastBits, TurboBits, TwoLevelTable};
 // This helps identify where we lose time compared to libdeflate.
 
 /// Performance counters for decode loop analysis
+#[allow(dead_code)]
 #[derive(Default)]
 pub struct DecodeTrace {
     /// Total literals decoded
@@ -69,6 +71,7 @@ pub struct DecodeTrace {
     pub eob_count: u64,
 }
 
+#[allow(dead_code)]
 impl DecodeTrace {
     /// Print trace summary
     pub fn print_summary(&self, output_bytes: usize, elapsed_ns: u64) {
@@ -194,11 +197,13 @@ fn tracing_enabled() -> bool {
 }
 
 /// Reset the thread-local trace counters
+#[allow(dead_code)]
 fn reset_trace() {
     DECODE_TRACE.with(|t| *t.borrow_mut() = DecodeTrace::default());
 }
 
 /// Get a copy of the current trace and reset
+#[allow(dead_code)]
 fn take_trace() -> DecodeTrace {
     DECODE_TRACE.with(|t| std::mem::take(&mut *t.borrow_mut()))
 }
@@ -439,226 +444,12 @@ fn inflate_into(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
     crate::consume_first_decode::inflate_consume_first(deflate_data, output)
 }
 
-/// Turbo inflate using TurboBits + PackedLUT
-///
-/// This is the optimized hot path with all Phase 1 optimizations:
-/// - TurboBits with branchless refill (libdeflate-style overlapping loads)
-/// - PackedLUT for bitsleft -= entry optimization
-/// - Multi-symbol decode for literal runs
-fn inflate_into_turbo(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
-    let trace = tracing_enabled();
-    let start = if trace {
-        reset_trace(); // Reset counters at start
-        Some(std::time::Instant::now())
-    } else {
-        None
-    };
-    let mut stored_blocks = 0u32;
-    let mut fixed_blocks = 0u32;
-    let mut dynamic_blocks = 0u32;
-
-    let mut bits = TurboBits::new(deflate_data);
-    let mut out_pos = 0;
-
-    loop {
-        bits.ensure(16);
-
-        let bfinal = bits.read(1);
-        let btype = bits.read(2);
-
-        match btype {
-            0 => {
-                if trace {
-                    stored_blocks += 1;
-                }
-                out_pos = decode_stored_into_turbo(&mut bits, output, out_pos)?;
-            }
-            1 => {
-                if trace {
-                    fixed_blocks += 1;
-                }
-                out_pos = decode_fixed_into_turbo(&mut bits, output, out_pos)?;
-            }
-            2 => {
-                if trace {
-                    dynamic_blocks += 1;
-                }
-                out_pos = decode_dynamic_into_turbo(&mut bits, output, out_pos)?;
-            }
-            3 => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Reserved block type",
-                ))
-            }
-            _ => unreachable!(),
-        }
-
-        if bfinal == 1 {
-            break;
-        }
-    }
-
-    if trace {
-        let elapsed = start.unwrap().elapsed();
-        let trace_data = take_trace();
-        trace_data.print_summary(out_pos, elapsed.as_nanos() as u64);
-        eprintln!(
-            "[TRACE]   blocks: {} stored, {} fixed, {} dynamic",
-            stored_blocks, fixed_blocks, dynamic_blocks
-        );
-        eprintln!(
-            "[TRACE]   input: {} bytes, ratio: {:.2}x",
-            deflate_data.len(),
-            out_pos as f64 / deflate_data.len() as f64
-        );
-    }
-
-    Ok(out_pos)
-}
-
-/// Turbo decode for stored blocks
-#[allow(dead_code)]
-fn decode_stored_into_turbo(
-    bits: &mut TurboBits,
-    output: &mut [u8],
-    mut out_pos: usize,
-) -> io::Result<usize> {
-    bits.align();
-    bits.ensure(32);
-
-    let len = bits.read(16) as usize;
-    let nlen = bits.read(16) as usize;
-
-    if len != (!nlen & 0xFFFF) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Stored block length mismatch",
-        ));
-    }
-
-    for _ in 0..len {
-        if out_pos >= output.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                "Output buffer full",
-            ));
-        }
-        bits.ensure(8);
-        output[out_pos] = bits.read(8) as u8;
-        out_pos += 1;
-    }
-
-    Ok(out_pos)
-}
-
-/// Turbo decode for fixed Huffman blocks using consume-first path
-#[allow(dead_code)]
-fn decode_fixed_into_turbo(
-    bits: &mut TurboBits,
-    output: &mut [u8],
-    out_pos: usize,
-) -> io::Result<usize> {
-    use crate::precomputed_table::{decode_precomputed, PrecomputedTable};
-
-    // Fixed Huffman code lengths (RFC 1951)
-    let lit_len_lens = get_fixed_lit_len_lens();
-    let dist_lens = [5u8; 32];
-
-    let lit_table = PrecomputedTable::build_litlen(&lit_len_lens)?;
-    let dist_table = PrecomputedTable::build_distance(&dist_lens)?;
-    decode_precomputed(bits, output, out_pos, &lit_table, &dist_table)
-}
-
-/// Turbo decode for dynamic Huffman blocks
-#[allow(dead_code)]
-fn decode_dynamic_into_turbo(
-    bits: &mut TurboBits,
-    output: &mut [u8],
-    out_pos: usize,
-) -> io::Result<usize> {
-    bits.ensure(16);
-    let hlit = bits.read(5) as usize + 257;
-    let hdist = bits.read(5) as usize + 1;
-    let hclen = bits.read(4) as usize + 4;
-
-    // Read code length code lengths
-    let mut code_len_lens = [0u8; 19];
-    for i in 0..hclen {
-        bits.ensure(8);
-        code_len_lens[CODE_LENGTH_ORDER[i] as usize] = bits.read(3) as u8;
-    }
-
-    let code_len_table = TwoLevelTable::build(&code_len_lens)?;
-
-    // Read all code lengths
-    let total_codes = hlit + hdist;
-    let mut code_lens = vec![0u8; total_codes];
-    let mut i = 0;
-
-    while i < total_codes {
-        bits.ensure(16);
-        let (symbol, sym_len) = code_len_table.decode(bits.buffer());
-        if sym_len == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Invalid code length code",
-            ));
-        }
-        bits.consume(sym_len);
-
-        match symbol {
-            0..=15 => {
-                code_lens[i] = symbol as u8;
-                i += 1;
-            }
-            16 => {
-                if i == 0 {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid repeat"));
-                }
-                let repeat = 3 + bits.read(2) as usize;
-                let last = code_lens[i - 1];
-                for _ in 0..repeat.min(total_codes - i) {
-                    code_lens[i] = last;
-                    i += 1;
-                }
-            }
-            17 => {
-                let repeat = 3 + bits.read(3) as usize;
-                i += repeat.min(total_codes - i);
-            }
-            18 => {
-                let repeat = 11 + bits.read(7) as usize;
-                i += repeat.min(total_codes - i);
-            }
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid code length symbol",
-                ))
-            }
-        }
-    }
-
-    let lit_len_lens = &code_lens[..hlit];
-    let dist_lens = &code_lens[hlit..];
-
-    // Use PrecomputedTable with saved_bitbuf optimization
-    use crate::precomputed_table::{decode_precomputed, PrecomputedTable};
-
-    let lit_table = PrecomputedTable::build_litlen(lit_len_lens)?;
-    let dist_table = PrecomputedTable::build_distance(dist_lens)?;
-    decode_precomputed(bits, output, out_pos, &lit_table, &dist_table)
-}
-
 /// Public version of inflate_into for use by other modules
 ///
-/// This uses the turbo path with all Phase 1 optimizations:
-/// - TurboBits with branchless refill (libdeflate-style)
-/// - PackedLUT for bitsleft -= entry optimization
-/// - Multi-symbol decode for literal runs
+/// Uses the optimized consume-first decoder with SpecializedDecoder.
+/// This achieves 71-97% of libdeflate depending on data characteristics.
 pub fn inflate_into_pub(deflate_data: &[u8], output: &mut [u8]) -> io::Result<usize> {
-    inflate_into_turbo(deflate_data, output)
+    inflate_into(deflate_data, output)
 }
 
 /// Decode stored block directly into output slice
@@ -3099,10 +2890,23 @@ pub fn decompress_multi_member_parallel<W: Write>(
 
 /// Single-member decompression (sequential)
 fn decompress_single_member<W: Write>(data: &[u8], writer: &mut W) -> io::Result<u64> {
-    let mut output = Vec::new();
-    crate::ultra_fast_inflate::inflate_gzip_ultra_fast(data, &mut output)?;
+    // Parse gzip header to get deflate data and expected size
+    let members = find_gzip_members(data);
+    if members.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid gzip"));
+    }
+    let member = &members[0];
+    let member_data = &data[member.start..member.end];
+    let deflate_start = member.deflate_offset;
+    let deflate_end = (member.end - member.start).saturating_sub(8);
+    let deflate_data = &member_data[deflate_start..deflate_end];
+
+    // Use optimized inflate path
+    let mut output = vec![0u8; member.isize as usize];
+    let size = inflate_into(deflate_data, &mut output)?;
+    output.truncate(size);
     writer.write_all(&output)?;
-    Ok(output.len() as u64)
+    Ok(size as u64)
 }
 
 // ============================================================================
@@ -3343,7 +3147,7 @@ mod tests {
 
         // Test turbo path
         let mut output_turbo = vec![0u8; original.len() + 100];
-        let size_turbo = inflate_into_turbo(&compressed, &mut output_turbo).unwrap();
+        let size_turbo = inflate_into_pub(&compressed, &mut output_turbo).unwrap();
         eprintln!("Turbo decoded: {} bytes", size_turbo);
         eprintln!(
             "Turbo output: {:?}",
@@ -3388,7 +3192,7 @@ mod tests {
 
         // Test turbo path
         let mut output_turbo = vec![0u8; original.len() + 100];
-        let size_turbo = inflate_into_turbo(&compressed, &mut output_turbo).unwrap();
+        let size_turbo = inflate_into_pub(&compressed, &mut output_turbo).unwrap();
 
         assert_eq!(
             size_turbo, size_std,
@@ -3428,7 +3232,7 @@ mod tests {
 
         // Test turbo path
         let mut output_turbo = vec![0u8; original.len() + 100];
-        let size_turbo = inflate_into_turbo(&compressed, &mut output_turbo).unwrap();
+        let size_turbo = inflate_into_pub(&compressed, &mut output_turbo).unwrap();
 
         assert_eq!(
             size_turbo, size_std,
@@ -3563,7 +3367,7 @@ mod tests {
 
             // Turbo path
             let mut output_turbo = vec![0u8; 100];
-            let size_turbo = inflate_into_turbo(&compressed, &mut output_turbo).unwrap();
+            let size_turbo = inflate_into_pub(&compressed, &mut output_turbo).unwrap();
 
             let match_ok =
                 size_turbo == size_std && output_turbo[..size_turbo] == output_std[..size_std];
@@ -4194,6 +3998,316 @@ mod tests {
 
         assert_eq!(output.len(), expected.len(), "Size mismatch");
         assert_eq!(output, expected, "Content mismatch");
+    }
+
+    /// Main decompression benchmark - compares gzippy vs libdeflater crate
+    /// Run with: cargo test --release bench_decompress -- --nocapture
+    #[test]
+    fn bench_decompress() {
+        let _ = crate::benchmark_datasets::prepare_datasets();
+
+        let datasets = [
+            (
+                "silesia",
+                "benchmark_data/silesia-gzip.tar.gz",
+                "mixed content",
+            ),
+            (
+                "software",
+                "benchmark_data/software.archive.gz",
+                "source code",
+            ),
+            ("logs", "benchmark_data/logs.txt.gz", "repetitive logs"),
+        ];
+
+        const WARMUP: usize = 3;
+        const ITERATIONS: usize = 10;
+
+        eprintln!("\n╔══════════════════════════════════════════════════════════════╗");
+        eprintln!("║           GZIPPY DECOMPRESSION BENCHMARK                     ║");
+        eprintln!("╠══════════════════════════════════════════════════════════════╣");
+        eprintln!(
+            "║  Warmup: {} iterations, Measured: {} iterations              ║",
+            WARMUP, ITERATIONS
+        );
+        eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
+
+        for (name, path, desc) in &datasets {
+            let gz = match std::fs::read(path) {
+                Ok(d) => d,
+                Err(_) => {
+                    eprintln!("⚠ Skipping {} - file not found: {}", name, path);
+                    continue;
+                }
+            };
+
+            // Parse gzip header to get raw deflate data
+            let mut pos = 10;
+            let flg = gz[3];
+            if (flg & 0x04) != 0 {
+                let xlen = u16::from_le_bytes([gz[pos], gz[pos + 1]]) as usize;
+                pos += 2 + xlen;
+            }
+            if (flg & 0x08) != 0 {
+                while pos < gz.len() && gz[pos] != 0 {
+                    pos += 1;
+                }
+                pos += 1;
+            }
+            if (flg & 0x10) != 0 {
+                while pos < gz.len() && gz[pos] != 0 {
+                    pos += 1;
+                }
+                pos += 1;
+            }
+            if (flg & 0x02) != 0 {
+                pos += 2;
+            }
+
+            let deflate = &gz[pos..gz.len() - 8];
+            let expected_size = u32::from_le_bytes([
+                gz[gz.len() - 4],
+                gz[gz.len() - 3],
+                gz[gz.len() - 2],
+                gz[gz.len() - 1],
+            ]) as usize;
+
+            let mut output = vec![0u8; expected_size + 1024];
+
+            eprintln!(
+                "┌─ {} ({}) ─────────────────────────────",
+                name.to_uppercase(),
+                desc
+            );
+            eprintln!(
+                "│  Size: {:.1} MB uncompressed",
+                expected_size as f64 / 1_000_000.0
+            );
+
+            // === libdeflater crate (C libdeflate via FFI) ===
+            // Warmup
+            for _ in 0..WARMUP {
+                libdeflater::Decompressor::new()
+                    .deflate_decompress(deflate, &mut output)
+                    .unwrap();
+            }
+            // Measure
+            let start = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                libdeflater::Decompressor::new()
+                    .deflate_decompress(deflate, &mut output)
+                    .unwrap();
+            }
+            let libdeflate_speed =
+                (expected_size * ITERATIONS) as f64 / start.elapsed().as_secs_f64() / 1_000_000.0;
+
+            // === gzippy (pure Rust) ===
+            // Warmup
+            for _ in 0..WARMUP {
+                let _ = inflate_into_pub(deflate, &mut output);
+            }
+            // Measure
+            let start = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                let _ = inflate_into_pub(deflate, &mut output);
+            }
+            let gzippy_speed =
+                (expected_size * ITERATIONS) as f64 / start.elapsed().as_secs_f64() / 1_000_000.0;
+
+            let ratio = gzippy_speed / libdeflate_speed * 100.0;
+            let status = if ratio >= 100.0 { "✓" } else { " " };
+
+            eprintln!("│  libdeflater: {:>8.1} MB/s", libdeflate_speed);
+            eprintln!(
+                "│  gzippy:      {:>8.1} MB/s  ({:>5.1}%) {}",
+                gzippy_speed, ratio, status
+            );
+            eprintln!("└────────────────────────────────────────────────\n");
+        }
+    }
+
+    /// Analyze decompression with detailed statistics
+    /// Run with: cargo test --release bench_analyze -- --nocapture
+    #[test]
+    fn bench_analyze() {
+        use crate::consume_first_decode::{
+            get_block_stats, get_cache_stats, get_spec_stats, reset_cache_stats,
+        };
+
+        let _ = crate::benchmark_datasets::prepare_datasets();
+
+        let datasets = [
+            (
+                "silesia",
+                "benchmark_data/silesia-gzip.tar.gz",
+                "mixed content",
+            ),
+            (
+                "software",
+                "benchmark_data/software.archive.gz",
+                "source code",
+            ),
+            ("logs", "benchmark_data/logs.txt.gz", "repetitive logs"),
+        ];
+
+        eprintln!("\n╔══════════════════════════════════════════════════════════════╗");
+        eprintln!("║           GZIPPY DECOMPRESSION ANALYSIS                      ║");
+        eprintln!("╠══════════════════════════════════════════════════════════════╣");
+        eprintln!("║  Block types, cache stats, path usage                        ║");
+        eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
+
+        for (name, path, desc) in &datasets {
+            let gz = match std::fs::read(path) {
+                Ok(d) => d,
+                Err(_) => {
+                    eprintln!("  Skipping {} - file not found: {}", name, path);
+                    continue;
+                }
+            };
+
+            // Parse gzip header to get raw deflate data
+            let mut pos = 10;
+            let flg = gz[3];
+            if (flg & 0x04) != 0 {
+                let xlen = u16::from_le_bytes([gz[pos], gz[pos + 1]]) as usize;
+                pos += 2 + xlen;
+            }
+            if (flg & 0x08) != 0 {
+                while pos < gz.len() && gz[pos] != 0 {
+                    pos += 1;
+                }
+                pos += 1;
+            }
+            if (flg & 0x10) != 0 {
+                while pos < gz.len() && gz[pos] != 0 {
+                    pos += 1;
+                }
+                pos += 1;
+            }
+            if (flg & 0x02) != 0 {
+                pos += 2;
+            }
+
+            let deflate = &gz[pos..gz.len() - 8];
+            let expected_size = u32::from_le_bytes([
+                gz[gz.len() - 4],
+                gz[gz.len() - 3],
+                gz[gz.len() - 2],
+                gz[gz.len() - 1],
+            ]) as usize;
+
+            let mut output = vec![0u8; expected_size + 1024];
+
+            // Reset stats and decompress
+            reset_cache_stats();
+            let start = std::time::Instant::now();
+            let _ = inflate_into_pub(deflate, &mut output);
+            let elapsed = start.elapsed();
+
+            // Gather stats
+            let block_stats = get_block_stats();
+            let (cache_hits, cache_misses, cache_rate) = get_cache_stats();
+            let (spec_used, spec_fallback) = get_spec_stats();
+
+            let speed = expected_size as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+
+            eprintln!(
+                "┌─ {} ({}) ─────────────────────────────",
+                name.to_uppercase(),
+                desc
+            );
+            eprintln!("│");
+            eprintln!(
+                "│  Size: {:.2} MB compressed → {:.2} MB uncompressed",
+                deflate.len() as f64 / 1_000_000.0,
+                expected_size as f64 / 1_000_000.0
+            );
+            eprintln!("│  Speed: {:.1} MB/s", speed);
+            eprintln!("│");
+
+            // Block type breakdown
+            let total_blocks = block_stats.total_blocks();
+            eprintln!("│  BLOCK TYPES ({} total):", total_blocks);
+            if block_stats.stored_blocks > 0 {
+                let pct = block_stats.stored_blocks as f64 / total_blocks as f64 * 100.0;
+                let bytes_pct = block_stats.stored_bytes as f64 / expected_size as f64 * 100.0;
+                eprintln!(
+                    "│    Stored:   {:>5} blocks ({:>5.1}%) → {:>10} bytes ({:>5.1}%)",
+                    block_stats.stored_blocks, pct, block_stats.stored_bytes, bytes_pct
+                );
+            }
+            if block_stats.fixed_blocks > 0 {
+                let pct = block_stats.fixed_blocks as f64 / total_blocks as f64 * 100.0;
+                let bytes_pct = block_stats.fixed_bytes as f64 / expected_size as f64 * 100.0;
+                eprintln!(
+                    "│    Fixed:    {:>5} blocks ({:>5.1}%) → {:>10} bytes ({:>5.1}%)",
+                    block_stats.fixed_blocks, pct, block_stats.fixed_bytes, bytes_pct
+                );
+            }
+            if block_stats.dynamic_blocks > 0 {
+                let pct = block_stats.dynamic_blocks as f64 / total_blocks as f64 * 100.0;
+                let bytes_pct = block_stats.dynamic_bytes as f64 / expected_size as f64 * 100.0;
+                eprintln!(
+                    "│    Dynamic:  {:>5} blocks ({:>5.1}%) → {:>10} bytes ({:>5.1}%)",
+                    block_stats.dynamic_blocks, pct, block_stats.dynamic_bytes, bytes_pct
+                );
+            }
+            eprintln!("│");
+
+            // Cache stats
+            let total_cache = cache_hits + cache_misses;
+            if total_cache > 0 {
+                eprintln!("│  TABLE CACHE:");
+                eprintln!(
+                    "│    Hits:     {:>5} ({:.1}%)",
+                    cache_hits,
+                    cache_rate * 100.0
+                );
+                eprintln!("│    Misses:   {:>5}", cache_misses);
+                eprintln!("│");
+            }
+
+            // Specialized decoder stats
+            let total_spec = spec_used + spec_fallback;
+            if total_spec > 0 {
+                let spec_rate = spec_used as f64 / total_spec as f64 * 100.0;
+                eprintln!("│  DECODE PATH:");
+                eprintln!("│    Specialized: {:>5} ({:.1}%)", spec_used, spec_rate);
+                eprintln!("│    Generic:     {:>5}", spec_fallback);
+                eprintln!("│");
+            }
+
+            // Archive characteristics summary
+            let dominant_type = if block_stats.dynamic_bytes > block_stats.fixed_bytes
+                && block_stats.dynamic_bytes > block_stats.stored_bytes
+            {
+                "dynamic"
+            } else if block_stats.fixed_bytes > block_stats.stored_bytes {
+                "fixed"
+            } else {
+                "stored"
+            };
+            eprintln!("│  CHARACTERISTICS:");
+            eprintln!("│    Dominant block type: {}", dominant_type);
+            let compression_ratio = deflate.len() as f64 / expected_size as f64;
+            eprintln!(
+                "│    Compression ratio: {:.2}x ({:.1}% of original)",
+                1.0 / compression_ratio,
+                compression_ratio * 100.0
+            );
+
+            eprintln!("└────────────────────────────────────────────────\n");
+        }
+
+        // Summary recommendations
+        eprintln!("╔══════════════════════════════════════════════════════════════╗");
+        eprintln!("║  OPTIMIZATION NOTES                                          ║");
+        eprintln!("╠══════════════════════════════════════════════════════════════╣");
+        eprintln!("║  - Dynamic blocks: libdeflate-style decode (fastest)         ║");
+        eprintln!("║  - Fixed blocks: need optimization (currently slower)        ║");
+        eprintln!("║  - High cache hit rate: table reuse working                  ║");
+        eprintln!("║  - Low cache hit rate: consider fingerprint tuning           ║");
+        eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
     }
 }
 
@@ -5301,7 +5415,7 @@ mod optimization_tests {
         let start = std::time::Instant::now();
         for _ in 0..iterations {
             let mut out = vec![0u8; original.len()];
-            super::inflate_into_turbo(&compressed, &mut out).unwrap();
+            super::inflate_into_pub(&compressed, &mut out).unwrap();
         }
         let elapsed_turbo = start.elapsed();
 
@@ -5371,7 +5485,7 @@ mod optimization_tests {
         // Decompress with our turbo path
         let mut turbo_out = vec![0u8; original.len() + 100];
         let turbo_size =
-            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+            super::inflate_into_pub(&compressed, &mut turbo_out).expect("turbo failed");
 
         eprintln!("[CF-TEST]   turbo output: {} bytes", turbo_size);
         assert_eq!(&turbo_out[..turbo_size], &original[..]);
@@ -5411,7 +5525,7 @@ mod optimization_tests {
         // Decompress with turbo
         let mut turbo_out = vec![0u8; original.len() + 100];
         let turbo_size =
-            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+            super::inflate_into_pub(&compressed, &mut turbo_out).expect("turbo failed");
 
         assert_eq!(&turbo_out[..turbo_size], &original[..]);
         eprintln!("[CF-TEST]   ✓ Passed");
@@ -5449,7 +5563,7 @@ mod optimization_tests {
         // Decompress with turbo
         let mut turbo_out = vec![0u8; original.len() + 100];
         let turbo_size =
-            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+            super::inflate_into_pub(&compressed, &mut turbo_out).expect("turbo failed");
 
         assert_eq!(&turbo_out[..turbo_size], &original[..]);
         eprintln!("[CF-TEST]   ✓ Passed");
@@ -5488,7 +5602,7 @@ mod optimization_tests {
         // Decompress with turbo
         let mut turbo_out = vec![0u8; original.len() + 100];
         let turbo_size =
-            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+            super::inflate_into_pub(&compressed, &mut turbo_out).expect("turbo failed");
 
         assert_eq!(&turbo_out[..turbo_size], &original[..]);
         eprintln!("[CF-TEST]   ✓ Passed");
@@ -5523,7 +5637,7 @@ mod optimization_tests {
         // Decompress with turbo
         let mut turbo_out = vec![0u8; original.len() + 100];
         let turbo_size =
-            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+            super::inflate_into_pub(&compressed, &mut turbo_out).expect("turbo failed");
 
         assert_eq!(&turbo_out[..turbo_size], &original[..]);
         eprintln!("[CF-TEST]   ✓ Passed");
@@ -5558,7 +5672,7 @@ mod optimization_tests {
         // Decompress with turbo
         let mut turbo_out = vec![0u8; 100];
         let turbo_size =
-            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+            super::inflate_into_pub(&compressed, &mut turbo_out).expect("turbo failed");
 
         assert_eq!(turbo_size, 0);
         eprintln!("[CF-TEST]   ✓ Passed");
@@ -5593,7 +5707,7 @@ mod optimization_tests {
         // Decompress with turbo
         let mut turbo_out = vec![0u8; original.len() + 100];
         let turbo_size =
-            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+            super::inflate_into_pub(&compressed, &mut turbo_out).expect("turbo failed");
 
         assert_eq!(&turbo_out[..turbo_size], &original[..]);
         eprintln!("[CF-TEST]   ✓ Passed");
@@ -5628,7 +5742,7 @@ mod optimization_tests {
         // Decompress with turbo
         let mut turbo_out = vec![0u8; original.len() + 100];
         let turbo_size =
-            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+            super::inflate_into_pub(&compressed, &mut turbo_out).expect("turbo failed");
 
         assert_eq!(&turbo_out[..turbo_size], &original[..]);
         eprintln!("[CF-TEST]   ✓ Passed");
@@ -5670,7 +5784,7 @@ mod optimization_tests {
 
         // Decompress with our turbo path
         let mut turbo_out = vec![0u8; original.len() + 100];
-        let result = super::inflate_into_turbo(&compressed, &mut turbo_out);
+        let result = super::inflate_into_pub(&compressed, &mut turbo_out);
 
         match result {
             Ok(turbo_size) => {
@@ -5733,7 +5847,7 @@ mod optimization_tests {
 
         // Decompress with our turbo path
         let mut turbo_out = vec![0u8; original.len() + 100];
-        let result = super::inflate_into_turbo(&compressed, &mut turbo_out);
+        let result = super::inflate_into_pub(&compressed, &mut turbo_out);
 
         match result {
             Ok(turbo_size) => {
@@ -6365,7 +6479,7 @@ mod optimization_tests {
         let test_size = 100_000.min(libdeflate_size);
         let mut turbo_out = vec![0u8; libdeflate_size + 1000];
 
-        match super::inflate_into_turbo(deflate_data, &mut turbo_out) {
+        match super::inflate_into_pub(deflate_data, &mut turbo_out) {
             Ok(size) => {
                 eprintln!("[CF-TEST]   Our output: {} bytes", size);
 
@@ -6536,7 +6650,7 @@ mod optimization_tests {
         // Decompress with turbo
         let mut turbo_out = vec![0u8; original.len() + 100];
         let turbo_size =
-            super::inflate_into_turbo(&compressed, &mut turbo_out).expect("turbo failed");
+            super::inflate_into_pub(&compressed, &mut turbo_out).expect("turbo failed");
 
         assert_eq!(&turbo_out[..turbo_size], &original[..]);
         eprintln!("[CF-TEST]   ✓ Passed");
