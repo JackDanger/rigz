@@ -197,6 +197,9 @@ The key to matching rapidgzip on arbitrary gzip files:
 5. **Capping threads at physical_cores** - VMs underreport
 6. **ISA-L FFI on ARM** - Complex struct layout (200KB+), pure C fallback anyway
 
+### Recent Learnings (Jan 2026)
+- Combined match lookup is safe behind the `combined_match` feature but regresses on software/logs; keep it off by default.
+
 ## Build & Dependencies
 
 gzippy uses only statically-linked dependencies for maximum portability:

@@ -54,6 +54,8 @@ const LITERAL_FLAG: u32 = 1 << 31;
 const EOB_FLAG: u32 = 1 << 30;
 const SUBTABLE_FLAG: u32 = 1 << 29;
 const DOUBLE_FLAG: u32 = 1 << 28;
+#[cfg(feature = "combined_match")]
+const COMBINED_PRESENT: u32 = 1 << 31;
 
 impl SpecEntry {
     #[inline(always)]
@@ -165,6 +167,24 @@ impl SpecEntry {
     }
 }
 
+#[cfg(feature = "combined_match")]
+#[inline(always)]
+pub fn combined_is_present(entry: u32) -> bool {
+    (entry & COMBINED_PRESENT) != 0
+}
+
+#[cfg(feature = "combined_match")]
+#[inline(always)]
+pub fn combined_dist_sym(entry: u32) -> usize {
+    ((entry >> 8) & 0xFF) as usize
+}
+
+#[cfg(feature = "combined_match")]
+#[inline(always)]
+pub fn combined_dist_len(entry: u32) -> u8 {
+    (entry & 0xFF) as u8
+}
+
 /// A specialized decoder for a specific Huffman table fingerprint
 /// Uses an 11-bit main table + subtables for 100% coverage
 pub struct SpecializedDecoder {
@@ -173,6 +193,9 @@ pub struct SpecializedDecoder {
     pub litlen: Box<[SpecEntry]>,
     /// Distance table (main + subtables)
     pub dist: Box<[SpecEntry]>,
+    /// Combined length+distance lookup (feature-gated)
+    #[cfg(feature = "combined_match")]
+    pub combined: Box<[u32]>,
     /// Number of times this decoder has been used
     pub use_count: usize,
 }
@@ -185,11 +208,15 @@ impl SpecializedDecoder {
         // Build tables with subtables at the end (like LitLenTable)
         let litlen = build_table_with_subtables(litlen_lens, false)?;
         let dist = build_table_with_subtables(dist_lens, true)?;
+        #[cfg(feature = "combined_match")]
+        let combined = build_combined_match_table(litlen_lens, dist_lens);
 
         Some(Self {
             fingerprint,
             litlen,
             dist,
+            #[cfg(feature = "combined_match")]
+            combined,
             use_count: 0,
         })
     }
@@ -346,6 +373,127 @@ fn reverse_bits(code: u32, len: u8) -> u32 {
         c >>= 1;
     }
     res
+}
+
+#[cfg(feature = "combined_match")]
+#[inline(always)]
+fn pack_combined(dist_sym: u8, dist_len: u8) -> u32 {
+    COMBINED_PRESENT | ((dist_sym as u32) << 8) | (dist_len as u32)
+}
+
+#[cfg(feature = "combined_match")]
+fn build_combined_match_table(litlen_lens: &[u8], dist_lens: &[u8]) -> Box<[u32]> {
+    const MAIN_BITS: usize = 11;
+    let size = 1 << MAIN_BITS;
+    let mut combined = vec![0u32; size];
+
+    // Build canonical codes for litlen.
+    let mut bl_count = [0u32; 16];
+    for &len in litlen_lens {
+        if len > 0 && len <= 15 {
+            bl_count[len as usize] += 1;
+        }
+    }
+    let mut next_code = [0u32; 16];
+    let mut code = 0u32;
+    for bits in 1..=15 {
+        code = (code + bl_count[bits - 1]) << 1;
+        next_code[bits] = code;
+    }
+
+    let mut len_map: Vec<Option<(u8, u8)>> = vec![None; size];
+    for (symbol, &len) in litlen_lens.iter().enumerate() {
+        if len == 0 || len as usize > MAIN_BITS {
+            continue;
+        }
+        let code = next_code[len as usize];
+        next_code[len as usize] += 1;
+        let rev = reverse_bits(code, len);
+        let step = 1 << len;
+
+        if symbol >= 257 {
+            let len_sym = (symbol - 257) as u8;
+            if crate::libdeflate_entry::LENGTH_TABLE[len_sym as usize].1 == 0 {
+                let mut idx = rev as usize;
+                while idx < size {
+                    len_map[idx] = Some((len_sym, len));
+                    idx += step;
+                }
+            }
+        }
+    }
+
+    // Build distance prefix maps for each remaining bit width.
+    let mut dist_bl_count = [0u32; 16];
+    for &len in dist_lens {
+        if len > 0 && len <= MAIN_BITS as u8 {
+            dist_bl_count[len as usize] += 1;
+        }
+    }
+    let mut dist_next_code = [0u32; 16];
+    let mut dist_code = 0u32;
+    for bits in 1..=MAIN_BITS {
+        dist_code = (dist_code + dist_bl_count[bits - 1]) << 1;
+        dist_next_code[bits] = dist_code;
+    }
+
+    let mut dist_codes: Vec<(u8, u8, u32)> = Vec::new();
+    for (symbol, &len) in dist_lens.iter().enumerate() {
+        if len == 0 || len as usize > MAIN_BITS {
+            continue;
+        }
+        let code = dist_next_code[len as usize];
+        dist_next_code[len as usize] += 1;
+        let rev = reverse_bits(code, len);
+        dist_codes.push((symbol as u8, len, rev));
+    }
+
+    let mut dist_prefix_maps: Vec<Vec<Option<(u8, u8)>>> = Vec::with_capacity(MAIN_BITS + 1);
+    dist_prefix_maps.push(Vec::new());
+    for l in 1..=MAIN_BITS {
+        let prefix_size = 1 << l;
+        let mut map = vec![None; prefix_size];
+        let mut conflict = vec![false; prefix_size];
+        for &(sym, len, rev) in &dist_codes {
+            if len as usize > l {
+                continue;
+            }
+            let step = 1 << len;
+            let mut idx = rev as usize;
+            while idx < prefix_size {
+                if !conflict[idx] {
+                    match map[idx] {
+                        None => map[idx] = Some((sym, len)),
+                        Some((prev_sym, prev_len)) => {
+                            if prev_sym != sym || prev_len != len {
+                                map[idx] = None;
+                                conflict[idx] = true;
+                            }
+                        }
+                    }
+                }
+                idx += step;
+            }
+        }
+        dist_prefix_maps.push(map);
+    }
+
+    for i in 0..size {
+        if let Some((_len_sym, b1)) = len_map[i] {
+            let remaining = MAIN_BITS - b1 as usize;
+            if remaining == 0 {
+                continue;
+            }
+            let prefix = i >> b1;
+            if let Some((dist_sym, dist_len)) = dist_prefix_maps[remaining][prefix] {
+                if dist_len as usize == remaining {
+                    combined[i] = pack_combined(dist_sym, dist_len);
+                }
+            }
+        }
+    }
+
+    combined.into_boxed_slice()
 }
 
 /// Cache of specialized decoders

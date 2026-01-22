@@ -2002,7 +2002,10 @@ fn decode_with_specialized_tables(
     // FASTLOOP with specialized main tables
     while out_pos + FASTLOOP_MARGIN <= out_end {
         // Decode litlen using flat 11-bit main table
-        let mut entry = unsafe { *spec.litlen.get_unchecked((bitbuf & 0x7FF) as usize) };
+        let index = (bitbuf & 0x7FF) as usize;
+        let mut entry = unsafe { *spec.litlen.get_unchecked(index) };
+        #[cfg(feature = "combined_match")]
+        let combined = spec.combined[index];
 
         let bits_used = entry.total_bits() as u32;
         bitbuf >>= bits_used;
@@ -2100,6 +2103,31 @@ fn decode_with_specialized_tables(
         refill!();
 
         // DISTANCE - flat 11-bit table + subtables
+        #[cfg(feature = "combined_match")]
+        if extra == 0 && crate::specialized_decode::combined_is_present(combined) {
+            let dist_len = crate::specialized_decode::combined_dist_len(combined) as u32;
+            let dist_sym = crate::specialized_decode::combined_dist_sym(combined);
+
+            bitbuf >>= dist_len;
+            bitsleft = bitsleft.wrapping_sub(dist_len);
+
+            let (dist_base, dist_extra) = crate::libdeflate_entry::DISTANCE_TABLE[dist_sym];
+            let distance = dist_base as u32 + (bitbuf & ((1u64 << dist_extra) - 1)) as u32;
+            bitbuf >>= dist_extra;
+            bitsleft = bitsleft.wrapping_sub(dist_extra as u32);
+
+            if distance == 0 || distance as usize > out_pos {
+                bits.bitbuf = bitbuf;
+                bits.bitsleft = bitsleft;
+                bits.pos = in_pos;
+                return Err(Error::new(ErrorKind::InvalidData, "Invalid distance"));
+            }
+
+            refill!();
+            out_pos = copy_match_fast(output, out_pos, distance, length);
+            continue;
+        }
+
         let mut dist_entry = spec.dist[(bitbuf & 0x7FF) as usize];
         if unlikely(dist_entry.is_subtable()) {
             let offset = dist_entry.subtable_offset() as usize;
@@ -2192,6 +2220,33 @@ fn decode_generic_with_spec(
         bits.refill();
 
         // Distance
+        #[cfg(feature = "combined_match")]
+        if extra == 0 {
+            let index = (bits.peek() & 0x7FF) as usize;
+            let combined = spec.combined[index];
+            if crate::specialized_decode::combined_is_present(combined) {
+                let dist_len = crate::specialized_decode::combined_dist_len(combined) as u32;
+                let dist_sym = crate::specialized_decode::combined_dist_sym(combined);
+
+                bits.consume(dist_len);
+
+                let (dist_base, dist_extra) = crate::libdeflate_entry::DISTANCE_TABLE[dist_sym];
+                let distance = dist_base as u32 + (bits.peek() & ((1u64 << dist_extra) - 1)) as u32;
+                bits.consume(dist_extra as u32);
+
+                if distance == 0 || distance as usize > out_pos {
+                    return Err(Error::new(ErrorKind::InvalidData, "Invalid distance"));
+                }
+
+                if out_pos + length as usize > output.len() {
+                    return Err(Error::new(ErrorKind::InvalidData, "Output overflow"));
+                }
+
+                out_pos = copy_match_fast(output, out_pos, distance, length);
+                continue;
+            }
+        }
+
         let dist_entry = spec.decode_distance(bits.peek());
         let dist_bits = dist_entry.total_bits() as u32;
         bits.consume(dist_bits);

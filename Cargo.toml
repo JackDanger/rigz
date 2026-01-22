@@ -17,6 +17,7 @@ build = "build.rs"
 default = []
 isal = []  # ISA-L decompression (enabled by build.rs when static lib is built)
 trace = []  # Enable decode tracing instrumentation
+combined_match = []  # Combined length+distance lookup (experimental)
 
 [dependencies]
 # Compression: flate2 with zlib-ng for maximum performance

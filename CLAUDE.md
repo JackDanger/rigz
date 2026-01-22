@@ -37,6 +37,7 @@ Gap to target (130%): 93%
 | Multi-symbol (augment style) | +15% | **-3%** | Double lookup overhead |
 | Speculative batch (basic) | +28% | **-1%** | Still sequential lookups |
 | Adaptive bloom filter | +10% | **-2%** | Tracking overhead |
+| Combined match lookup (feature `combined_match`) | +10% | **-35%** | Regressed on software/logs (64%/51% of libdeflate) |
 
 **KEY LESSON: Micro-optimizations often REGRESS. LLVM already optimizes well.**
 
