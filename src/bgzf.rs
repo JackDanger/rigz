@@ -4329,6 +4329,141 @@ mod tests {
         eprintln!("║  - Low cache hit rate: consider fingerprint tuning           ║");
         eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
     }
+
+    /// Profile time spent in table building vs decoding
+    /// Run with: cargo test --release bench_profile -- --nocapture
+    #[test]
+    fn bench_profile() {
+        use crate::consume_first_decode::{get_timing_stats, reset_cache_stats};
+
+        let _ = crate::benchmark_datasets::prepare_datasets();
+
+        let datasets = [
+            (
+                "silesia",
+                "benchmark_data/silesia-gzip.tar.gz",
+                "mixed content",
+            ),
+            (
+                "software",
+                "benchmark_data/software.archive.gz",
+                "source code",
+            ),
+            ("logs", "benchmark_data/logs.txt.gz", "repetitive logs"),
+        ];
+
+        eprintln!("\n╔══════════════════════════════════════════════════════════════╗");
+        eprintln!("║           GZIPPY TIMING PROFILE                              ║");
+        eprintln!("╠══════════════════════════════════════════════════════════════╣");
+        eprintln!("║  Breakdown of table building vs decode time                  ║");
+        eprintln!("╚══════════════════════════════════════════════════════════════╝\n");
+
+        for (name, path, desc) in &datasets {
+            let gz = match std::fs::read(path) {
+                Ok(d) => d,
+                Err(_) => {
+                    eprintln!("⚠ Skipping {} - file not found: {}", name, path);
+                    continue;
+                }
+            };
+
+            // Parse gzip header
+            let mut pos = 10;
+            let flg = gz[3];
+            if (flg & 0x04) != 0 {
+                let xlen = u16::from_le_bytes([gz[pos], gz[pos + 1]]) as usize;
+                pos += 2 + xlen;
+            }
+            if (flg & 0x08) != 0 {
+                while pos < gz.len() && gz[pos] != 0 {
+                    pos += 1;
+                }
+                pos += 1;
+            }
+            if (flg & 0x10) != 0 {
+                while pos < gz.len() && gz[pos] != 0 {
+                    pos += 1;
+                }
+                pos += 1;
+            }
+            if (flg & 0x02) != 0 {
+                pos += 2;
+            }
+
+            let deflate = &gz[pos..gz.len() - 8];
+            let expected_size = u32::from_le_bytes([
+                gz[gz.len() - 4],
+                gz[gz.len() - 3],
+                gz[gz.len() - 2],
+                gz[gz.len() - 1],
+            ]) as usize;
+
+            let mut output = vec![0u8; expected_size + 1024];
+
+            // Reset stats and run decompression
+            reset_cache_stats();
+
+            let start = std::time::Instant::now();
+            let _ = inflate_into_pub(deflate, &mut output);
+            let total_time = start.elapsed();
+
+            let timing = get_timing_stats();
+
+            let total_nanos = total_time.as_nanos() as f64;
+            let table_pct = timing.table_build_nanos as f64 / total_nanos * 100.0;
+            let decode_pct = timing.decode_nanos as f64 / total_nanos * 100.0;
+            let other_pct = 100.0 - table_pct - decode_pct;
+
+            let avg_table_us = if timing.table_build_count > 0 {
+                timing.table_build_nanos as f64 / timing.table_build_count as f64 / 1000.0
+            } else {
+                0.0
+            };
+            let avg_decode_us = if timing.decode_count > 0 {
+                timing.decode_nanos as f64 / timing.decode_count as f64 / 1000.0
+            } else {
+                0.0
+            };
+
+            eprintln!(
+                "┌─ {} ({}) ─────────────────────────────",
+                name.to_uppercase(),
+                desc
+            );
+            eprintln!(
+                "│  Size: {:.1} MB, Total time: {:.1}ms",
+                expected_size as f64 / 1_000_000.0,
+                total_time.as_secs_f64() * 1000.0
+            );
+            eprintln!("│");
+            eprintln!("│  TIME BREAKDOWN:");
+            eprintln!(
+                "│    Table building: {:>6.1}ms ({:>5.1}%) - {} tables, {:.1}µs avg",
+                timing.table_build_nanos as f64 / 1_000_000.0,
+                table_pct,
+                timing.table_build_count,
+                avg_table_us
+            );
+            eprintln!(
+                "│    Decoding:       {:>6.1}ms ({:>5.1}%) - {} blocks, {:.1}µs avg",
+                timing.decode_nanos as f64 / 1_000_000.0,
+                decode_pct,
+                timing.decode_count,
+                avg_decode_us
+            );
+            eprintln!(
+                "│    Other/overhead: {:>6.1}ms ({:>5.1}%)",
+                (total_nanos - timing.table_build_nanos as f64 - timing.decode_nanos as f64)
+                    / 1_000_000.0,
+                other_pct
+            );
+            eprintln!(
+                "│  Speed: {:.1} MB/s",
+                expected_size as f64 / total_time.as_secs_f64() / 1_000_000.0
+            );
+            eprintln!("└────────────────────────────────────────────────\n");
+        }
+    }
 }
 
 // =============================================================================

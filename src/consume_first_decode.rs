@@ -37,6 +37,30 @@ thread_local! {
         RefCell::new(crate::specialized_decode::SpecializedCache::new());
     static SPEC_STATS: RefCell<(usize, usize)> = const { RefCell::new((0, 0)) }; // (specialized_used, generic_used)
     static BLOCK_STATS: RefCell<BlockStats> = const { RefCell::new(BlockStats::new()) };
+    // Timing stats: (table_build_nanos, decode_nanos, header_parse_nanos)
+    static TIMING_STATS: RefCell<TimingStats> = const { RefCell::new(TimingStats::new()) };
+}
+
+/// Timing statistics for profiling table building vs decoding
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TimingStats {
+    pub table_build_nanos: u64,
+    pub decode_nanos: u64,
+    pub header_parse_nanos: u64,
+    pub table_build_count: u64,
+    pub decode_count: u64,
+}
+
+impl TimingStats {
+    pub const fn new() -> Self {
+        Self {
+            table_build_nanos: 0,
+            decode_nanos: 0,
+            header_parse_nanos: 0,
+            table_build_count: 0,
+            decode_count: 0,
+        }
+    }
 }
 
 /// Block type statistics for analysis
@@ -105,7 +129,12 @@ pub fn get_spec_cache_stats() -> (usize, usize, usize, usize) {
     SPEC_CACHE.with(|cache| cache.borrow().detailed_stats())
 }
 
-/// Reset all statistics (cache, spec, block)
+/// Get timing statistics
+pub fn get_timing_stats() -> TimingStats {
+    TIMING_STATS.with(|stats| *stats.borrow())
+}
+
+/// Reset all statistics (cache, spec, block, timing)
 pub fn reset_cache_stats() {
     CACHE_STATS.with(|stats| {
         *stats.borrow_mut() = (0, 0);
@@ -121,6 +150,9 @@ pub fn reset_cache_stats() {
     });
     SPEC_CACHE.with(|cache| {
         *cache.borrow_mut() = crate::specialized_decode::SpecializedCache::new();
+    });
+    TIMING_STATS.with(|stats| {
+        *stats.borrow_mut() = TimingStats::new();
     });
 }
 
@@ -1977,26 +2009,49 @@ fn decode_dynamic_fallback(
     dist_lengths: &[u8],
     fingerprint: TableFingerprint,
 ) -> Result<usize> {
+    use std::time::Instant;
+
     // Try to get cached tables, otherwise build new ones
-    let (litlen_table, dist_table) = TABLE_CACHE.with(|cache| {
+    let ((litlen_table, dist_table), build_time) = TABLE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(tables) = cache.get(&fingerprint) {
             CACHE_STATS.with(|s| s.borrow_mut().0 += 1); // hit
-            return tables.clone();
+            return (tables.clone(), 0u64);
         }
 
         CACHE_STATS.with(|s| s.borrow_mut().1 += 1); // miss
 
+        let start = Instant::now();
         let litlen = LitLenTable::build(litlen_lengths).expect("Invalid litlen table");
         let dist = DistTable::build(dist_lengths).expect("Invalid dist table");
+        let build_nanos = start.elapsed().as_nanos() as u64;
 
         let tables = (litlen, dist);
         cache.insert(fingerprint, tables.clone());
-        tables
+        (tables, build_nanos)
     });
 
-    // Use optimized speculative decoder
-    decode_dynamic_speculative(bits, output, out_pos, &litlen_table, &dist_table)
+    // Record table build time
+    if build_time > 0 {
+        TIMING_STATS.with(|s| {
+            let mut stats = s.borrow_mut();
+            stats.table_build_nanos += build_time;
+            stats.table_build_count += 1;
+        });
+    }
+
+    // Time the decode
+    let decode_start = Instant::now();
+    let result = decode_dynamic_speculative(bits, output, out_pos, &litlen_table, &dist_table);
+    let decode_nanos = decode_start.elapsed().as_nanos() as u64;
+
+    TIMING_STATS.with(|s| {
+        let mut stats = s.borrow_mut();
+        stats.decode_nanos += decode_nanos;
+        stats.decode_count += 1;
+    });
+
+    result
 }
 
 /// Decode using specialized flat tables (no subtables, direct lookup)

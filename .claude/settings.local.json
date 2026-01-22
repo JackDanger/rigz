@@ -34,7 +34,14 @@
       "Bash(./bench.sh:*)",
       "Bash(do echo \"=== Run $i ===\")",
       "Bash(fi)",
-      "Bash(./bench-decompress.sh:*)"
+      "Bash(./bench-decompress.sh:*)",
+      "Bash(./bench-decompression.sh:*)",
+      "Bash(RUSTFLAGS=\"-C target-cpu=native -C target-feature=+bmi2\" cargo test:*)",
+      "Bash(RUSTFLAGS=\"-C target-cpu=native\" ./bench-decompress.sh:*)",
+      "Bash(RUSTFLAGS=\"-C target-cpu=x86-64-v3\" cargo check:*)",
+      "Bash(./run-bench-on-linux.sh:*)",
+      "Bash(ssh:*)",
+      "Bash(awk:*)"
     ]
   }
 }
