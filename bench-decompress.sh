@@ -53,11 +53,16 @@ export RUSTFLAGS="-C target-cpu=native"
 
 # Parse arguments
 ANALYZE=false
+PROFILE=false
 RUNS=""
 while [[ $# -gt 0 ]]; do
     case $1 in
         --analyze)
             ANALYZE=true
+            shift
+            ;;
+        --profile)
+            PROFILE=true
             shift
             ;;
         --runs)
@@ -66,7 +71,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: ./bench-decompress.sh [--runs N] [--analyze]"
+            echo "Usage: ./bench-decompress.sh [--runs N] [--analyze] [--profile]"
             exit 1
             ;;
     esac
@@ -77,7 +82,9 @@ if [[ -n "$RUNS" ]]; then
     export BENCH_RUNS="$RUNS"
 fi
 
-if [[ "$ANALYZE" == "true" ]]; then
+if [[ "$PROFILE" == "true" ]]; then
+    cargo test --release --features profile bench_profile -- --nocapture
+elif [[ "$ANALYZE" == "true" ]]; then
     cargo test --release bench_analyze -- --nocapture
 else
     cargo test --release bench_decompress -- --nocapture

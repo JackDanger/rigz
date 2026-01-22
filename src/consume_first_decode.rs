@@ -2009,29 +2009,50 @@ fn decode_dynamic_fallback(
     dist_lengths: &[u8],
     fingerprint: TableFingerprint,
 ) -> Result<usize> {
-    use std::time::Instant;
-
     // Try to get cached tables, otherwise build new ones
-    let ((litlen_table, dist_table), build_time) = TABLE_CACHE.with(|cache| {
+    #[cfg(feature = "profile")]
+    let ((litlen_table, dist_table), build_time) = {
+        use std::time::Instant;
+        TABLE_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            if let Some(tables) = cache.get(&fingerprint) {
+                CACHE_STATS.with(|s| s.borrow_mut().0 += 1); // hit
+                return (tables.clone(), 0u64);
+            }
+
+            CACHE_STATS.with(|s| s.borrow_mut().1 += 1); // miss
+
+            let start = Instant::now();
+            let litlen = LitLenTable::build(litlen_lengths).expect("Invalid litlen table");
+            let dist = DistTable::build(dist_lengths).expect("Invalid dist table");
+            let build_nanos = start.elapsed().as_nanos() as u64;
+
+            let tables = (litlen, dist);
+            cache.insert(fingerprint, tables.clone());
+            (tables, build_nanos)
+        })
+    };
+
+    #[cfg(not(feature = "profile"))]
+    let (litlen_table, dist_table) = TABLE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if let Some(tables) = cache.get(&fingerprint) {
             CACHE_STATS.with(|s| s.borrow_mut().0 += 1); // hit
-            return (tables.clone(), 0u64);
+            return tables.clone();
         }
 
         CACHE_STATS.with(|s| s.borrow_mut().1 += 1); // miss
 
-        let start = Instant::now();
         let litlen = LitLenTable::build(litlen_lengths).expect("Invalid litlen table");
         let dist = DistTable::build(dist_lengths).expect("Invalid dist table");
-        let build_nanos = start.elapsed().as_nanos() as u64;
 
         let tables = (litlen, dist);
         cache.insert(fingerprint, tables.clone());
-        (tables, build_nanos)
+        tables
     });
 
-    // Record table build time
+    // Record table build time (only with profile feature)
+    #[cfg(feature = "profile")]
     if build_time > 0 {
         TIMING_STATS.with(|s| {
             let mut stats = s.borrow_mut();
@@ -2040,16 +2061,21 @@ fn decode_dynamic_fallback(
         });
     }
 
-    // Time the decode
-    let decode_start = Instant::now();
-    let result = decode_dynamic_speculative(bits, output, out_pos, &litlen_table, &dist_table);
-    let decode_nanos = decode_start.elapsed().as_nanos() as u64;
+    // Time the decode (only with profile feature)
+    #[cfg(feature = "profile")]
+    let decode_start = std::time::Instant::now();
 
-    TIMING_STATS.with(|s| {
-        let mut stats = s.borrow_mut();
-        stats.decode_nanos += decode_nanos;
-        stats.decode_count += 1;
-    });
+    let result = decode_dynamic_speculative(bits, output, out_pos, &litlen_table, &dist_table);
+
+    #[cfg(feature = "profile")]
+    {
+        let decode_nanos = decode_start.elapsed().as_nanos() as u64;
+        TIMING_STATS.with(|s| {
+            let mut stats = s.borrow_mut();
+            stats.decode_nanos += decode_nanos;
+            stats.decode_count += 1;
+        });
+    }
 
     result
 }
