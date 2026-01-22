@@ -387,7 +387,7 @@ fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32
             }
         } else if dist >= 8 {
             // Fast path: offset >= WORDBYTES (8)
-            // Matches libdeflate: unconditionally copy 5 words first, then 5 words per iteration
+            // Unconditionally copy 5 words first (40 bytes - covers most matches)
             (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
             src = src.add(8);
             dst = dst.add(8);
@@ -404,20 +404,8 @@ fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32
             src = src.add(8);
             dst = dst.add(8);
 
-            // Loop for longer matches - 5 words per iteration (matches libdeflate)
+            // Loop for longer matches
             while dst < end {
-                (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-                src = src.add(8);
-                dst = dst.add(8);
-                (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-                src = src.add(8);
-                dst = dst.add(8);
-                (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-                src = src.add(8);
-                dst = dst.add(8);
-                (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-                src = src.add(8);
-                dst = dst.add(8);
                 (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
                 src = src.add(8);
                 dst = dst.add(8);

@@ -41,8 +41,7 @@
       "Bash(RUSTFLAGS=\"-C target-cpu=x86-64-v3\" cargo check:*)",
       "Bash(./run-bench-on-linux.sh:*)",
       "Bash(ssh:*)",
-      "Bash(awk:*)",
-      "Bash(git revert:*)"
+      "Bash(awk:*)"
     ]
   }
 }
