@@ -703,243 +703,172 @@ fn decode_huffman_libdeflate_style(
 
         // Check LITERAL (bit 31 set = negative as i32)
         if (entry as i32) < 0 {
-            // LITERAL PATH - architecture-specific batching
-            // libdeflate notes that decoding >2-3 extra literals DECREASES performance
-            // on x86 by messing with branch prediction for match offset decode.
-            // ARM handles deeper nesting better, so we use 8-literal batching there.
+            // LITERAL PATH - libdeflate style multi-literal decode
+            let lit1 = (entry >> 16) as u8;
+            entry = lookup!();
 
-            #[cfg(target_arch = "aarch64")]
-            {
-                // ARM: 8-literal batching (works well with ARM branch predictor)
-                let lit1 = (entry >> 16) as u8;
+            if (entry as i32) < 0 {
+                // 2nd literal
+                bitbuf >>= entry as u8;
+                bitsleft = bitsleft.wrapping_sub(entry);
+                let lit2 = (entry >> 16) as u8;
                 entry = lookup!();
 
                 if (entry as i32) < 0 {
-                    // 2nd literal
+                    // 3rd literal
                     bitbuf >>= entry as u8;
                     bitsleft = bitsleft.wrapping_sub(entry);
-                    let lit2 = (entry >> 16) as u8;
+                    let lit3 = (entry >> 16) as u8;
                     entry = lookup!();
 
                     if (entry as i32) < 0 {
-                        // 3rd literal
+                        // 4th literal
                         bitbuf >>= entry as u8;
                         bitsleft = bitsleft.wrapping_sub(entry);
-                        let lit3 = (entry >> 16) as u8;
+                        let lit4 = (entry >> 16) as u8;
                         entry = lookup!();
+                        // Always refill before 5th literal - we need bits for potential length/distance
+                        refill_branchless_fast!();
 
                         if (entry as i32) < 0 {
-                            // 4th literal
+                            // 5th literal
                             bitbuf >>= entry as u8;
                             bitsleft = bitsleft.wrapping_sub(entry);
-                            let lit4 = (entry >> 16) as u8;
+                            let lit5 = (entry >> 16) as u8;
                             entry = lookup!();
-                            refill_branchless_fast!();
 
+                            // Try to decode 3 more literals for 8-literal batch
                             if (entry as i32) < 0 {
-                                // 5th literal
+                                // 6th literal
                                 bitbuf >>= entry as u8;
                                 bitsleft = bitsleft.wrapping_sub(entry);
-                                let lit5 = (entry >> 16) as u8;
+                                let lit6 = (entry >> 16) as u8;
                                 entry = lookup!();
 
                                 if (entry as i32) < 0 {
-                                    // 6th literal
+                                    // 7th literal
                                     bitbuf >>= entry as u8;
                                     bitsleft = bitsleft.wrapping_sub(entry);
-                                    let lit6 = (entry >> 16) as u8;
+                                    let lit7 = (entry >> 16) as u8;
                                     entry = lookup!();
+                                    refill_branchless_fast!();
 
                                     if (entry as i32) < 0 {
-                                        // 7th literal
+                                        // 8th literal - write all 8 at once
                                         bitbuf >>= entry as u8;
                                         bitsleft = bitsleft.wrapping_sub(entry);
-                                        let lit7 = (entry >> 16) as u8;
+                                        let lit8 = (entry >> 16) as u8;
                                         entry = lookup!();
-                                        refill_branchless_fast!();
 
-                                        if (entry as i32) < 0 {
-                                            // 8th literal
-                                            bitbuf >>= entry as u8;
-                                            bitsleft = bitsleft.wrapping_sub(entry);
-                                            let lit8 = (entry >> 16) as u8;
-                                            entry = lookup!();
-
-                                            let packed = (lit1 as u64)
-                                                | ((lit2 as u64) << 8)
-                                                | ((lit3 as u64) << 16)
-                                                | ((lit4 as u64) << 24)
-                                                | ((lit5 as u64) << 32)
-                                                | ((lit6 as u64) << 40)
-                                                | ((lit7 as u64) << 48)
-                                                | ((lit8 as u64) << 56);
-                                            unsafe {
-                                                (out_ptr.add(out_pos) as *mut u64)
-                                                    .write_unaligned(packed);
-                                            }
-                                            out_pos += 8;
-                                            continue;
-                                        }
-
-                                        // 7 literals
+                                        // Pack 8 literals into a u64 and write
                                         let packed = (lit1 as u64)
                                             | ((lit2 as u64) << 8)
                                             | ((lit3 as u64) << 16)
                                             | ((lit4 as u64) << 24)
                                             | ((lit5 as u64) << 32)
                                             | ((lit6 as u64) << 40)
-                                            | ((lit7 as u64) << 48);
+                                            | ((lit7 as u64) << 48)
+                                            | ((lit8 as u64) << 56);
                                         unsafe {
                                             (out_ptr.add(out_pos) as *mut u64)
                                                 .write_unaligned(packed);
                                         }
-                                        out_pos += 7;
+                                        out_pos += 8;
                                         continue;
                                     }
 
-                                    // 6 literals
+                                    // 7 literals
                                     let packed = (lit1 as u64)
                                         | ((lit2 as u64) << 8)
                                         | ((lit3 as u64) << 16)
                                         | ((lit4 as u64) << 24)
                                         | ((lit5 as u64) << 32)
-                                        | ((lit6 as u64) << 40);
+                                        | ((lit6 as u64) << 40)
+                                        | ((lit7 as u64) << 48);
                                     unsafe {
                                         (out_ptr.add(out_pos) as *mut u64).write_unaligned(packed);
                                     }
-                                    out_pos += 6;
-                                    refill_branchless_fast!();
+                                    out_pos += 7;
                                     continue;
                                 }
 
-                                // 5 literals
+                                // 6 literals
                                 let packed = (lit1 as u64)
                                     | ((lit2 as u64) << 8)
                                     | ((lit3 as u64) << 16)
                                     | ((lit4 as u64) << 24)
-                                    | ((lit5 as u64) << 32);
+                                    | ((lit5 as u64) << 32)
+                                    | ((lit6 as u64) << 40);
                                 unsafe {
                                     (out_ptr.add(out_pos) as *mut u64).write_unaligned(packed);
                                 }
-                                out_pos += 5;
+                                out_pos += 6;
                                 refill_branchless_fast!();
                                 continue;
                             }
 
-                            // 4 literals
-                            let packed = (lit1 as u32)
-                                | ((lit2 as u32) << 8)
-                                | ((lit3 as u32) << 16)
-                                | ((lit4 as u32) << 24);
+                            // 5 literals
+                            let packed = (lit1 as u64)
+                                | ((lit2 as u64) << 8)
+                                | ((lit3 as u64) << 16)
+                                | ((lit4 as u64) << 24)
+                                | ((lit5 as u64) << 32);
                             unsafe {
-                                (out_ptr.add(out_pos) as *mut u32).write_unaligned(packed);
+                                (out_ptr.add(out_pos) as *mut u64).write_unaligned(packed);
                             }
-                            out_pos += 4;
+                            out_pos += 5;
+                            refill_branchless_fast!();
                             continue;
                         }
 
-                        // 3 literals
-                        let packed = (lit1 as u32) | ((lit2 as u32) << 8) | ((lit3 as u32) << 16);
+                        // Pack 4 literals into a u32 and write at once
+                        let packed = (lit1 as u32)
+                            | ((lit2 as u32) << 8)
+                            | ((lit3 as u32) << 16)
+                            | ((lit4 as u32) << 24);
                         unsafe {
                             (out_ptr.add(out_pos) as *mut u32).write_unaligned(packed);
                         }
-                        out_pos += 3;
-                        if (bitsleft as u8) < 32 {
-                            refill_branchless_fast!();
-                        }
+                        out_pos += 4;
                         continue;
                     }
 
-                    // 2 literals
-                    let packed = (lit1 as u16) | ((lit2 as u16) << 8);
+                    // Pack 3 literals and write (u32 is fine, we only need 3 bytes)
+                    let packed = (lit1 as u32) | ((lit2 as u32) << 8) | ((lit3 as u32) << 16);
                     unsafe {
-                        (out_ptr.add(out_pos) as *mut u16).write_unaligned(packed);
+                        (out_ptr.add(out_pos) as *mut u32).write_unaligned(packed);
                     }
-                    out_pos += 2;
+                    out_pos += 3;
+                    // Conditional refill - only if we need more bits
                     if (bitsleft as u8) < 32 {
                         refill_branchless_fast!();
                     }
                     continue;
                 }
 
-                // Single literal
+                // 2 literals - pack into u16
+                let packed = (lit1 as u16) | ((lit2 as u16) << 8);
                 unsafe {
-                    *out_ptr.add(out_pos) = lit1;
+                    (out_ptr.add(out_pos) as *mut u16).write_unaligned(packed);
                 }
-                out_pos += 1;
+                out_pos += 2;
+                // Conditional refill - only if we need more bits
                 if (bitsleft as u8) < 32 {
                     refill_branchless_fast!();
                 }
                 continue;
             }
 
-            #[cfg(not(target_arch = "aarch64"))]
-            {
-                // x86/other: 2-3 literal batching (matches libdeflate exactly)
-                // libdeflate comment: "We could actually do 3, but that actually
-                // decreases performance slightly (perhaps by messing with the
-                // branch prediction of the conditional refill that happens later
-                // while decoding the match offset)."
-                let lit1 = (entry >> 16) as u8;
-                entry = lookup!();
-
-                if (entry as i32) < 0 {
-                    // 1st extra fast literal
-                    let saved_bitbuf2 = bitbuf;
-                    bitbuf >>= entry as u8;
-                    bitsleft = bitsleft.wrapping_sub(entry);
-                    let lit2 = (entry >> 16) as u8;
-                    entry = lookup!();
-                    let _ = saved_bitbuf2; // Mark as intentionally unused
-
-                    unsafe {
-                        *out_ptr.add(out_pos) = lit1;
-                    }
-                    out_pos += 1;
-
-                    if (entry as i32) < 0 {
-                        // 2nd extra fast literal
-                        let saved_bitbuf3 = bitbuf;
-                        bitbuf >>= entry as u8;
-                        bitsleft = bitsleft.wrapping_sub(entry);
-                        let lit3 = (entry >> 16) as u8;
-                        entry = lookup!();
-                        let _ = saved_bitbuf3; // Mark as intentionally unused
-                        refill_branchless_fast!();
-
-                        unsafe {
-                            *out_ptr.add(out_pos) = lit2;
-                        }
-                        out_pos += 1;
-                        unsafe {
-                            *out_ptr.add(out_pos) = lit3;
-                        }
-                        out_pos += 1;
-                        continue;
-                    }
-
-                    // Only 1 extra literal
-                    unsafe {
-                        *out_ptr.add(out_pos) = lit2;
-                    }
-                    out_pos += 1;
-                    // Conditional refill
-                    if (bitsleft as u8) < 32 {
-                        refill_branchless_fast!();
-                    }
-                    continue;
-                }
-
-                // Single literal (primary item)
-                unsafe {
-                    *out_ptr.add(out_pos) = lit1;
-                }
-                out_pos += 1;
-                if (bitsleft as u8) < 32 {
-                    refill_branchless_fast!();
-                }
-                continue;
+            // Single literal
+            unsafe {
+                *out_ptr.add(out_pos) = lit1;
             }
+            out_pos += 1;
+            // Conditional refill - only if we need more bits
+            if (bitsleft as u8) < 32 {
+                refill_branchless_fast!();
+            }
+            continue;
         }
 
         // Not a literal - check EXCEPTIONAL (subtable or EOB)
