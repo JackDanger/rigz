@@ -168,7 +168,7 @@ impl OutputBuffer {
 fn replace_markers_scalar(data: &mut [u16], window: &[u8]) {
     const MARKER_BASE_LOCAL: u16 = 32768;
     for val in data.iter_mut() {
-        if *val > 255 {
+        if *val >= MARKER_BASE_LOCAL {
             let offset = (*val - MARKER_BASE_LOCAL) as usize;
             if offset < window.len() {
                 *val = window[window.len() - 1 - offset] as u16;
@@ -202,19 +202,22 @@ unsafe fn replace_markers_avx2(data: &mut [u16], window: &[u8]) {
         return;
     }
 
-    let threshold = _mm256_set1_epi16(255);
+    // Check if high bit is set (values >= 32768 are markers)
+    // This avoids the signed comparison issue with _mm256_cmpgt_epi16
+    let marker_bit = _mm256_set1_epi16(i16::MIN); // 0x8000
     let mut i = 0;
     let simd_end = data.len().saturating_sub(16);
 
     while i < simd_end {
         let v = _mm256_loadu_si256(data.as_ptr().add(i) as *const __m256i);
-        let mask = _mm256_cmpgt_epi16(v, threshold);
-        let any_markers = _mm256_movemask_epi8(mask);
+        // Check if any value has the high bit set (marker flag)
+        let mask = _mm256_and_si256(v, marker_bit);
+        let any_markers = _mm256_movemask_epi8(_mm256_cmpeq_epi16(mask, marker_bit));
 
         if any_markers != 0 {
             for j in 0..16 {
                 let val = data[i + j];
-                if val > 255 {
+                if val >= MARKER_BASE_LOCAL {
                     let offset = (val - MARKER_BASE_LOCAL) as usize;
                     if offset < window.len() {
                         data[i + j] = window[window.len() - 1 - offset] as u16;
@@ -226,7 +229,7 @@ unsafe fn replace_markers_avx2(data: &mut [u16], window: &[u8]) {
     }
 
     for val in &mut data[i..] {
-        if *val > 255 {
+        if *val >= MARKER_BASE_LOCAL {
             let offset = (*val - MARKER_BASE_LOCAL) as usize;
             if offset < window.len() {
                 *val = window[window.len() - 1 - offset] as u16;
@@ -251,15 +254,16 @@ fn replace_markers_simd(data: &mut [u16], window: &[u8]) {
 
     while i < simd_end {
         unsafe {
-            let threshold = vdupq_n_u16(255);
+            // Check for high bit set (marker flag) using unsigned comparison
+            let marker_threshold = vdupq_n_u16(MARKER_BASE_LOCAL - 1);
             let v = vld1q_u16(data.as_ptr().add(i));
-            let mask = vcgtq_u16(v, threshold);
+            let mask = vcgtq_u16(v, marker_threshold);
             let any_markers = vmaxvq_u16(mask);
 
             if any_markers != 0 {
                 for j in 0..8 {
                     let val = data[i + j];
-                    if val > 255 {
+                    if val >= MARKER_BASE_LOCAL {
                         let offset = (val - MARKER_BASE_LOCAL) as usize;
                         if offset < window.len() {
                             data[i + j] = window[window.len() - 1 - offset] as u16;
@@ -272,7 +276,7 @@ fn replace_markers_simd(data: &mut [u16], window: &[u8]) {
     }
 
     for val in &mut data[i..] {
-        if *val > 255 {
+        if *val >= MARKER_BASE_LOCAL {
             let offset = (*val - MARKER_BASE_LOCAL) as usize;
             if offset < window.len() {
                 *val = window[window.len() - 1 - offset] as u16;
