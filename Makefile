@@ -171,11 +171,248 @@ install: $(GZIPPY_BIN) $(UNGZIPPY_BIN)
 # =============================================================================
 clean:
 	@echo "Cleaning..."
-	@rm -rf $(TEST_DATA_DIR) $(RESULTS_DIR)
+	@rm -rf $(TEST_DATA_DIR) $(RESULTS_DIR) $(BENCH_RESULTS_DIR) $(BENCH_BIN_DIR)
 	@$(MAKE) -C $(PIGZ_DIR) clean >/dev/null 2>&1 || true
 	@$(MAKE) -C $(GZIP_DIR) clean >/dev/null 2>&1 || true
 	@cd $(GZIPPY_DIR) && cargo clean >/dev/null 2>&1
 	@echo "✓ Cleaned"
+
+# =============================================================================
+# Benchmark Data Preparation (matches CI)
+# =============================================================================
+
+BENCHMARK_DIR := ./benchmark_data
+BENCH_RESULTS_DIR := ./benchmark_results
+BENCH_BIN_DIR := ./bench_bin
+THREADS := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+
+# Setup bin directory for multi-tool benchmarks
+bench-bin: $(GZIPPY_BIN) $(PIGZ_BIN) $(IGZIP_BIN)
+	@mkdir -p $(BENCH_BIN_DIR)
+	@cp -f $(GZIPPY_BIN) $(BENCH_BIN_DIR)/
+	@cp -f $(PIGZ_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
+	@cp -f $(PIGZ_DIR)/unpigz $(BENCH_BIN_DIR)/ 2>/dev/null || true
+	@cp -f $(IGZIP_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
+	@cp -f $(RAPIDGZIP_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
+	@cp -f $(ZOPFLI_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
+	@echo "✓ Benchmark binaries ready in $(BENCH_BIN_DIR)/"
+
+# Benchmark data files
+SILESIA_TAR := $(BENCHMARK_DIR)/silesia.tar
+SILESIA_GZ := $(BENCHMARK_DIR)/silesia-gzip.tar.gz
+SOFTWARE := $(BENCHMARK_DIR)/software.archive
+SOFTWARE_GZ := $(BENCHMARK_DIR)/software.archive.gz
+LOGS := $(BENCHMARK_DIR)/logs.txt
+LOGS_GZ := $(BENCHMARK_DIR)/logs.txt.gz
+
+.PHONY: bench-data bench-bin bench-decompress bench-decompress-all bench-compress bench-compress-all
+.PHONY: bench-decompress-silesia bench-decompress-silesia-all
+.PHONY: bench-decompress-software bench-decompress-software-all
+.PHONY: bench-decompress-logs bench-decompress-logs-all
+.PHONY: bench-compress-silesia-l1 bench-compress-silesia-l1-all
+.PHONY: bench-compress-silesia-l6 bench-compress-silesia-l6-all
+.PHONY: bench-compress-silesia-l9 bench-compress-silesia-l9-all
+.PHONY: bench-compress-software-l1 bench-compress-software-l1-all
+.PHONY: bench-compress-software-l6 bench-compress-software-l6-all
+.PHONY: bench-compress-software-l9 bench-compress-software-l9-all
+.PHONY: bench-compress-logs-l1 bench-compress-logs-l1-all
+.PHONY: bench-compress-logs-l6 bench-compress-logs-l6-all
+.PHONY: bench-compress-logs-l9 bench-compress-logs-l9-all
+.PHONY: bench bench-all bench-exhaustive
+
+bench-data:
+	@chmod +x scripts/prepare_benchmark_data.sh
+	./scripts/prepare_benchmark_data.sh all
+
+# =============================================================================
+# DECOMPRESSION BENCHMARKS
+# =============================================================================
+
+# --- Silesia (mixed binary/text) ---
+bench-decompress-silesia: $(GZIPPY_BIN) bench-data
+	@echo "=== Decompression: silesia (gzippy only) ==="
+	RUSTFLAGS="-C target-cpu=native" cargo test --release bench_cf_silesia -- --nocapture
+
+bench-decompress-silesia-all: bench-bin bench-data
+	@mkdir -p $(BENCH_RESULTS_DIR)
+	python3 scripts/benchmark_decompression.py \
+		--binaries $(BENCH_BIN_DIR) --compressed-file $(SILESIA_GZ) --original-file $(SILESIA_TAR) \
+		--threads $(THREADS) --archive-type silesia \
+		--output $(BENCH_RESULTS_DIR)/decompress-silesia.json
+
+# --- Software (source code patterns) ---
+bench-decompress-software: $(GZIPPY_BIN) bench-data
+	@echo "=== Decompression: software (gzippy only) ==="
+	RUSTFLAGS="-C target-cpu=native" cargo test --release bench_cf_software -- --nocapture
+
+bench-decompress-software-all: bench-bin bench-data
+	@mkdir -p $(BENCH_RESULTS_DIR)
+	python3 scripts/benchmark_decompression.py \
+		--binaries $(BENCH_BIN_DIR) --compressed-file $(SOFTWARE_GZ) --original-file $(SOFTWARE) \
+		--threads $(THREADS) --archive-type software \
+		--output $(BENCH_RESULTS_DIR)/decompress-software.json
+
+# --- Logs (repetitive data) ---
+bench-decompress-logs: $(GZIPPY_BIN) bench-data
+	@echo "=== Decompression: logs (gzippy only) ==="
+	RUSTFLAGS="-C target-cpu=native" cargo test --release bench_cf_logs -- --nocapture
+
+bench-decompress-logs-all: bench-bin bench-data
+	@mkdir -p $(BENCH_RESULTS_DIR)
+	python3 scripts/benchmark_decompression.py \
+		--binaries $(BENCH_BIN_DIR) --compressed-file $(LOGS_GZ) --original-file $(LOGS) \
+		--threads $(THREADS) --archive-type logs \
+		--output $(BENCH_RESULTS_DIR)/decompress-logs.json
+
+# --- Combined decompression ---
+bench-decompress: bench-decompress-silesia bench-decompress-software bench-decompress-logs
+
+bench-decompress-all: bench-decompress-silesia-all bench-decompress-software-all bench-decompress-logs-all
+	@echo ""
+	@echo "=== Decompression Results ==="
+	@for f in $(BENCH_RESULTS_DIR)/decompress-*.json; do \
+		[ -f "$$f" ] && echo "--- $$(basename $$f .json) ---" && \
+		python3 -c "import json,sys; d=json.load(open('$$f')); [print(f'  {r[\"tool\"]}: {r.get(\"speed_mbps\",0):.1f} MB/s') for r in d.get('results',[]) if 'error' not in r]" 2>/dev/null || true; \
+	done
+
+# =============================================================================
+# COMPRESSION BENCHMARKS
+# =============================================================================
+
+# --- Silesia L1 (fast) ---
+bench-compress-silesia-l1: $(GZIPPY_BIN) bench-data
+	@echo "=== Compression: silesia L1 (gzippy only) ==="
+	@time sh -c '$(GZIPPY_BIN) -1 -p$(THREADS) -c $(SILESIA_TAR) > /dev/null'
+
+bench-compress-silesia-l1-all: bench-bin bench-data
+	@mkdir -p $(BENCH_RESULTS_DIR)
+	python3 scripts/benchmark_compression.py \
+		--binaries $(BENCH_BIN_DIR) --data-file $(SILESIA_TAR) \
+		--level 1 --threads $(THREADS) --content-type silesia \
+		--output $(BENCH_RESULTS_DIR)/compress-silesia-l1.json
+
+# --- Silesia L6 (default) ---
+bench-compress-silesia-l6: $(GZIPPY_BIN) bench-data
+	@echo "=== Compression: silesia L6 (gzippy only) ==="
+	@time sh -c '$(GZIPPY_BIN) -6 -p$(THREADS) -c $(SILESIA_TAR) > /dev/null'
+
+bench-compress-silesia-l6-all: bench-bin bench-data
+	@mkdir -p $(BENCH_RESULTS_DIR)
+	python3 scripts/benchmark_compression.py \
+		--binaries $(BENCH_BIN_DIR) --data-file $(SILESIA_TAR) \
+		--level 6 --threads $(THREADS) --content-type silesia \
+		--output $(BENCH_RESULTS_DIR)/compress-silesia-l6.json
+
+# --- Silesia L9 (best) ---
+bench-compress-silesia-l9: $(GZIPPY_BIN) bench-data
+	@echo "=== Compression: silesia L9 (gzippy only) ==="
+	@time sh -c '$(GZIPPY_BIN) -9 -p$(THREADS) -c $(SILESIA_TAR) > /dev/null'
+
+bench-compress-silesia-l9-all: bench-bin bench-data
+	@mkdir -p $(BENCH_RESULTS_DIR)
+	python3 scripts/benchmark_compression.py \
+		--binaries $(BENCH_BIN_DIR) --data-file $(SILESIA_TAR) \
+		--level 9 --threads $(THREADS) --content-type silesia \
+		--output $(BENCH_RESULTS_DIR)/compress-silesia-l9.json
+
+# --- Software L1/L6/L9 ---
+bench-compress-software-l1: $(GZIPPY_BIN) bench-data
+	@echo "=== Compression: software L1 (gzippy only) ==="
+	@time sh -c '$(GZIPPY_BIN) -1 -p$(THREADS) -c $(SOFTWARE) > /dev/null'
+
+bench-compress-software-l1-all: bench-bin bench-data
+	@mkdir -p $(BENCH_RESULTS_DIR)
+	python3 scripts/benchmark_compression.py \
+		--binaries $(BENCH_BIN_DIR) --data-file $(SOFTWARE) \
+		--level 1 --threads $(THREADS) --content-type software \
+		--output $(BENCH_RESULTS_DIR)/compress-software-l1.json
+
+bench-compress-software-l6: $(GZIPPY_BIN) bench-data
+	@echo "=== Compression: software L6 (gzippy only) ==="
+	@time sh -c '$(GZIPPY_BIN) -6 -p$(THREADS) -c $(SOFTWARE) > /dev/null'
+
+bench-compress-software-l6-all: bench-bin bench-data
+	@mkdir -p $(BENCH_RESULTS_DIR)
+	python3 scripts/benchmark_compression.py \
+		--binaries $(BENCH_BIN_DIR) --data-file $(SOFTWARE) \
+		--level 6 --threads $(THREADS) --content-type software \
+		--output $(BENCH_RESULTS_DIR)/compress-software-l6.json
+
+bench-compress-software-l9: $(GZIPPY_BIN) bench-data
+	@echo "=== Compression: software L9 (gzippy only) ==="
+	@time sh -c '$(GZIPPY_BIN) -9 -p$(THREADS) -c $(SOFTWARE) > /dev/null'
+
+bench-compress-software-l9-all: bench-bin bench-data
+	@mkdir -p $(BENCH_RESULTS_DIR)
+	python3 scripts/benchmark_compression.py \
+		--binaries $(BENCH_BIN_DIR) --data-file $(SOFTWARE) \
+		--level 9 --threads $(THREADS) --content-type software \
+		--output $(BENCH_RESULTS_DIR)/compress-software-l9.json
+
+# --- Logs L1/L6/L9 ---
+bench-compress-logs-l1: $(GZIPPY_BIN) bench-data
+	@echo "=== Compression: logs L1 (gzippy only) ==="
+	@time sh -c '$(GZIPPY_BIN) -1 -p$(THREADS) -c $(LOGS) > /dev/null'
+
+bench-compress-logs-l1-all: bench-bin bench-data
+	@mkdir -p $(BENCH_RESULTS_DIR)
+	python3 scripts/benchmark_compression.py \
+		--binaries $(BENCH_BIN_DIR) --data-file $(LOGS) \
+		--level 1 --threads $(THREADS) --content-type logs \
+		--output $(BENCH_RESULTS_DIR)/compress-logs-l1.json
+
+bench-compress-logs-l6: $(GZIPPY_BIN) bench-data
+	@echo "=== Compression: logs L6 (gzippy only) ==="
+	@time sh -c '$(GZIPPY_BIN) -6 -p$(THREADS) -c $(LOGS) > /dev/null'
+
+bench-compress-logs-l6-all: bench-bin bench-data
+	@mkdir -p $(BENCH_RESULTS_DIR)
+	python3 scripts/benchmark_compression.py \
+		--binaries $(BENCH_BIN_DIR) --data-file $(LOGS) \
+		--level 6 --threads $(THREADS) --content-type logs \
+		--output $(BENCH_RESULTS_DIR)/compress-logs-l6.json
+
+bench-compress-logs-l9: $(GZIPPY_BIN) bench-data
+	@echo "=== Compression: logs L9 (gzippy only) ==="
+	@time sh -c '$(GZIPPY_BIN) -9 -p$(THREADS) -c $(LOGS) > /dev/null'
+
+bench-compress-logs-l9-all: bench-bin bench-data
+	@mkdir -p $(BENCH_RESULTS_DIR)
+	python3 scripts/benchmark_compression.py \
+		--binaries $(BENCH_BIN_DIR) --data-file $(LOGS) \
+		--level 9 --threads $(THREADS) --content-type logs \
+		--output $(BENCH_RESULTS_DIR)/compress-logs-l9.json
+
+# --- Combined compression ---
+bench-compress: bench-compress-silesia-l6 bench-compress-software-l6 bench-compress-logs-l6
+
+bench-compress-all: \
+	bench-compress-silesia-l1-all bench-compress-silesia-l6-all bench-compress-silesia-l9-all \
+	bench-compress-software-l1-all bench-compress-software-l6-all bench-compress-software-l9-all \
+	bench-compress-logs-l1-all bench-compress-logs-l6-all bench-compress-logs-l9-all
+	@echo ""
+	@echo "=== Compression Results ==="
+	@for f in $(BENCH_RESULTS_DIR)/compress-*.json; do \
+		[ -f "$$f" ] && echo "--- $$(basename $$f .json) ---" && \
+		python3 -c "import json; d=json.load(open('$$f')); [print(f'  {r[\"tool\"]}: {r.get(\"speed_mbps\",0):.1f} MB/s, ratio {r.get(\"ratio\",0):.3f}') for r in d.get('results',[]) if 'error' not in r]" 2>/dev/null || true; \
+	done
+
+# =============================================================================
+# Combined benchmark targets
+# =============================================================================
+
+# Quick: gzippy only, L6, all datasets
+bench: bench-decompress bench-compress
+	@echo ""
+	@echo "=== Quick Benchmark Complete ==="
+
+# Full: all tools, all levels
+bench-all: bench-decompress-all bench-compress-all
+	@echo ""
+	@echo "=== Full Benchmark Complete ==="
+	@echo "Results in $(BENCH_RESULTS_DIR)/"
+
+bench-exhaustive: bench-all
 
 # =============================================================================
 # Help
@@ -192,6 +429,29 @@ help:
 	@echo "  make validate     Run validation suite (adaptive 3-17 trials)"
 	@echo "  make lint         Run rustfmt and clippy (auto-fix)"
 	@echo "  make lint-check   Check formatting without changes"
+	@echo ""
+	@echo "Benchmarks (gzippy only - fast):"
+	@echo "  make bench                       Quick benchmark (L6, all datasets)"
+	@echo "  make bench-decompress-silesia    Decompress silesia"
+	@echo "  make bench-decompress-software   Decompress software"
+	@echo "  make bench-decompress-logs       Decompress logs"
+	@echo "  make bench-compress-silesia-l6   Compress silesia L6"
+	@echo "  make bench-compress-software-l6  Compress software L6"
+	@echo "  make bench-compress-logs-l6      Compress logs L6"
+	@echo ""
+	@echo "Benchmarks (all tools compared - exhaustive):"
+	@echo "  make bench-all                       Full comparison (all tools, all levels)"
+	@echo "  make bench-decompress-all            All decompression (3 datasets)"
+	@echo "  make bench-decompress-silesia-all    Decompress silesia (all tools)"
+	@echo "  make bench-decompress-software-all   Decompress software (all tools)"
+	@echo "  make bench-decompress-logs-all       Decompress logs (all tools)"
+	@echo "  make bench-compress-all              All compression (3 datasets x 3 levels)"
+	@echo "  make bench-compress-silesia-l6-all   Compress silesia L6 (all tools)"
+	@echo "  make bench-compress-software-l6-all  Compress software L6 (all tools)"
+	@echo "  make bench-compress-logs-l6-all      Compress logs L6 (all tools)"
+	@echo ""
+	@echo "Data preparation:"
+	@echo "  make bench-data   Prepare benchmark datasets (silesia, software, logs)"
 	@echo ""
 	@echo "Charting (separate test running from rendering):"
 	@echo "  make validate-json     Run tests, save JSON to test_results/"

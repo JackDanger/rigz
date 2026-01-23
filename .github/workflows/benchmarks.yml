@@ -102,7 +102,7 @@ jobs:
 
   # ============================================================================
   # STAGE 2: Prepare benchmark data
-  # Uses shared script that downloads silesia and generates software/logs
+  # Uses `make bench-data` which downloads silesia and generates software/logs
   # Compressed versions are cached in git; uncompressed regenerated on demand
   # ============================================================================
   prepare-data:
@@ -114,9 +114,7 @@ jobs:
 
       - name: Prepare benchmark data
         run: |
-          chmod +x scripts/prepare_benchmark_data.sh
-          ./scripts/prepare_benchmark_data.sh all
-          echo "=== Benchmark data ready ==="
+          make bench-data
           ls -lh benchmark_data/
 
       - uses: actions/upload-artifact@v4
