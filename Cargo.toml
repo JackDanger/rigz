@@ -18,6 +18,7 @@ default = []
 isal = []  # ISA-L decompression (enabled by build.rs when static lib is built)
 trace = []  # Enable decode tracing instrumentation
 profile = []  # Enable timing profiler (adds overhead, only use for profiling)
+debug_decode = []  # Log decode operations around DEBUG_POS (e.g., DEBUG_POS=124088477)
 
 [dependencies]
 # Compression: flate2 with zlib-ng for maximum performance
