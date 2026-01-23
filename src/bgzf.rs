@@ -7224,4 +7224,593 @@ mod optimization_tests {
         );
         eprintln!("Ratio: Turbo is {:.1}% of libdeflate", ratio);
     }
+
+    /// Diagnostic test for tarball L1 decompression bug
+    /// Creates mixed binary/text data (like a tarball), compresses with level 1,
+    /// then decompresses and shows EXACTLY where first mismatch occurs.
+    #[test]
+    fn test_tarball_l1_diagnostic() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        eprintln!("\n{}", "=".repeat(70));
+        eprintln!("DIAGNOSTIC: Tarball L1 Decompression Test");
+        eprintln!("{}\n", "=".repeat(70));
+
+        // Create tarball-like mixed data: source code + binary + repetitive
+        let mut original = Vec::new();
+
+        // Part 1: Source code patterns (like .rs files)
+        for i in 0..1000 {
+            let line = format!(
+                "    fn function_{}(arg: u32) -> Result<String, Error> {{\n        \
+                 let value = arg * {} + {};\n        Ok(format!(\"result: {{}}\", value))\n    }}\n\n",
+                i,
+                i % 17,
+                i % 31
+            );
+            original.extend_from_slice(line.as_bytes());
+        }
+        eprintln!("Part 1 (source code): {} bytes", original.len());
+
+        // Part 2: Binary-ish data (like .git objects)
+        let binary_start = original.len();
+        for i in 0..50000 {
+            let b = ((i * 0x1234567) ^ (i >> 3)) as u8;
+            original.push(b);
+        }
+        eprintln!(
+            "Part 2 (binary): {} bytes (starts at {})",
+            original.len() - binary_start,
+            binary_start
+        );
+
+        // Part 3: Highly repetitive (triggers RLE)
+        let rle_start = original.len();
+        for _ in 0..10000 {
+            original.extend_from_slice(b"AAAAAAAAAAAAAAAA");
+        }
+        eprintln!(
+            "Part 3 (repetitive): {} bytes (starts at {})",
+            original.len() - rle_start,
+            rle_start
+        );
+
+        // Part 4: More source code
+        let code2_start = original.len();
+        for i in 0..500 {
+            let line = format!(
+                "// Comment line {} with some text\nconst VALUE_{}: u64 = {};\n",
+                i,
+                i,
+                i * 12345
+            );
+            original.extend_from_slice(line.as_bytes());
+        }
+        eprintln!(
+            "Part 4 (more code): {} bytes (starts at {})",
+            original.len() - code2_start,
+            code2_start
+        );
+
+        eprintln!("\nTotal original size: {} bytes", original.len());
+
+        // Compress with level 1 (like gzip -1)
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&original).unwrap();
+        let compressed = encoder.finish().unwrap();
+        eprintln!(
+            "Compressed size: {} bytes (ratio {:.1}%)",
+            compressed.len(),
+            compressed.len() as f64 / original.len() as f64 * 100.0
+        );
+
+        // Parse gzip header to get deflate data
+        // Gzip format: magic(2) + method(1) + flags(1) + mtime(4) + xfl(1) + os(1) = 10 bytes min
+        assert!(compressed[0] == 0x1f && compressed[1] == 0x8b, "Not gzip");
+        let flags = compressed[3];
+        let mut header_size = 10;
+        // FEXTRA
+        if flags & 0x04 != 0 {
+            let xlen = u16::from_le_bytes([compressed[10], compressed[11]]) as usize;
+            header_size = 12 + xlen;
+        }
+        // FNAME (null-terminated)
+        if flags & 0x08 != 0 {
+            while header_size < compressed.len() && compressed[header_size] != 0 {
+                header_size += 1;
+            }
+            header_size += 1;
+        }
+        // FCOMMENT (null-terminated)
+        if flags & 0x10 != 0 {
+            while header_size < compressed.len() && compressed[header_size] != 0 {
+                header_size += 1;
+            }
+            header_size += 1;
+        }
+        // FHCRC
+        if flags & 0x02 != 0 {
+            header_size += 2;
+        }
+        let deflate_data = &compressed[header_size..compressed.len() - 8];
+        eprintln!(
+            "Deflate data: {} bytes (header={}, trailer=8)",
+            deflate_data.len(),
+            header_size
+        );
+
+        // Decompress with our decoder
+        let mut output = vec![0u8; original.len() + 1024];
+        eprintln!("\nDecompressing with consume_first_decode...");
+
+        let result = crate::consume_first_decode::inflate_consume_first(deflate_data, &mut output);
+
+        match result {
+            Ok(decompressed_size) => {
+                eprintln!("Decompression succeeded: {} bytes", decompressed_size);
+
+                if decompressed_size != original.len() {
+                    eprintln!(
+                        "\n*** SIZE MISMATCH: expected {}, got {} ***",
+                        original.len(),
+                        decompressed_size
+                    );
+                }
+
+                // Find first mismatch
+                let check_len = decompressed_size.min(original.len());
+                let mut mismatch_pos = None;
+
+                for i in 0..check_len {
+                    if output[i] != original[i] {
+                        mismatch_pos = Some(i);
+                        break;
+                    }
+                }
+
+                if let Some(pos) = mismatch_pos {
+                    eprintln!("\n{}", "*".repeat(70));
+                    eprintln!("*** FIRST MISMATCH AT POSITION {} ***", pos);
+                    eprintln!("{}", "*".repeat(70));
+
+                    // Determine which section the mismatch is in
+                    let section = if pos < binary_start {
+                        "Part 1 (source code)"
+                    } else if pos < rle_start {
+                        "Part 2 (binary)"
+                    } else if pos < code2_start {
+                        "Part 3 (repetitive)"
+                    } else {
+                        "Part 4 (more code)"
+                    };
+                    eprintln!("Section: {}", section);
+
+                    // Show context around mismatch
+                    let ctx_start = pos.saturating_sub(32);
+                    let ctx_end = (pos + 64).min(check_len);
+
+                    eprintln!("\nExpected bytes around position {}:", pos);
+                    eprintln!("  Offset: {:6} to {:6}", ctx_start, ctx_end);
+                    eprint!("  Hex:   ");
+                    for i in ctx_start..ctx_end {
+                        if i == pos {
+                            eprint!("[{:02x}]", original[i]);
+                        } else {
+                            eprint!(" {:02x} ", original[i]);
+                        }
+                    }
+                    eprintln!();
+                    eprint!("  ASCII: ");
+                    for i in ctx_start..ctx_end {
+                        let c = original[i];
+                        let ch = if (32..127).contains(&c) {
+                            c as char
+                        } else {
+                            '.'
+                        };
+                        if i == pos {
+                            eprint!("[{}]", ch);
+                        } else {
+                            eprint!(" {} ", ch);
+                        }
+                    }
+                    eprintln!();
+
+                    eprintln!("\nActual bytes (our output):");
+                    eprint!("  Hex:   ");
+                    for i in ctx_start..ctx_end {
+                        if i == pos {
+                            eprint!("[{:02x}]", output[i]);
+                        } else {
+                            eprint!(" {:02x} ", output[i]);
+                        }
+                    }
+                    eprintln!();
+                    eprint!("  ASCII: ");
+                    for i in ctx_start..ctx_end {
+                        let c = output[i];
+                        let ch = if (32..127).contains(&c) {
+                            c as char
+                        } else {
+                            '.'
+                        };
+                        if i == pos {
+                            eprint!("[{}]", ch);
+                        } else {
+                            eprint!(" {} ", ch);
+                        }
+                    }
+                    eprintln!();
+
+                    eprintln!(
+                        "\nAt position {}: expected 0x{:02x} ('{}'), got 0x{:02x} ('{}')",
+                        pos,
+                        original[pos],
+                        if original[pos] >= 32 && original[pos] < 127 {
+                            original[pos] as char
+                        } else {
+                            '.'
+                        },
+                        output[pos],
+                        if output[pos] >= 32 && output[pos] < 127 {
+                            output[pos] as char
+                        } else {
+                            '.'
+                        }
+                    );
+
+                    // Count total mismatches
+                    let total_mismatches =
+                        (0..check_len).filter(|&i| output[i] != original[i]).count();
+                    eprintln!(
+                        "\nTotal mismatches: {} out of {} bytes ({:.2}%)",
+                        total_mismatches,
+                        check_len,
+                        total_mismatches as f64 / check_len as f64 * 100.0
+                    );
+
+                    panic!(
+                        "Decompression mismatch at position {} (expected 0x{:02x}, got 0x{:02x})",
+                        pos, original[pos], output[pos]
+                    );
+                } else if decompressed_size == original.len() {
+                    eprintln!("\n*** SUCCESS: Output matches original exactly! ***");
+                } else {
+                    panic!(
+                        "Size mismatch but no byte mismatch in overlap - expected {}, got {}",
+                        original.len(),
+                        decompressed_size
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("\n*** DECOMPRESSION FAILED: {} ***", e);
+                panic!("Decompression failed: {}", e);
+            }
+        }
+    }
+
+    /// Test using actual gzip binary (if available)
+    #[test]
+    fn test_with_system_gzip() {
+        use crate::consume_first_decode::inflate_consume_first;
+        use std::process::Command;
+
+        // Check if gzip is available
+        let gzip_check = Command::new("gzip").arg("--version").output();
+        if gzip_check.is_err() {
+            eprintln!("gzip not available, skipping system gzip test");
+            return;
+        }
+
+        eprintln!("\n{}", "=".repeat(70));
+        eprintln!("Testing with SYSTEM GZIP binary");
+        eprintln!("{}\n", "=".repeat(70));
+
+        // Create tarball-like data
+        let mut original = Vec::new();
+
+        // Mixed content similar to a real tarball
+        for i in 0..500 {
+            let line = format!(
+                "pub fn func_{}(x: i32) -> i32 {{ x * {} + {} }}\n",
+                i,
+                i % 17,
+                i % 31
+            );
+            original.extend_from_slice(line.as_bytes());
+        }
+        // Binary-ish section
+        for i in 0..20000 {
+            original.push(((i * 0x1234567) ^ (i >> 3)) as u8);
+        }
+        // Repetitive section
+        for _ in 0..5000 {
+            original.extend_from_slice(b"REPEATREPEAT");
+        }
+
+        eprintln!("Original data: {} bytes", original.len());
+
+        // Write to temp file
+        let tmp_dir = std::env::temp_dir();
+        let input_path = tmp_dir.join("gzip_test_input.bin");
+        let compressed_path = tmp_dir.join("gzip_test_input.bin.gz");
+
+        std::fs::write(&input_path, &original).expect("Failed to write input");
+
+        // Compress with gzip -1 (fast)
+        let output = Command::new("gzip")
+            .arg("-1")
+            .arg("-f") // force overwrite
+            .arg("-k") // keep original
+            .arg(&input_path)
+            .output()
+            .expect("Failed to run gzip");
+
+        if !output.status.success() {
+            eprintln!("gzip failed: {}", String::from_utf8_lossy(&output.stderr));
+            panic!("gzip compression failed");
+        }
+
+        // Read compressed data
+        let compressed = std::fs::read(&compressed_path).expect("Failed to read compressed file");
+        eprintln!(
+            "Compressed with gzip -1: {} bytes ({:.1}%)",
+            compressed.len(),
+            compressed.len() as f64 / original.len() as f64 * 100.0
+        );
+
+        // Parse gzip header
+        assert!(
+            compressed[0] == 0x1f && compressed[1] == 0x8b,
+            "Not gzip format"
+        );
+        let flags = compressed[3];
+        let mut header_size = 10;
+        if flags & 0x04 != 0 {
+            let xlen = u16::from_le_bytes([compressed[10], compressed[11]]) as usize;
+            header_size = 12 + xlen;
+        }
+        if flags & 0x08 != 0 {
+            while header_size < compressed.len() && compressed[header_size] != 0 {
+                header_size += 1;
+            }
+            header_size += 1;
+        }
+        if flags & 0x10 != 0 {
+            while header_size < compressed.len() && compressed[header_size] != 0 {
+                header_size += 1;
+            }
+            header_size += 1;
+        }
+        if flags & 0x02 != 0 {
+            header_size += 2;
+        }
+        let deflate_data = &compressed[header_size..compressed.len() - 8];
+        eprintln!("Deflate data: {} bytes", deflate_data.len());
+
+        // Decompress
+        let mut output_buf = vec![0u8; original.len() + 1024];
+        eprintln!("Decompressing...");
+
+        let result = inflate_consume_first(deflate_data, &mut output_buf);
+
+        // Cleanup
+        let _ = std::fs::remove_file(&input_path);
+        let _ = std::fs::remove_file(&compressed_path);
+
+        match result {
+            Ok(size) => {
+                eprintln!("Decompressed: {} bytes", size);
+
+                if size != original.len() {
+                    panic!("Size mismatch: expected {}, got {}", original.len(), size);
+                }
+
+                for i in 0..original.len() {
+                    if output_buf[i] != original[i] {
+                        eprintln!("\n{}", "*".repeat(70));
+                        eprintln!("MISMATCH at position {}", i);
+                        eprintln!("{}", "*".repeat(70));
+
+                        let start = i.saturating_sub(32);
+                        let end = (i + 64).min(original.len());
+
+                        eprintln!("\nExpected around {}:", i);
+                        eprint!("  ");
+                        for j in start..end {
+                            if j == i {
+                                eprint!("[{:02x}]", original[j]);
+                            } else {
+                                eprint!("{:02x} ", original[j]);
+                            }
+                        }
+                        eprintln!();
+
+                        eprintln!("\nGot:");
+                        eprint!("  ");
+                        for j in start..end {
+                            if j == i {
+                                eprint!("[{:02x}]", output_buf[j]);
+                            } else {
+                                eprint!("{:02x} ", output_buf[j]);
+                            }
+                        }
+                        eprintln!();
+
+                        panic!(
+                            "Mismatch at {}: expected 0x{:02x}, got 0x{:02x}",
+                            i, original[i], output_buf[i]
+                        );
+                    }
+                }
+                eprintln!("\n*** SUCCESS: Output matches original ***");
+            }
+            Err(e) => {
+                panic!("Decompression failed: {}", e);
+            }
+        }
+    }
+
+    /// Test copy_match_fast edge cases that might differ on x86_64
+    #[test]
+    fn test_copy_match_edge_cases() {
+        use crate::consume_first_decode::inflate_consume_first;
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        // Test cases designed to exercise copy_match_fast edge cases:
+        // 1. dist >= 32 && len >= 64 (SIMD path on ARM, scalar on x86_64)
+        // 2. dist >= 8 (5-word unroll path)
+        // 3. dist == 1 (RLE path)
+        // 4. dist 2-7 (small distance path)
+
+        let test_cases: Vec<(&str, Vec<u8>)> = vec![
+            // Case 1: Large distance, large length (SIMD path)
+            ("large_dist_len", {
+                let mut data = vec![0u8; 10000];
+                // Write pattern at start
+                for i in 0..100 {
+                    data[i] = (i * 7) as u8;
+                }
+                // Reference it from far away (distance > 32, length > 64)
+                for i in 5000..5100 {
+                    data[i] = data[i - 4900]; // Will compress as match
+                }
+                data
+            }),
+            // Case 2: Medium distance (dist >= 8)
+            ("medium_dist", {
+                let mut data = vec![0u8; 1000];
+                for i in 0..100 {
+                    data[i] = (i * 3) as u8;
+                }
+                for i in 110..210 {
+                    data[i] = data[i - 10]; // distance = 10
+                }
+                data
+            }),
+            // Case 3: RLE (dist == 1)
+            ("rle_pattern", {
+                let mut data = Vec::new();
+                data.extend_from_slice(b"Hello");
+                data.extend(vec![b'A'; 1000]); // RLE
+                data.extend_from_slice(b"World");
+                data.extend(vec![b'B'; 500]); // More RLE
+                data
+            }),
+            // Case 4: Small distance (2-7)
+            ("small_dist", {
+                let mut data = Vec::new();
+                data.extend_from_slice(b"ABCDEFGH"); // 8 bytes
+                                                     // Repeat with distance 3 (will use small distance path)
+                for _ in 0..100 {
+                    data.extend_from_slice(b"ABC");
+                }
+                data
+            }),
+            // Case 5: Very long RLE
+            ("long_rle", {
+                let data = vec![0x42u8; 100_000]; // 100KB of 'B'
+                data
+            }),
+            // Case 6: Alternating patterns
+            ("alternating", {
+                let mut data = Vec::new();
+                for i in 0..10000 {
+                    data.push(if i % 2 == 0 { 0xAA } else { 0x55 });
+                }
+                data
+            }),
+            // Case 7: Binary data with matches at various distances
+            ("binary_matches", {
+                let mut data = vec![0u8; 50000];
+                // Write unique pattern every 100 bytes
+                for i in 0..500 {
+                    let base = i * 100;
+                    for j in 0..50 {
+                        data[base + j] = ((i * 7 + j * 13) & 0xFF) as u8;
+                    }
+                }
+                // Now create matches at various distances
+                for i in 0..200 {
+                    let src = (i * 50) % 25000;
+                    let dst = 25000 + i * 100;
+                    for j in 0..50 {
+                        if dst + j < data.len() {
+                            data[dst + j] = data[src + j];
+                        }
+                    }
+                }
+                data
+            }),
+        ];
+
+        for (name, original) in test_cases {
+            eprintln!("\n--- Testing: {} ({} bytes) ---", name, original.len());
+
+            // Compress with level 1
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+            encoder.write_all(&original).unwrap();
+            let compressed = encoder.finish().unwrap();
+
+            eprintln!(
+                "  Compressed: {} bytes ({:.1}%)",
+                compressed.len(),
+                compressed.len() as f64 / original.len() as f64 * 100.0
+            );
+
+            // Parse gzip header
+            assert!(compressed[0] == 0x1f && compressed[1] == 0x8b);
+            let flags = compressed[3];
+            let mut header_size = 10;
+            if flags & 0x04 != 0 {
+                let xlen = u16::from_le_bytes([compressed[10], compressed[11]]) as usize;
+                header_size = 12 + xlen;
+            }
+            if flags & 0x08 != 0 {
+                while header_size < compressed.len() && compressed[header_size] != 0 {
+                    header_size += 1;
+                }
+                header_size += 1;
+            }
+            if flags & 0x10 != 0 {
+                while header_size < compressed.len() && compressed[header_size] != 0 {
+                    header_size += 1;
+                }
+                header_size += 1;
+            }
+            if flags & 0x02 != 0 {
+                header_size += 2;
+            }
+            let deflate_data = &compressed[header_size..compressed.len() - 8];
+
+            // Decompress
+            let mut output = vec![0u8; original.len() + 1024];
+            let size = inflate_consume_first(deflate_data, &mut output)
+                .unwrap_or_else(|e| panic!("Decompression failed for {}: {}", name, e));
+
+            // Compare
+            assert_eq!(size, original.len(), "{}: size mismatch", name);
+
+            for i in 0..original.len() {
+                if output[i] != original[i] {
+                    eprintln!(
+                        "  MISMATCH at {}: expected 0x{:02x}, got 0x{:02x}",
+                        i, original[i], output[i]
+                    );
+                    // Show context
+                    let start = i.saturating_sub(16);
+                    let end = (i + 16).min(original.len());
+                    eprintln!("  Expected: {:?}", &original[start..end]);
+                    eprintln!("  Got:      {:?}", &output[start..end]);
+                    panic!("{}: mismatch at position {}", name, i);
+                }
+            }
+            eprintln!("  OK!");
+        }
+    }
 }

@@ -46,7 +46,8 @@
       "Bash(python3:*)",
       "Bash(__NEW_LINE_1c96999828663da3__ echo \"\")",
       "Bash(__NEW_LINE_74ae511e8e05472e__ echo \"\")",
-      "Bash(__NEW_LINE_cead8ab77c9dfcc2__ echo \"\")"
+      "Bash(__NEW_LINE_cead8ab77c9dfcc2__ echo \"\")",
+      "Bash(gh pr list:*)"
     ]
   }
 }
