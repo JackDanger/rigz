@@ -346,32 +346,7 @@ fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32
         }
 
         if dist >= 32 && len >= 64 {
-            // SIMD fast path: use AVX2 32-byte copies for large non-overlapping matches
-            #[cfg(target_arch = "x86_64")]
-            {
-                // Copy 64 bytes at a time using AVX2
-                while dst.add(64) <= end {
-                    let v0 = _mm256_loadu_si256(src as *const __m256i);
-                    let v1 = _mm256_loadu_si256(src.add(32) as *const __m256i);
-                    _mm256_storeu_si256(dst as *mut __m256i, v0);
-                    _mm256_storeu_si256(dst.add(32) as *mut __m256i, v1);
-                    src = src.add(64);
-                    dst = dst.add(64);
-                }
-                // Copy 32 bytes at a time
-                while dst.add(32) <= end {
-                    let v = _mm256_loadu_si256(src as *const __m256i);
-                    _mm256_storeu_si256(dst as *mut __m256i, v);
-                    src = src.add(32);
-                    dst = dst.add(32);
-                }
-                // Handle remainder with 8-byte copies
-                while dst < end {
-                    (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
-                    src = src.add(8);
-                    dst = dst.add(8);
-                }
-            }
+            // SIMD fast path for large non-overlapping matches
             #[cfg(target_arch = "aarch64")]
             {
                 // NEON fast path: 32-byte copies using two 16-byte registers
@@ -397,9 +372,11 @@ fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32
                     dst = dst.add(8);
                 }
             }
-            #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+            #[cfg(not(target_arch = "aarch64"))]
             {
-                // Scalar fallback
+                // Scalar fallback for x86_64 and other architectures
+                // Note: AVX2 path removed because it requires #[target_feature] annotation
+                // and runtime detection - using scalar path for safety
                 while dst < end {
                     (dst as *mut u64).write_unaligned((src as *const u64).read_unaligned());
                     src = src.add(8);
@@ -434,22 +411,8 @@ fn copy_match_fast(output: &mut [u8], out_pos: usize, distance: u32, length: u32
         } else if dist == 1 {
             // RLE path: use SIMD broadcast for large fills
             let byte = *src;
-            #[cfg(target_arch = "x86_64")]
-            {
-                if len >= 64 {
-                    // Use AVX2 broadcast for large RLE
-                    let pattern = _mm256_set1_epi8(byte as i8);
-                    while dst.add(64) <= end {
-                        _mm256_storeu_si256(dst as *mut __m256i, pattern);
-                        _mm256_storeu_si256(dst.add(32) as *mut __m256i, pattern);
-                        dst = dst.add(64);
-                    }
-                    while dst.add(32) <= end {
-                        _mm256_storeu_si256(dst as *mut __m256i, pattern);
-                        dst = dst.add(32);
-                    }
-                }
-            }
+            // Note: x86_64 AVX2 path removed - requires #[target_feature(enable="avx2")]
+            // and proper runtime detection. Using scalar path for safety.
             #[cfg(target_arch = "aarch64")]
             {
                 if len >= 32 {
