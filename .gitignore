@@ -35,3 +35,6 @@ perf.data*
 # Python cache
 __pycache__/
 *.pyc
+
+# Local settings
+.claude
