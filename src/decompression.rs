@@ -437,8 +437,13 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
         .unwrap_or(4);
 
     if !is_likely_multi_member(data) {
-        // Single-member: use our turbo inflate (optimized pure Rust)
-        // No fallback to libdeflate - we want to see errors
+        // Single-member: use our optimized sequential decode
+        // Our turbo inflate (pure Rust) is at 90%+ of libdeflate speed
+        //
+        // NOTE: Parallel single-member decode requires a fast speculative decoder
+        // that can match our sequential speed. The current rapidgzip_decoder uses
+        // a slow SpeculativeDecoder (~70 MB/s vs 700+ MB/s sequential).
+        // Until we have a fast parallel implementation, sequential is faster.
         if std::env::var("GZIPPY_DEBUG").is_ok() {
             eprintln!("[gzippy] Single-member: turbo inflate (pure Rust)");
         }

@@ -385,6 +385,8 @@ pub fn decompress_hyper_parallel<W: io::Write>(
     let mut full_output = vec![0u8; isize];
 
     // Use our turbo inflate (pure Rust with Phase 1 optimizations)
+    // NOTE: This returns immediately with sequential result. True parallel
+    // requires implementing the two-pass approach from bgzf.rs
     match crate::bgzf::inflate_into_pub(deflate_data, &mut full_output) {
         Ok(size) => {
             writer.write_all(&full_output[..size])?;
