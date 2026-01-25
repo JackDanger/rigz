@@ -160,64 +160,20 @@ pub fn reset_cache_stats() {
 /// Extract low n bits from a value using BMI2 BZHI when available
 /// On x86_64 with BMI2, this compiles to a single `bzhi` instruction
 /// Elsewhere, uses branchless mask computation
-/// BMI2-enabled bzhi - SAFETY: caller must verify BMI2 is available
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "bmi2")]
-#[inline]
-unsafe fn bzhi_u64_bmi2(x: u64, n: u32) -> u64 {
-    std::arch::x86_64::_bzhi_u64(x, n)
-}
-
-/// Fallback bzhi implementation
-#[inline(always)]
-fn bzhi_u64_fallback(x: u64, n: u32) -> u64 {
-    // Branchless: compute mask and apply
-    // For n=0, mask = 0; for n=63, mask = 0x7FFF_FFFF_FFFF_FFFF
-    let mask = (1u64 << (n & 63)).wrapping_sub(1);
-    x & mask
-}
-
-/// Check if BMI2 is available (cached for performance)
-#[cfg(target_arch = "x86_64")]
-fn has_bmi2() -> bool {
-    use std::sync::atomic::{AtomicU8, Ordering};
-    static CACHED: AtomicU8 = AtomicU8::new(0); // 0 = unknown, 1 = no, 2 = yes
-
-    match CACHED.load(Ordering::Relaxed) {
-        2 => true,
-        1 => false,
-        _ => {
-            let result = is_x86_feature_detected!("bmi2");
-            CACHED.store(if result { 2 } else { 1 }, Ordering::Relaxed);
-            result
-        }
-    }
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn has_bmi2() -> bool {
-    false
-}
-
 #[inline(always)]
 fn bzhi_u64(x: u64, n: u32) -> u64 {
     #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
     {
-        // Compile-time BMI2 enabled
-        unsafe { bzhi_u64_bmi2(x, n) }
+        use std::arch::x86_64::_bzhi_u64;
+        // BMI2 bzhi instruction - single cycle bit extraction
+        unsafe { _bzhi_u64(x, n) }
     }
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "bmi2")))]
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
     {
-        // Runtime detection for x86_64 without compile-time BMI2
-        if has_bmi2() {
-            unsafe { bzhi_u64_bmi2(x, n) }
-        } else {
-            bzhi_u64_fallback(x, n)
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    {
-        bzhi_u64_fallback(x, n)
+        // Branchless: compute mask and apply
+        // For n=0, mask = 0; for n=63, mask = 0x7FFF_FFFF_FFFF_FFFF
+        let mask = (1u64 << (n & 63)).wrapping_sub(1);
+        x & mask
     }
 }
 
