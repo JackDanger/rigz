@@ -94,15 +94,20 @@ Status: Near parity, high variance due to 35W TDP thermal throttling
 
 ### BREAKTHROUGH: marker_turbo.rs (Jan 2026)
 
-**Fast Marker-Based Decoder**: 1132 MB/s (16x faster than old 70 MB/s MarkerDecoder!)
+**Fast Marker-Based Decoder**: 2129 MB/s (30x faster than old 70 MB/s MarkerDecoder!)
 
 The key insight: reuse the fast Bits struct from consume_first_decode but output
 to u16 buffer with markers for unresolved back-references.
 
+**Now fully integrated:**
+- `inflate_with_markers_at()` - Start at any bit position for parallel chunks
+- `hyper_parallel.rs` - Uses marker_turbo for speculative parallel decode
+- `hyperion.rs` - Routes large single-member files (>8MB) to hyper_parallel
+
 **Parallel potential:**
-- 8 threads × 1132 MB/s = 9056 MB/s theoretical
+- 8 threads × 2129 MB/s = 17032 MB/s theoretical
 - vs 1400 MB/s single-thread turbo_inflate
-- **6.5x parallel speedup potential!**
+- **12x parallel speedup potential!**
 
 ### Why rapidgzip Wins on SILESIA
 
@@ -225,7 +230,8 @@ Update this file with what you tried and the result.
 |------|---------|----------|
 | `src/consume_first_decode.rs` | Current best decoder | ⭐⭐⭐⭐⭐ |
 | `src/hyperion.rs` | Unified routing entrypoint | ⭐⭐⭐⭐⭐ |
-| `src/marker_turbo.rs` | Fast parallel marker decoder (1132 MB/s!) | ⭐⭐⭐⭐⭐ |
+| `src/marker_turbo.rs` | Fast parallel marker decoder (2129 MB/s!) | ⭐⭐⭐⭐⭐ |
+| `src/hyper_parallel.rs` | Parallel single-member via marker_turbo | ⭐⭐⭐⭐ |
 | `src/libdeflate_entry.rs` | Entry format definitions | ⭐⭐⭐⭐ |
 | `src/unified_table.rs` | Novel unified approach | ⭐⭐⭐ |
 | `libdeflate/lib/decompress_template.h` | libdeflate's implementation | ⭐⭐⭐⭐⭐ |
