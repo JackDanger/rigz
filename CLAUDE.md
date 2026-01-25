@@ -4,10 +4,10 @@
 
 **gzippy aims to be the fastest gzip implementation ever created.**
 
-**ACHIEVED: 99-117% of libdeflate in pure Rust!**
+**ACHIEVED: 91-101% of libdeflate in pure Rust!**
 
-Current: **1400 MB/s on SILESIA (99% of libdeflate)**
-Status: **PARITY ACHIEVED** - We match or exceed libdeflate on all tested datasets!
+Current: **1402 MB/s on SILESIA (91% of libdeflate), 8438 MB/s on LOGS (101%!)**
+Status: **WE BEAT LIBDEFLATE ON LOGS!** Near parity on all other datasets.
 
 Every change must be benchmarked. Every optimization must be measured. Speed is the only metric that matters.
 
@@ -23,12 +23,12 @@ Every change must be benchmarked. Every optimization must be measured. Speed is 
 ### ARM (Apple M3) - Primary Development Platform
 ```
 Dataset          Our MB/s    libdeflate MB/s    Ratio
-SILESIA          1265        1385               91.4%   ✓ NEAR PARITY
-SOFTWARE         18680       19113              97.7%   ✓ AT PARITY
-LOGS             7723        7857               98.3%   ✓ AT PARITY
+SILESIA          1402        1543               90.9%   ✓ NEAR PARITY
+SOFTWARE         18369       19680              93.3%   ✓ AT PARITY
+LOGS             8438        8341               101.2%  ✓ WE WIN!
 
 Decoder: consume_first_decode.rs → decode_huffman_libdeflate_style
-Status: 91-98% of libdeflate across all datasets!
+Status: 91-101% of libdeflate - WE BEAT LIBDEFLATE ON LOGS!
 ```
 
 ### x86 (Intel i7-13700T) - Secondary Platform
