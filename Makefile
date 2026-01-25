@@ -4,11 +4,12 @@
 # Quick tests (<30s) run with 'make' or 'make quick' - for AI tools and iteration
 # Full perf tests (10+ min) run with 'make perf-full' - for humans at release time
 
-# Build configuration - submodules are in ./gzip, ./pigz, ./isa-l, ./zopfli, and ./rapidgzip
+# Build configuration - submodules are in ./gzip, ./pigz, ./isa-l, ./zopfli, ./libdeflate, and ./rapidgzip
 GZIP_DIR := ./gzip
 PIGZ_DIR := ./pigz
 ISAL_DIR := ./isa-l
 ZOPFLI_DIR := ./zopfli
+LIBDEFLATE_DIR := ./libdeflate
 RAPIDGZIP_DIR := ./rapidgzip
 GZIPPY_DIR := .
 TEST_DATA_DIR := test_data
@@ -20,6 +21,7 @@ UNGZIPPY_BIN := $(GZIPPY_DIR)/target/release/ungzippy
 PIGZ_BIN := $(PIGZ_DIR)/pigz
 IGZIP_BIN := $(ISAL_DIR)/build/igzip
 ZOPFLI_BIN := $(ZOPFLI_DIR)/zopfli
+LIBDEFLATE_BIN := $(LIBDEFLATE_DIR)/build/programs/libdeflate-gzip
 RAPIDGZIP_BIN := $(RAPIDGZIP_DIR)/librapidarchive/build/src/tools/rapidgzip
 
 # Prefer local gzip build, fall back to system gzip
@@ -39,10 +41,10 @@ all: quick
 
 build: $(GZIPPY_BIN) $(UNGZIPPY_BIN)
 
-deps: $(PIGZ_BIN) $(IGZIP_BIN) $(ZOPFLI_BIN) $(RAPIDGZIP_BIN)
+deps: $(PIGZ_BIN) $(IGZIP_BIN) $(ZOPFLI_BIN) $(LIBDEFLATE_BIN) $(RAPIDGZIP_BIN)
 	@# Try to build gzip, but don't fail if it doesn't work
 	@$(MAKE) $(GZIP_DIR)/gzip 2>/dev/null || true
-	@echo "✓ Dependencies ready (gzip, pigz, igzip, zopfli, rapidgzip)"
+	@echo "✓ Dependencies ready (gzip, pigz, igzip, zopfli, libdeflate, rapidgzip)"
 
 $(GZIP_DIR)/gzip:
 	@echo "Building gzip from source..."
@@ -71,6 +73,12 @@ $(ZOPFLI_BIN):
 	@echo "Building zopfli from source..."
 	@$(MAKE) -C $(ZOPFLI_DIR) zopfli 2>&1 | grep -E "(cc|g\+\+|error)" || true
 	@echo "✓ Built zopfli"
+
+$(LIBDEFLATE_BIN):
+	@echo "Building libdeflate from source..."
+	@mkdir -p $(LIBDEFLATE_DIR)/build
+	@cd $(LIBDEFLATE_DIR)/build && cmake .. >/dev/null 2>&1 && make -j4 2>&1 | grep -E "(Built|Linking|error)" || true
+	@echo "✓ Built libdeflate"
 
 $(RAPIDGZIP_BIN):
 	@echo "Building rapidgzip from source..."
@@ -187,13 +195,14 @@ BENCH_BIN_DIR := ./bench_bin
 THREADS := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 
 # Setup bin directory for multi-tool benchmarks
-bench-bin: $(GZIPPY_BIN) $(PIGZ_BIN) $(IGZIP_BIN)
+bench-bin: $(GZIPPY_BIN) $(PIGZ_BIN) $(IGZIP_BIN) $(LIBDEFLATE_BIN)
 	@mkdir -p $(BENCH_BIN_DIR)
 	@cp -f $(GZIPPY_BIN) $(BENCH_BIN_DIR)/
 	@cp -f $(PIGZ_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
 	@cp -f $(PIGZ_DIR)/unpigz $(BENCH_BIN_DIR)/ 2>/dev/null || true
 	@cp -f $(IGZIP_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
 	@cp -f $(RAPIDGZIP_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
+	@cp -f $(LIBDEFLATE_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
 	@cp -f $(ZOPFLI_BIN) $(BENCH_BIN_DIR)/ 2>/dev/null || true
 	@echo "✓ Benchmark binaries ready in $(BENCH_BIN_DIR)/"
 
