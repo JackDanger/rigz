@@ -225,6 +225,22 @@ src += WORDBYTES; dst += WORDBYTES;
 
 ## Action Items (Priority Order)
 
+### HIGHEST Priority: INTEGRATE EXISTING MULTI-SYMBOL CODE
+
+**CRITICAL FINDING:** We already have `src/multi_symbol.rs` with:
+- `MultiSymbolLUT::build()` that creates double-literal entries
+- `upgrade_to_double_literals()` that packs literal pairs during table build
+- Working tests proving correctness
+
+**BUT IT IS NOT INTEGRATED INTO THE HOT PATH!**
+
+The integration path:
+1. Replace `LitLenTable` with `MultiSymbolLUT` in `consume_first_decode.rs`
+2. Add multi-symbol decode path to `decode_huffman_libdeflate_style()`
+3. Benchmark on SILESIA
+
+**Expected improvement:** 10-20% on literal-heavy data (SILESIA is 60%+ literals)
+
 ### HIGH Priority
 
 1. **Runtime AVX2 Detection for Match Copy**
@@ -232,10 +248,9 @@ src += WORDBYTES; dst += WORDBYTES;
    - Add `#[target_feature(enable = "avx2")]` functions
    - ~5% improvement expected on x86_64
 
-2. **Investigate ISA-L Multi-Symbol Integration**
-   - Study how ISA-L builds multi-symbol entries during table construction
-   - Prototype in `LitLenTable::build()`
-   - This could close the 9% gap on SILESIA
+2. **Investigate Why multi_symbol.rs Was Never Integrated**
+   - Check git history for previous integration attempts
+   - May have been blocked by build cost (now amortized into table build)
 
 ### MEDIUM Priority
 
