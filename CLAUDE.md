@@ -252,3 +252,56 @@ cargo fmt
 - **The 130% target is partially achieved** - SOFTWARE and LOGS exceed it!
 - **Simpler is often faster** - Specialized decoder was SLOWER than libdeflate-style
 - **Measure, measure, measure** - The specialized path regression was unexpected
+
+---
+
+## HYPERION: Next-Generation Implementation Plan
+
+See `docs/HYPERION_IMPLEMENTATION_PLAN.md` for the full LLM-friendly implementation guide.
+
+### Summary of 55+ Commit History Analysis
+
+**What ALWAYS Works:**
+1. Copy libdeflate's algorithm exactly, then optimize
+2. Benchmark before AND after every change
+3. Revert immediately if performance drops
+4. Keep the hot path simple (nested conditionals kill performance)
+
+**What NEVER Works:**
+1. JIT compilation (compile time > decode time)
+2. Statistical prediction (prediction overhead > benefit)
+3. Per-block table building (build cost > decode gain)
+4. Replacing table lookups with computation (L1 cache beats compute)
+
+**The Parallel Single-Member Blocker:**
+The speculative decoder runs at ~70 MB/s while turbo_inflate runs at ~1400 MB/s.
+For 8-thread parallel to beat sequential:
+```
+speculative_speed × 8 > 1400 MB/s
+speculative_speed > 175 MB/s (currently 70, need 2.5x improvement)
+```
+
+**Solution:** Create `turbo_inflate_with_markers` that reuses the consume_first_decode
+hot path but outputs to u16 buffer with markers. This should achieve 500+ MB/s,
+making parallel worthwhile.
+
+### Disconnected Advanced Modules (Ready to Integrate)
+
+| Module | Status | Next Step |
+|--------|--------|-----------|
+| `algebraic_decode.rs` | 1.52x faster isolated | Integrate for fixed Huffman |
+| `simd_parallel_decode.rs` | Infrastructure ready | Add AVX2 gather/scatter |
+| `unified_table.rs` | Exists | Benchmark vs separate tables |
+| `vector_huffman.rs` | 8-lane ready | Wire into decode loop |
+| `hyper_parallel.rs` | Broken | Fix marker bugs |
+| `marker_decode.rs` | Works | Needs fast speculative decoder |
+
+### The HYPERION Goal
+
+```
+Beat EVERY tool on EVERY dataset at EVERY thread count.
+
+SILESIA:  1 thread → 1500 MB/s,  8 threads → 5000 MB/s
+SOFTWARE: 1 thread → 25000 MB/s, 8 threads → 50000 MB/s
+LOGS:     1 thread → 10000 MB/s, 8 threads → 20000 MB/s
+```
