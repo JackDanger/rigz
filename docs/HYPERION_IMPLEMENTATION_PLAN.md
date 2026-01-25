@@ -324,6 +324,37 @@ Only integrate if measurably faster on SILESIA. Otherwise, document and move on.
 
 ---
 
+## Premortem: Top Failure Modes & Remediations
+
+| # | What Goes Wrong | Historical Evidence | One-Line Remediation |
+|---|-----------------|---------------------|----------------------|
+| 1 | **Optimization that benchmarks fast in isolation is slow when integrated** | consume_first was 36% faster isolated, slower in full loop | Always benchmark on SILESIA after integration, not just isolated tests |
+| 2 | **Parallel path produces wrong output at chunk boundaries** | hyper_parallel output differed at 4.1MB (CHUNK_SIZE) | Run `diff <(gzippy -d) <(gzip -d)` after every parallel change |
+| 3 | **New module breaks existing passing tests** | Multiple reverts in history due to test failures | Run `cargo test --release` before AND after every commit |
+| 4 | **Performance regresses without noticing** | Specialized decoder was 20% slower but shipped | Commit message MUST include benchmark numbers vs baseline |
+| 5 | **LLM changes too many things at once, can't isolate failure** | Several "big bang" commits that needed reversion | ONE change per commit; if >50 lines changed, split it |
+| 6 | **Fast speculative decoder still 10x slower than turbo** | SpeculativeDecoder at 70 MB/s vs 1400 MB/s | Reuse consume_first_decode hot path directly, don't rewrite |
+| 7 | **Advanced math module (ANF/FSM) has subtle correctness bugs** | No evidence yet but high complexity risk | Golden test: decode 10 diverse files, compare byte-for-byte |
+| 8 | **SIMD code works on dev machine, fails on CI (different CPU)** | Multiple CI failures from target-cpu=native | Never use target-cpu=native; test on both ARM and x86 |
+| 9 | **L1 cache pressure from larger tables kills performance** | 12-bit table was same speed as 11-bit (cache pressure) | Profile cache misses before adding larger lookup tables |
+| 10 | **Marker replacement corrupts output for large back-references** | Signed comparison bug in replace_markers_avx2 (`26f54c3`) | Use u32 for all marker math; add fuzzer for edge cases |
+
+### Quick Reference: Emergency Recovery
+
+```bash
+# If tests fail after changes:
+git stash && cargo test --release && git stash pop  # Verify it was your change
+
+# If performance dropped:
+git log --oneline -5  # Find last known-good
+git checkout <sha> -- src/  # Restore source, keep docs
+
+# If completely lost:
+git checkout main && git checkout -b hyperion-attempt-N
+```
+
+---
+
 ## Guardrails for LLM Implementation
 
 ### When Starting Any Task
