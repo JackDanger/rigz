@@ -82,6 +82,41 @@ Status: Near parity, high variance due to 35W TDP thermal throttling
 
 **KEY LESSON: Micro-optimizations often REGRESS. LLVM already optimizes well.**
 
+## Multi-Threaded Decompression Status (Jan 2026)
+
+### Benchmark Results vs rapidgzip (M3, 14 threads)
+
+| Dataset | gzippy | rapidgzip | Ratio | Status |
+|---------|--------|-----------|-------|--------|
+| **LOGS** | 1749 MB/s | 691 MB/s | **253%** | ✓ WE WIN by 2.5x |
+| **SOFTWARE** | 2659 MB/s | 3065 MB/s | 87% | Close |
+| **SILESIA** | 856 MB/s | 2464 MB/s | 35% | ✗ Need parallel |
+
+### Why rapidgzip Wins on SILESIA
+
+rapidgzip uses **parallel single-member decompression**:
+1. Find deflate block boundaries speculatively
+2. Decode each block with markers for unresolved back-references
+3. Propagate windows between chunks
+4. Resolve markers in parallel
+
+We have the infrastructure (`rapidgzip_decoder.rs`, `hyper_parallel.rs`, `marker_decode.rs`)
+but it's **10x slower** than our sequential turbo inflate:
+- `SpeculativeDecoder`: ~70 MB/s
+- `inflate_into_pub`: ~1300 MB/s
+
+### Blocker for Parallel Single-Member
+
+The speculative decoder must match our sequential speed to be worthwhile.
+Two-pass decode (sequential boundary finding + parallel re-decode) only helps
+if the second pass is >2x faster than sequential.
+
+### What Works for Parallel
+
+- **BGZF files** (gzippy output): Full parallel via embedded block sizes
+- **Multi-member gzip** (pigz output): Parallel per-member
+- **Highly-compressible data** (LOGS, SOFTWARE): Our sequential is already 2.5x faster
+
 ## What MIGHT Work (Untried or Partially Tried)
 
 ### Tier 1: High Probability (Try These First)
