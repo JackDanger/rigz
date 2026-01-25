@@ -35,6 +35,7 @@ mod libdeflate_decode;
 mod libdeflate_entry;
 mod libdeflate_ext;
 mod marker_decode;
+mod marker_turbo;
 mod multi_symbol;
 mod optimization;
 mod packed_lut;
