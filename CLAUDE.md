@@ -92,6 +92,18 @@ Status: Near parity, high variance due to 35W TDP thermal throttling
 | **SOFTWARE** | 2659 MB/s | 3065 MB/s | 87% | Close |
 | **SILESIA** | 856 MB/s | 2464 MB/s | 35% | ✗ Need parallel |
 
+### BREAKTHROUGH: marker_turbo.rs (Jan 2026)
+
+**Fast Marker-Based Decoder**: 1132 MB/s (16x faster than old 70 MB/s MarkerDecoder!)
+
+The key insight: reuse the fast Bits struct from consume_first_decode but output
+to u16 buffer with markers for unresolved back-references.
+
+**Parallel potential:**
+- 8 threads × 1132 MB/s = 9056 MB/s theoretical
+- vs 1400 MB/s single-thread turbo_inflate
+- **6.5x parallel speedup potential!**
+
 ### Why rapidgzip Wins on SILESIA
 
 rapidgzip uses **parallel single-member decompression**:
@@ -211,10 +223,11 @@ Update this file with what you tried and the result.
 
 | File | Purpose | Priority |
 |------|---------|----------|
-| `src/libdeflate_decode.rs` | Current best decoder | ⭐⭐⭐⭐⭐ |
+| `src/consume_first_decode.rs` | Current best decoder | ⭐⭐⭐⭐⭐ |
+| `src/hyperion.rs` | Unified routing entrypoint | ⭐⭐⭐⭐⭐ |
+| `src/marker_turbo.rs` | Fast parallel marker decoder (1132 MB/s!) | ⭐⭐⭐⭐⭐ |
 | `src/libdeflate_entry.rs` | Entry format definitions | ⭐⭐⭐⭐ |
-| `src/unified_table.rs` | Novel unified approach | ⭐⭐⭐⭐ |
-| `src/vector_huffman.rs` | SIMD infrastructure | ⭐⭐⭐⭐ |
+| `src/unified_table.rs` | Novel unified approach | ⭐⭐⭐ |
 | `libdeflate/lib/decompress_template.h` | libdeflate's implementation | ⭐⭐⭐⭐⭐ |
 | `rapidgzip/huffman/HuffmanCodingShortBitsMultiCached.hpp` | rapidgzip's optimization | ⭐⭐⭐⭐ |
 
