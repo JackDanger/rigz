@@ -194,7 +194,7 @@ fn decompress_mmap_libdeflate<W: Write + Send>(
 ///
 /// Uses conservative heuristics to avoid false positives from gzip magic
 /// appearing in compressed data.
-fn is_likely_multi_member(data: &[u8]) -> bool {
+pub(crate) fn is_likely_multi_member(data: &[u8]) -> bool {
     use memchr::memmem;
 
     // A gzip member is minimum 18 bytes (10 header + 8 trailer)
