@@ -46,6 +46,7 @@ mod pipelined_compress;
 mod precomputed_decode;
 mod rapidgzip_decoder;
 mod scheduler;
+mod simd_block_scanner;
 mod simd_copy;
 mod simd_huffman;
 mod simd_inflate;

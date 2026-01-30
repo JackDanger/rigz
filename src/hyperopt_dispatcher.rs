@@ -64,12 +64,13 @@ impl BlockStats {
         let dynamic_ratio = self.dynamic as f64 / total as f64;
 
         // Repetitive: >50% fixed blocks OR very high compression ratio
-        if fixed_ratio > 0.5 || self.compression_ratio > 10.0 {
+        // NOTE: SIMD profiling over-counts on logs, use conservative threshold
+        if fixed_ratio > 0.7 || self.compression_ratio > 15.0 {
             return ArchiveProfile::Repetitive;
         }
 
         // Source code: Mostly dynamic blocks, moderate compression
-        if dynamic_ratio > 0.7 && self.compression_ratio > 2.0 && self.compression_ratio < 6.0 {
+        if dynamic_ratio > 0.6 && self.compression_ratio > 2.0 && self.compression_ratio < 6.0 {
             return ArchiveProfile::SourceCode;
         }
 
@@ -85,47 +86,30 @@ impl BlockStats {
 /// Sample first few blocks to detect characteristics
 /// Returns block stats without decompressing the entire file
 pub fn sample_archive_profile(data: &[u8]) -> io::Result<BlockStats> {
-    // For now, use a simple heuristic based on header analysis
-    // Full block analysis would require partial decompression which is expensive
-    let mut stats = BlockStats::default();
-
-    // Check first 100KB for block type markers
+    // SIMD scan only first 100KB to avoid false positives in compressed data
     let sample_size = data.len().min(100_000);
-    let mut i = 0;
+    let sample_data = &data[..sample_size];
 
-    // Count occurrences of deflate block type markers (very rough heuristic)
-    while i + 3 < sample_size {
-        // Look for potential block headers (after alignment)
-        // This is imperfect but fast
-        let bits = data[i];
+    // Use SIMD-accelerated scanning on sample
+    let simd_patterns = crate::simd_block_scanner::scan_block_patterns_simd(sample_data)?;
 
-        // Check for fixed block pattern (bit pattern 01 for block type)
-        if bits & 0x06 == 0x02 {
-            stats.fixed += 1;
-        }
-        // Check for dynamic block pattern (bit pattern 10 for block type)
-        else if bits & 0x06 == 0x04 {
-            stats.dynamic += 1;
-        }
-        // Check for stored block pattern (bit pattern 00 for block type)
-        else if bits & 0x06 == 0x00 {
-            stats.stored += 1;
-        }
-
-        i += 1;
-    }
-
-    // Estimate compression ratio from file size vs header hint
-    if let Some(isize) = crate::decompression::read_gzip_isize(data) {
-        if isize > 0 {
-            stats.compression_ratio = isize as f64 / data.len() as f64;
-        }
-    }
-
-    // Default to moderate compression ratio if we couldn't determine
-    if stats.compression_ratio == 0.0 {
-        stats.compression_ratio = 3.0;
-    }
+    let stats = BlockStats {
+        fixed: simd_patterns.fixed_patterns,
+        dynamic: simd_patterns.dynamic_patterns,
+        stored: simd_patterns.stored_patterns,
+        compression_ratio: {
+            // Estimate compression ratio from file size vs header hint
+            if let Some(isize) = crate::decompression::read_gzip_isize(data) {
+                if isize > 0 {
+                    isize as f64 / data.len() as f64
+                } else {
+                    3.0 // Default
+                }
+            } else {
+                3.0 // Default
+            }
+        },
+    };
 
     Ok(stats)
 }
