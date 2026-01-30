@@ -375,98 +375,45 @@ fn decompress_single_member_turbo<W: Write>(data: &[u8], writer: &mut W) -> Gzip
 ///
 /// Strategies (in order of preference):
 /// 1. BGZF-style (gzippy output): parallel libdeflate using embedded block sizes
-/// 2. Single member: libdeflate (fastest, 30-50% faster than zlib)
-/// 3. Large multi-member: speculative parallel decompression (rapidgzip-style)
-/// 4. Small multi-member: sequential zlib-ng
+/// 2. Single member: turbo inflate (pure Rust, 90%+ of libdeflate)
+/// 3. Multi-member: parallel per-member decompression
+/// 4. Fallback: sequential zlib-ng
 fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
         return Ok(0);
     }
 
-    // Check for BGZF-style markers FIRST (gzippy output with embedded block sizes)
-    // This check is fast (only looks at first header) and must come before
-    // is_multi_member_quick which only scans 256KB - not enough for random data
-    // where the first block can be >256KB
-    if has_bgzf_markers(data) {
-        // Try our new CombinedLUT-based BGZF decompressor (fastest pure Rust)
-        let num_threads = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4);
+    // Use HYPERION unified entrypoint for all gzip decompression
+    let num_threads = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4);
 
-        match crate::bgzf::decompress_bgzf_parallel(data, writer, num_threads) {
-            Ok(bytes) => {
-                if std::env::var("GZIPPY_DEBUG").is_ok() {
-                    eprintln!(
-                        "[gzippy] BGZF parallel: {} bytes, {} threads",
-                        bytes, num_threads
-                    );
-                }
-                return Ok(bytes);
-            }
-            Err(e) => {
-                if std::env::var("GZIPPY_DEBUG").is_ok() {
-                    eprintln!("[gzippy] BGZF parallel failed: {}, trying ultra_inflate", e);
-                }
+    // HYPERION handles all archive types optimally
+    match crate::hyperion::decompress_hyperion(data, writer, num_threads) {
+        Ok(bytes) => return Ok(bytes),
+        Err(e) => {
+            if std::env::var("GZIPPY_DEBUG").is_ok() {
+                eprintln!("[gzippy] HYPERION failed: {}, trying fallbacks", e);
             }
         }
+    }
 
-        // Fallback to ultra_inflate BGZF (uses our turbo inflate)
-        match crate::ultra_inflate::decompress_bgzf_ultra(data, writer, num_threads) {
-            Ok(bytes) => {
-                if std::env::var("GZIPPY_DEBUG").is_ok() {
-                    eprintln!(
-                        "[gzippy] BGZF ultra: {} bytes, {} threads",
-                        bytes, num_threads
-                    );
-                }
-                return Ok(bytes);
-            }
-            Err(e) => {
-                if std::env::var("GZIPPY_DEBUG").is_ok() {
-                    eprintln!("[gzippy] BGZF ultra failed: {}, falling back", e);
-                }
-            }
+    // Fallback chain for edge cases
+    if has_bgzf_markers(data) {
+        // Fallback to ultra_inflate BGZF
+        if let Ok(bytes) = crate::ultra_inflate::decompress_bgzf_ultra(data, writer, num_threads) {
+            return Ok(bytes);
         }
         // Fallback to streaming parallel decompressor
         return decompress_bgzf_parallel_prefetch(data, writer);
     }
 
-    // Check if this is multi-member using conservative heuristics
-    let num_threads = std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(4);
-
     if !is_likely_multi_member(data) {
-        // Single-member: use our turbo inflate (optimized pure Rust)
-        // No fallback to libdeflate - we want to see errors
-        if std::env::var("GZIPPY_DEBUG").is_ok() {
-            eprintln!("[gzippy] Single-member: turbo inflate (pure Rust)");
-        }
+        // Single-member fallback
         return decompress_single_member_turbo(data, writer);
     }
 
-    // Multi-member: try our new pre-allocated parallel decompressor first (Phase 2)
-    match crate::bgzf::decompress_multi_member_parallel(data, writer, num_threads) {
-        Ok(bytes) => {
-            if std::env::var("GZIPPY_DEBUG").is_ok() {
-                eprintln!(
-                    "[gzippy] Multi-member parallel: {} bytes, {} threads",
-                    bytes, num_threads
-                );
-            }
-            return Ok(bytes);
-        }
-        Err(e) => {
-            if std::env::var("GZIPPY_DEBUG").is_ok() {
-                eprintln!(
-                    "[gzippy] Multi-member parallel failed: {}, trying fallback",
-                    e
-                );
-            }
-        }
-    }
-
-    // Fallback to parallel_decompress
+    // Multi-member fallbacks
     if let Ok(bytes) = crate::parallel_decompress::decompress_parallel(data, writer, num_threads) {
         return Ok(bytes);
     }
@@ -474,11 +421,9 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
     match crate::ultra_decompress::decompress_ultra(data, writer, num_threads) {
         Ok(bytes) => Ok(bytes),
         Err(_) => {
-            // Try our pure Rust parallel inflater
             if let Ok(bytes) = crate::parallel_inflate::decompress_auto(data, writer, num_threads) {
                 return Ok(bytes);
             }
-            // Fallback to flate2 sequential
             decompress_multi_member_zlibng(data, writer)
         }
     }

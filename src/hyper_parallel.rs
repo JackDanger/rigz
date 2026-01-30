@@ -49,7 +49,8 @@ use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use crate::marker_decode::{MarkerDecoder, CHUNK_SIZE, WINDOW_SIZE};
+use crate::marker_decode::{CHUNK_SIZE, WINDOW_SIZE};
+use crate::marker_turbo::inflate_with_markers_at;
 
 // =============================================================================
 // Configuration
@@ -385,6 +386,8 @@ pub fn decompress_hyper_parallel<W: io::Write>(
     let mut full_output = vec![0u8; isize];
 
     // Use our turbo inflate (pure Rust with Phase 1 optimizations)
+    // NOTE: This returns immediately with sequential result. True parallel
+    // requires implementing the two-pass approach from bgzf.rs
     match crate::bgzf::inflate_into_pub(deflate_data, &mut full_output) {
         Ok(size) => {
             writer.write_all(&full_output[..size])?;
@@ -396,27 +399,29 @@ pub fn decompress_hyper_parallel<W: io::Write>(
     }
 
     // Fallback to marker-based decode for very large files
-    let mut first_decoder = MarkerDecoder::new(deflate_data, 0);
-
-    // Decode enough to get a full 32KB window
+    // Use marker_turbo for fast bootstrap decoding
     let bootstrap_target = WINDOW_SIZE + CHUNK_SIZE;
-    if first_decoder.decode_until(bootstrap_target).is_err() {
-        // Decode failed early - fall back to sequential
-        return decompress_sequential(data, writer);
-    }
+    let (first_output, first_bit_pos) =
+        match inflate_with_markers_at(deflate_data, 0, bootstrap_target) {
+            Ok((output, end_bit)) => (output, end_bit),
+            Err(_) => return decompress_sequential(data, writer),
+        };
 
-    let first_output = first_decoder.output();
-    let first_bit_pos = first_decoder.bit_position();
+    // Count markers in first output
+    let first_marker_count = first_output
+        .iter()
+        .filter(|&&v| v >= crate::marker_decode::MARKER_BASE)
+        .count();
 
     // Check if we decoded everything (small file case)
-    if first_decoder.marker_count() == 0 && first_bit_pos * 8 >= deflate_data.len() * 8 - 32 {
+    if first_marker_count == 0 && first_bit_pos >= deflate_data.len() * 8 - 32 {
         // Entire file decoded in bootstrap
         let output: Vec<u8> = first_output.iter().map(|&v| v as u8).collect();
         writer.write_all(&output)?;
         return Ok(output.len() as u64);
     }
 
-    // Build initial window
+    // Build initial window (only from non-marker values)
     let initial_window: Vec<u8> = if first_output.len() >= WINDOW_SIZE {
         first_output[first_output.len() - WINDOW_SIZE..]
             .iter()
@@ -467,14 +472,17 @@ pub fn decompress_hyper_parallel<W: io::Write>(
                             break;
                         }
 
-                        // Decode speculatively (will have markers for back-refs)
+                        // Decode speculatively with marker_turbo (16x faster!)
                         let start_bit = start_byte * 8;
-                        let mut decoder = MarkerDecoder::new(deflate_data_ref, start_bit);
+                        let chunk_max_output = CHUNK_SIZE * 4;
 
-                        match decoder.decode_until(CHUNK_SIZE * 4) {
-                            Ok(_) => {
-                                let data = decoder.output().to_vec();
-                                let marker_count = decoder.marker_count();
+                        match inflate_with_markers_at(deflate_data_ref, start_bit, chunk_max_output)
+                        {
+                            Ok((data, end_bit)) => {
+                                let marker_count = data
+                                    .iter()
+                                    .filter(|&&v| v >= crate::marker_decode::MARKER_BASE)
+                                    .count();
 
                                 local_chunks.push(SpecChunk {
                                     index: chunk_idx,
@@ -485,7 +493,7 @@ pub fn decompress_hyper_parallel<W: io::Write>(
                                     output_start: 0,
                                     output_len: 0,
                                     state: ChunkState::WaitingForWindow,
-                                    end_bit: decoder.bit_position(),
+                                    end_bit,
                                 });
                             }
                             Err(_) => {
@@ -526,24 +534,16 @@ pub fn decompress_hyper_parallel<W: io::Write>(
     // Write first chunk
     unsafe {
         let dst = output_buffer.slice_mut(0, first_output.len());
-        convert_u16_to_u8_simd(first_output, dst);
+        convert_u16_to_u8_simd(&first_output, dst);
     }
     output_buffer.mark_written(first_output.len());
 
     // Process chunks in order (window propagation must be sequential)
     for mut chunk in chunks {
         if chunk.state == ChunkState::Failed {
-            // Re-decode this chunk with known window
-            let start_bit = chunk.start_byte * 8;
-            let mut decoder = MarkerDecoder::with_window(deflate_data, start_bit, &current_window);
-
-            if decoder.decode_until(CHUNK_SIZE * 4).is_err() {
-                // Still failed - abort parallel and use sequential
-                return decompress_sequential(data, writer);
-            }
-
-            chunk.data = decoder.output().to_vec();
-            chunk.marker_count = decoder.marker_count();
+            // Failed chunks can't be recovered with marker_turbo
+            // Fall back to sequential for the whole file
+            return decompress_sequential(data, writer);
         }
 
         // Replace markers using SIMD

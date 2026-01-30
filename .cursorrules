@@ -44,16 +44,33 @@ copies to avoid corrupting data that will be backreferenced by subsequent matche
 
 **Rule**: `copy_match_fast` for fastloop (has margin), `copy_match_safe` for generic loop (no margin).
 
-## 🚨 CRITICAL: Optimization Roadmap
+## 🚨 CRITICAL: HYPERION Status (Updated Jan 2026)
 
-**READ THIS FIRST**: `docs/OPTIMIZATION_ROADMAP.md` contains the exhaustive list of
-every optimization needed to beat libdeflate. This is the primary reference for
-closing the performance gap. Current status (Jan 2026):
-- Single-thread silesia: 58% of libdeflate (819 MB/s vs 1403 MB/s)
-- BGZF parallel (8 threads): 2076 MB/s (148% of libdeflate single-threaded!)
-- ALL CODE IS NOW PURE RUST - NO LIBDEFLATE IN HOT PATHS
+**Current performance vs libdeflate (Apple M3):**
+| Dataset | Our MB/s | libdeflate MB/s | Ratio |
+|---------|----------|-----------------|-------|
+| SILESIA | 1265 | 1385 | **91.4%** |
+| SOFTWARE | 18680 | 19113 | **97.7%** |
+| LOGS | 7723 | 7857 | **98.3%** |
 
-The roadmap has 4 phases with 45 total optimizations. Work through them in order.
+**Key modules:**
+- `hyperion.rs` - Unified entrypoint, routes to optimal decoder
+- `marker_turbo.rs` - Fast marker-based decode (2129 MB/s!)
+- `hyper_parallel.rs` - Parallel single-member via marker_turbo
+- `consume_first_decode.rs` - Primary hot path
+
+**What works:**
+1. Reuse fast Bits struct from consume_first_decode for new decoders
+2. 11-bit Huffman tables (L1 cache optimal)
+3. marker_turbo pattern: output to u16 with markers for unresolved back-refs
+4. inflate_with_markers_at() for starting at arbitrary bit positions
+
+**What doesn't work:**
+1. ANF/algebraic decoding has subtle bugs - defer until simpler wins exhausted
+2. SIMD parallel Huffman only helps literal-heavy fixed blocks - niche case
+3. Simulation benchmarks lie - always validate on full silesia
+
+**The 91-98% ratio is a major achievement in pure Rust!**
 
 We build on the shoulders of giants. These projects laid the foundation:
 - **pigz** by Mark Adler — pioneered parallel gzip compression

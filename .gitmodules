@@ -17,3 +17,6 @@
 [submodule "libdeflate"]
 	path = libdeflate
 	url = https://github.com/ebiggers/libdeflate.git
+[submodule "rust"]
+	path = rust
+	url = https://github.com/rust-lang/rust.git

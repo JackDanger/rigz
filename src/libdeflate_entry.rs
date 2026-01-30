@@ -656,6 +656,12 @@ impl DistTable {
             entry
         }
     }
+    
+    /// Get pointer to entries array for ASM access
+    #[inline(always)]
+    pub fn entries_ptr(&self) -> *const DistEntry {
+        self.entries.as_ptr()
+    }
 }
 
 // =============================================================================
