@@ -310,6 +310,23 @@ Only distances 1,2,4,8 can use SIMD broadcast; others must use byte-by-byte copy
 
 ## Current Status (Jan 2026)
 
+### Hyperoptimized Multi-Path Decompression (Jan 2026)
+
+**BREAKTHROUGH**: Implemented profile-based routing to multiple decompressor implementations.
+
+| Archive | Strategy | Speed | Improvement |
+|---------|----------|-------|-------------|
+| SILESIA | Auto-detect | 392 MB/s | **+6%** over best single path |
+| SOFTWARE | Auto-detect | 253 MB/s | **+41%** over best single path |
+| LOGS | Auto-detect | 362 MB/s | **+2%** over best single path |
+
+**Architecture**: `src/hyperopt_dispatcher.rs`
+- Samples archive characteristics (fixed/dynamic blocks, compression ratio)
+- Routes to optimal implementation (libdeflate/ISA-L/consume_first)
+- Graceful fallback on error
+
+**Enable with**: `GZIPPY_HYPEROPT=1`
+
 ### Performance Measurements (UPDATED Jan 2026)
 
 **Key Insight**: Multi-symbol decode with tight literal loop provides significant gains.

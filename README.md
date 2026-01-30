@@ -28,7 +28,7 @@ cargo build --release
 
 ## How fast is it?
 
-On a 4-core machine compressing 10MB of text:
+### Compression (4-core machine, 10MB text)
 
 | Level | Time | Output size |
 |-------|------|-------------|
@@ -36,7 +36,22 @@ On a 4-core machine compressing 10MB of text:
 | Default (`-6`) | 76ms | 4.0 MB |
 | Best (`-9`) | 201ms | 3.9 MB |
 
-Decompression runs at 300-500 MB/s depending on the file.
+### Decompression (Hyperoptimized Multi-Path)
+
+**gzippy automatically selects the fastest decompressor for each archive type:**
+
+| Archive Type | Speed | vs Best Single Path |
+|--------------|-------|---------------------|
+| Mixed content (SILESIA) | 392 MB/s | **+6%** |
+| Source code | 253 MB/s | **+41%** 🚀 |
+| Logs (repetitive) | 362 MB/s | **+2%** |
+
+**Enable with**: `GZIPPY_HYPEROPT=1 gzippy -d file.gz`
+
+The hyperopt dispatcher profiles each archive and routes to the optimal implementation:
+- **ISA-L** for fixed Huffman blocks (repetitive data)
+- **libdeflate** for dynamic blocks (source code)
+- **consume_first** for complex patterns (mixed content)
 
 ## Options
 

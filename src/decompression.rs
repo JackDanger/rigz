@@ -267,7 +267,7 @@ fn is_likely_multi_member(data: &[u8]) -> bool {
 }
 
 /// Parse gzip header size (variable due to FEXTRA, FNAME, FCOMMENT, FHCRC)
-fn parse_gzip_header_size(data: &[u8]) -> Option<usize> {
+pub(crate) fn parse_gzip_header_size(data: &[u8]) -> Option<usize> {
     if data.len() < 10 {
         return None;
     }
@@ -375,9 +375,12 @@ fn decompress_single_member_turbo<W: Write>(data: &[u8], writer: &mut W) -> Gzip
 ///
 /// Strategies (in order of preference):
 /// 1. BGZF-style (gzippy output): parallel libdeflate using embedded block sizes
-/// 2. Single member: libdeflate (fastest, 30-50% faster than zlib)
-/// 3. Large multi-member: speculative parallel decompression (rapidgzip-style)
-/// 4. Small multi-member: sequential zlib-ng
+/// 2. Hyperoptimized routing: Profile-based selection (libdeflate/ISA-L/consume_first)
+/// 3. Single member: libdeflate (fastest, 30-50% faster than zlib)
+/// 4. Large multi-member: speculative parallel decompression (rapidgzip-style)
+/// 5. Small multi-member: sequential zlib-ng
+///
+/// To enable hyperoptimized routing, set GZIPPY_HYPEROPT=1
 fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> GzippyResult<u64> {
     if data.len() < 2 || data[0] != 0x1f || data[1] != 0x8b {
         return Ok(0);
@@ -429,6 +432,27 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
         }
         // Fallback to streaming parallel decompressor
         return decompress_bgzf_parallel_prefetch(data, writer);
+    }
+
+    // HYPEROPT: Use profile-based routing if enabled
+    if std::env::var("GZIPPY_HYPEROPT").is_ok() {
+        let num_threads = std::thread::available_parallelism()
+            .map(|p| p.get())
+            .unwrap_or(4);
+
+        match crate::hyperopt_dispatcher::decompress_hyperopt(data, writer, num_threads) {
+            Ok(bytes) => {
+                if std::env::var("GZIPPY_DEBUG").is_ok() {
+                    eprintln!("[gzippy] HYPEROPT: {} bytes", bytes);
+                }
+                return Ok(bytes);
+            }
+            Err(e) => {
+                if std::env::var("GZIPPY_DEBUG").is_ok() {
+                    eprintln!("[gzippy] HYPEROPT failed: {}, falling back", e);
+                }
+            }
+        }
     }
 
     // Check if this is multi-member using conservative heuristics
@@ -486,7 +510,7 @@ fn decompress_gzip_libdeflate<W: Write + Send>(data: &[u8], writer: &mut W) -> G
 
 /// Check if data has BGZF-style "GZ" markers in the first gzip header
 #[inline]
-fn has_bgzf_markers(data: &[u8]) -> bool {
+pub(crate) fn has_bgzf_markers(data: &[u8]) -> bool {
     // Minimum header with FEXTRA: 10 base + 2 XLEN + 4 subfield header
     if data.len() < 16 {
         return false;
@@ -787,7 +811,7 @@ fn prefetch_memory(data: &[u8]) {
 /// Read the ISIZE field from gzip trailer (last 4 bytes) for buffer sizing
 /// Returns uncompressed size mod 2^32 (per RFC 1952)
 #[inline]
-fn read_gzip_isize(data: &[u8]) -> Option<u32> {
+pub(crate) fn read_gzip_isize(data: &[u8]) -> Option<u32> {
     if data.len() < 18 {
         // Minimum gzip: 10 header + 8 trailer
         return None;
