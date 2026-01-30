@@ -77,12 +77,6 @@ pub const HUFFDEC_SUBTABLE_POINTER: u32 = 0x0000_4000;
 /// Flag: Entry is end-of-block (bit 13)
 pub const HUFFDEC_END_OF_BLOCK: u32 = 0x0000_2000;
 
-/// Flag: Entry is a double-literal (bit 30) - ISA-L style optimization
-/// When LITERAL (bit 31) and DOUBLE_LITERAL (bit 30) are both set,
-/// the entry contains TWO literals that can be decoded with a single lookup.
-/// Format: [LITERAL:1][DOUBLE:1][total_bits:5][lit1:8][lit2:8][unused:9]
-pub const HUFFDEC_DOUBLE_LITERAL: u32 = 0x4000_0000;
-
 /// A literal/length table entry
 #[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
@@ -96,25 +90,6 @@ impl LitLenEntry {
         // Bit 23-16: literal value
         // Bit 3-0: codeword bits (for consumption)
         Self(HUFFDEC_LITERAL | ((value as u32) << 16) | (codeword_bits as u32))
-    }
-
-    /// Create a double-literal entry (ISA-L style optimization)
-    /// Both literals are decoded with a single table lookup.
-    /// Format compatible with existing decode loop:
-    /// - Bits 31: LITERAL flag
-    /// - Bits 30: DOUBLE_LITERAL flag  
-    /// - Bits 23-16: lit1 (so (entry >> 16) as u8 works)
-    /// - Bits 15-8: lit2
-    /// - Bits 7-0: total_bits (so entry as u8 works for consumption)
-    #[inline(always)]
-    pub const fn double_literal(lit1: u8, lit2: u8, total_bits: u8) -> Self {
-        Self(
-            HUFFDEC_LITERAL
-                | HUFFDEC_DOUBLE_LITERAL
-                | ((lit1 as u32) << 16)
-                | ((lit2 as u32) << 8)
-                | (total_bits as u32),
-        )
     }
 
     /// Create a length entry
@@ -150,28 +125,6 @@ impl LitLenEntry {
     #[inline(always)]
     pub const fn is_literal(self) -> bool {
         (self.0 as i32) < 0
-    }
-
-    /// Check if this is a double-literal (bits 31 AND 30 set)
-    /// Double-literals contain two literals that decode together.
-    #[inline(always)]
-    pub const fn is_double_literal(self) -> bool {
-        // Both LITERAL (bit 31) and DOUBLE_LITERAL (bit 30) must be set
-        (self.0 & (HUFFDEC_LITERAL | HUFFDEC_DOUBLE_LITERAL))
-            == (HUFFDEC_LITERAL | HUFFDEC_DOUBLE_LITERAL)
-    }
-
-    /// Get the second literal value for double-literal entries (bits 15-8)
-    #[inline(always)]
-    pub const fn second_literal_value(self) -> u8 {
-        ((self.0 >> 8) & 0xFF) as u8
-    }
-
-    /// Get total bits for double-literal entries (bits 7-0, same as codeword_bits)
-    /// This is compatible with `entry as u8` for bit consumption.
-    #[inline(always)]
-    pub const fn double_literal_bits(self) -> u8 {
-        (self.0 & 0xFF) as u8
     }
 
     /// Check if this is exceptional (subtable or EOB)
@@ -491,126 +444,10 @@ impl LitLenTable {
         }
 
         entries.truncate(subtable_next);
-
-        // Double-literal table upgrade disabled - too complex with correctness issues
-        // The decode loop already does 8-literal batching which achieves similar effect
-        // TODO: Revisit with ISA-L's exact algorithm if needed
-        // Self::upgrade_to_double_literals(&mut entries, table_bits, code_lengths);
-
         Some(Self {
             entries,
             table_bits,
         })
-    }
-
-    /// Upgrade single-literal entries to double-literals where both fit in TABLE_BITS
-    /// Uses ISA-L's approach: iterate over all valid literal pairs and fill combined entries
-    fn upgrade_to_double_literals(
-        entries: &mut [LitLenEntry],
-        table_bits: u8,
-        code_lengths: &[u8],
-    ) {
-        let main_size = 1usize << table_bits;
-
-        // Count codes of each length
-        let mut count = [0u16; 16];
-        for &len in code_lengths {
-            if len > 0 && len <= 15 {
-                count[len as usize] += 1;
-            }
-        }
-
-        // Compute first code for each length
-        let mut first_code = [0u32; 16];
-        let mut code = 0u32;
-        for len in 1..=15 {
-            code = (code + count[len - 1] as u32) << 1;
-            first_code[len] = code;
-        }
-
-        // Build list of (symbol, huffman_code, reversed_code, len) for literals only
-        struct LitInfo {
-            symbol: u8,
-            reversed: u32,
-            len: u8,
-        }
-        let mut literals: Vec<LitInfo> = Vec::new();
-
-        let mut next_code = first_code;
-        for (symbol, &len) in code_lengths.iter().enumerate() {
-            if len == 0 || symbol >= 256 || len as usize > table_bits as usize {
-                continue;
-            }
-
-            let huffman_code = next_code[len as usize];
-            next_code[len as usize] += 1;
-
-            // Reverse bits for table lookup
-            let mut reversed = 0u32;
-            for i in 0..len {
-                if (huffman_code >> i) & 1 != 0 {
-                    reversed |= 1 << (len - 1 - i);
-                }
-            }
-
-            literals.push(LitInfo {
-                symbol: symbol as u8,
-                reversed,
-                len,
-            });
-        }
-
-        // For each pair of literals where combined length <= TABLE_BITS,
-        // create double-literal entries (ISA-L style)
-        for lit1 in &literals {
-            for lit2 in &literals {
-                let total_bits = lit1.len as usize + lit2.len as usize;
-                if total_bits > table_bits as usize {
-                    continue;
-                }
-
-                // Combined table index: lit1's code | (lit2's code << lit1.len)
-                let combined_code = lit1.reversed as usize | ((lit2.reversed as usize) << lit1.len);
-
-                // Fill all entries that match this combined pattern
-                // CRITICAL: Verify that idx actually decodes to (lit1, lit2)
-                // The low bits of idx must match lit1's reversed code
-                // The next bits must match lit2's reversed code
-                let lit1_mask = (1usize << lit1.len) - 1;
-                let lit2_mask = (1usize << lit2.len) - 1;
-
-                let fill_count = 1usize << (table_bits as usize - total_bits);
-                for i in 0..fill_count {
-                    let idx = combined_code | (i << total_bits);
-                    if idx < main_size {
-                        // Verify that idx actually represents (lit1, lit2)
-                        let idx_lit1_code = idx & lit1_mask;
-                        let idx_lit2_code = (idx >> lit1.len) & lit2_mask;
-
-                        if idx_lit1_code != lit1.reversed as usize
-                            || idx_lit2_code != lit2.reversed as usize
-                        {
-                            continue; // This index doesn't represent our pair
-                        }
-
-                        let existing = entries[idx];
-                        // Only upgrade if it's currently a single literal for lit1
-                        if existing.is_literal()
-                            && !existing.is_double_literal()
-                            && !existing.is_subtable_ptr()
-                            && existing.literal_value() == lit1.symbol
-                            && existing.codeword_bits() == lit1.len
-                        {
-                            entries[idx] = LitLenEntry::double_literal(
-                                lit1.symbol,
-                                lit2.symbol,
-                                total_bits as u8,
-                            );
-                        }
-                    }
-                }
-            }
-        }
     }
 
     /// Look up an entry by bit pattern (unsafe unchecked for max speed)
@@ -818,6 +655,12 @@ impl DistTable {
         } else {
             entry
         }
+    }
+    
+    /// Get pointer to entries array for ASM access
+    #[inline(always)]
+    pub fn entries_ptr(&self) -> *const DistEntry {
+        self.entries.as_ptr()
     }
 }
 

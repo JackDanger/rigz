@@ -233,6 +233,17 @@ fn extract_bits(value: u64, n: u32) -> u64 {
     bzhi_u64(value, n)
 }
 
+/// Exact libdeflate EXTRACT_VARBITS8 pattern
+/// This computes: (saved_bitbuf & ((1 << (entry & 0xff)) - 1)) >> ((entry >> 8) & 0xff)
+/// Used for extracting extra bits after consuming the code word
+#[inline(always)]
+fn extract_varbits8(saved_bitbuf: u64, entry: u32) -> u32 {
+    let n_bits = entry as u8; // bottom 8 bits = total consumed
+    let shift = (entry >> 8) as u8; // next 8 bits = code word bits (shift amount)
+    let mask = (1u64 << n_bits).wrapping_sub(1);
+    ((saved_bitbuf & mask) >> shift) as u32
+}
+
 // =============================================================================
 // Bit Reader - Matching libdeflate exactly
 // =============================================================================
@@ -695,7 +706,7 @@ macro_rules! debug_write {
 /// 4. Up to 2 extra literals decoded per iteration on 64-bit
 /// 5. Next entry preloaded before refill to hide latency
 #[inline(never)]
-fn decode_huffman_libdeflate_style(
+pub fn decode_huffman_libdeflate_style(
     bits: &mut Bits,
     output: &mut [u8],
     mut out_pos: usize,
@@ -1529,6 +1540,12 @@ fn decode_huffman_with_dispatch(
     litlen: &LitLenTable,
     dist: &DistTable,
 ) -> Result<usize> {
+    // Check for ASM decoder path via environment variable
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    if std::env::var("GZIPPY_ASM").is_ok() {
+        return crate::asm_decode::decode_huffman_asm(bits, output, out_pos, litlen, dist);
+    }
+    
     // Use the original libdeflate-style decoder with bzhi_u64 for bit extraction
     decode_huffman_libdeflate_style(bits, output, out_pos, litlen, dist)
 }
@@ -2915,6 +2932,1076 @@ pub fn inflate_consume_first(input: &[u8], output: &mut [u8]) -> Result<usize> {
     let mut bits = Bits::new(input);
     let out_size = inflate_consume_first_bits(&mut bits, output)?;
     Ok(out_size)
+}
+
+/// Decode a deflate stream using ASM primitives (for testing)
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn inflate_consume_first_asm(input: &[u8], output: &mut [u8]) -> Result<usize> {
+    let mut bits = Bits::new(input);
+    let out_size = inflate_consume_first_bits_asm(&mut bits, output)?;
+    Ok(out_size)
+}
+
+/// Decode a deflate stream from a Bits reader using ASM primitives
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn inflate_consume_first_bits_asm(bits: &mut Bits, output: &mut [u8]) -> Result<usize> {
+    let mut out_pos = 0;
+
+    loop {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+
+        let bfinal = (bits.peek() & 1) != 0;
+        let btype = ((bits.peek() >> 1) & 3) as u8;
+        bits.consume(3);
+
+        match btype {
+            0 => out_pos = decode_stored(bits, output, out_pos)?,
+            1 => out_pos = decode_fixed_asm(bits, output, out_pos)?,
+            2 => out_pos = decode_dynamic_asm(bits, output, out_pos)?,
+            3 => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type")),
+            _ => unreachable!(),
+        }
+
+        if bfinal {
+            bits.align_to_byte();
+            return Ok(out_pos);
+        }
+    }
+}
+
+/// Decode fixed Huffman block using ASM primitives
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn decode_fixed_asm(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    let (litlen, dist) = crate::libdeflate_decode::get_fixed_tables();
+    crate::asm_decode::decode_huffman_asm(bits, output, out_pos, litlen, dist)
+}
+
+/// Decode dynamic Huffman block using ASM primitives
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn decode_dynamic_asm(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    // Read dynamic Huffman table header
+    if bits.available() < 14 {
+        bits.refill();
+    }
+
+    let hlit = (bits.peek() & 0x1F) as usize + 257;
+    bits.consume(5);
+    let hdist = (bits.peek() & 0x1F) as usize + 1;
+    bits.consume(5);
+    let hclen = (bits.peek() & 0xF) as usize + 4;
+    bits.consume(4);
+
+    // Read code length code lengths
+    const CODE_LENGTH_ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+
+    let mut code_length_lengths = [0u8; 19];
+    for i in 0..hclen {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+        code_length_lengths[CODE_LENGTH_ORDER[i]] = (bits.peek() & 0x7) as u8;
+        bits.consume(3);
+    }
+
+    // Build code length table
+    let cl_table = build_code_length_table(&code_length_lengths)?;
+
+    // Read literal/length and distance code lengths
+    let mut all_lengths = vec![0u8; hlit + hdist];
+    let mut i = 0;
+    while i < hlit + hdist {
+        if bits.available() < 15 {
+            bits.refill();
+        }
+
+        let entry = cl_table[(bits.peek() & 0x7F) as usize];
+        let symbol = (entry >> 8) as u8;
+        let len = (entry & 0xFF) as u8;
+        bits.consume(len as u32);
+
+        match symbol {
+            0..=15 => {
+                all_lengths[i] = symbol;
+                i += 1;
+            }
+            16 => {
+                if i == 0 {
+                    return Err(Error::new(ErrorKind::InvalidData, "Invalid repeat"));
+                }
+                let repeat = 3 + (bits.peek() & 0x3) as usize;
+                bits.consume(2);
+                let val = all_lengths[i - 1];
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = val;
+                    i += 1;
+                }
+            }
+            17 => {
+                let repeat = 3 + (bits.peek() & 0x7) as usize;
+                bits.consume(3);
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            18 => {
+                let repeat = 11 + (bits.peek() & 0x7F) as usize;
+                bits.consume(7);
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Invalid code length symbol: {}", symbol),
+                ));
+            }
+        }
+    }
+
+    let litlen_lengths = &all_lengths[..hlit];
+    let dist_lengths = &all_lengths[hlit..];
+
+    // Build Huffman tables
+    let litlen_table = LitLenTable::build(litlen_lengths)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid litlen table"))?;
+    let dist_table = DistTable::build(dist_lengths)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid dist table"))?;
+
+    // Decode using ASM decoder
+    crate::asm_decode::decode_huffman_asm(bits, output, out_pos, &litlen_table, &dist_table)
+}
+
+/// Entry point for v2 ASM inflate (optimized)
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn inflate_consume_first_asm_v2(input: &[u8], output: &mut [u8]) -> Result<usize> {
+    let mut bits = Bits::new(input);
+    let out_size = inflate_consume_first_bits_asm_v2(&mut bits, output)?;
+    Ok(out_size)
+}
+
+/// Decode a deflate stream using ASM v2 primitives (optimized)
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn inflate_consume_first_bits_asm_v2(bits: &mut Bits, output: &mut [u8]) -> Result<usize> {
+    let mut out_pos = 0;
+
+    loop {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+
+        let bfinal = (bits.peek() & 1) != 0;
+        let btype = ((bits.peek() >> 1) & 3) as u8;
+        bits.consume(3);
+
+        match btype {
+            0 => out_pos = decode_stored(bits, output, out_pos)?,
+            1 => out_pos = decode_fixed_asm_v2(bits, output, out_pos)?,
+            2 => out_pos = decode_dynamic_asm_v2(bits, output, out_pos)?,
+            3 => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type")),
+            _ => unreachable!(),
+        }
+
+        if bfinal {
+            return Ok(out_pos);
+        }
+    }
+}
+
+/// Decode fixed Huffman block using ASM v2
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn decode_fixed_asm_v2(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    let (litlen, dist) = crate::libdeflate_decode::get_fixed_tables();
+    crate::asm_decode::decode_huffman_asm_v2(bits, output, out_pos, litlen, dist)
+}
+
+/// Decode dynamic Huffman block using ASM v2
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn decode_dynamic_asm_v2(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    // Read dynamic Huffman table header
+    if bits.available() < 14 {
+        bits.refill();
+    }
+
+    let hlit = (bits.peek() & 0x1F) as usize + 257;
+    bits.consume(5);
+    let hdist = (bits.peek() & 0x1F) as usize + 1;
+    bits.consume(5);
+    let hclen = (bits.peek() & 0xF) as usize + 4;
+    bits.consume(4);
+
+    // Read code length code lengths
+    const CODE_LENGTH_ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+
+    let mut code_length_lengths = [0u8; 19];
+    for i in 0..hclen {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+        code_length_lengths[CODE_LENGTH_ORDER[i]] = (bits.peek() & 0x7) as u8;
+        bits.consume(3);
+    }
+
+    // Build code length table (simple format: entry = (symbol << 8) | len)
+    let cl_table = build_code_length_table(&code_length_lengths)?;
+
+    // Read combined litlen and distance code lengths
+    let mut all_lengths = vec![0u8; hlit + hdist];
+    let mut i = 0;
+    while i < hlit + hdist {
+        if bits.available() < 15 {
+            bits.refill();
+        }
+
+        let entry = cl_table[(bits.peek() & 0x7F) as usize];
+        let symbol = (entry >> 8) as u8;
+        let len = (entry & 0xFF) as u8;
+        bits.consume(len as u32);
+
+        match symbol {
+            0..=15 => {
+                all_lengths[i] = symbol;
+                i += 1;
+            }
+            16 => {
+                if i == 0 {
+                    return Err(Error::new(ErrorKind::InvalidData, "Invalid repeat"));
+                }
+                let repeat = 3 + (bits.peek() & 0x3) as usize;
+                bits.consume(2);
+                let val = all_lengths[i - 1];
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = val;
+                    i += 1;
+                }
+            }
+            17 => {
+                let repeat = 3 + (bits.peek() & 0x7) as usize;
+                bits.consume(3);
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            18 => {
+                let repeat = 11 + (bits.peek() & 0x7F) as usize;
+                bits.consume(7);
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Invalid code length symbol: {}", symbol),
+                ));
+            }
+        }
+    }
+
+    let litlen_lengths = &all_lengths[..hlit];
+    let dist_lengths = &all_lengths[hlit..];
+
+    // Build Huffman tables
+    let litlen_table = LitLenTable::build(litlen_lengths)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid litlen table"))?;
+    let dist_table = DistTable::build(dist_lengths)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid dist table"))?;
+
+    // Decode using ASM v2 decoder
+    crate::asm_decode::decode_huffman_asm_v2(bits, output, out_pos, &litlen_table, &dist_table)
+}
+
+// =============================================================================
+// ASM v3: Pure Assembly Decode Loop
+// =============================================================================
+
+/// Entry point for v3 ASM inflate (pure assembly hot loop)
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn inflate_consume_first_asm_v3(input: &[u8], output: &mut [u8]) -> Result<usize> {
+    let mut bits = Bits::new(input);
+    let out_size = inflate_consume_first_bits_asm_v3(&mut bits, output)?;
+    Ok(out_size)
+}
+
+/// Decode a deflate stream using ASM v3 (pure asm hot loop)
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn inflate_consume_first_bits_asm_v3(bits: &mut Bits, output: &mut [u8]) -> Result<usize> {
+    let mut out_pos = 0;
+
+    loop {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+
+        let bfinal = (bits.peek() & 1) != 0;
+        let btype = ((bits.peek() >> 1) & 3) as u8;
+        bits.consume(3);
+
+        match btype {
+            0 => out_pos = decode_stored(bits, output, out_pos)?,
+            1 => out_pos = decode_fixed_asm_v3(bits, output, out_pos)?,
+            2 => out_pos = decode_dynamic_asm_v3(bits, output, out_pos)?,
+            3 => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type")),
+            _ => unreachable!(),
+        }
+
+        if bfinal {
+            return Ok(out_pos);
+        }
+    }
+}
+
+/// Decode fixed Huffman block using ASM v3
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn decode_fixed_asm_v3(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    let (litlen, dist) = crate::libdeflate_decode::get_fixed_tables();
+    crate::asm_decode::decode_huffman_asm_v3(bits, output, out_pos, litlen, dist)
+}
+
+/// Decode dynamic Huffman block using ASM v3
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn decode_dynamic_asm_v3(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    // Read dynamic Huffman table header (same as v2)
+    if bits.available() < 14 {
+        bits.refill();
+    }
+
+    let hlit = ((bits.peek() & 0x1F) as usize) + 257;
+    bits.consume(5);
+    let hdist = ((bits.peek() & 0x1F) as usize) + 1;
+    bits.consume(5);
+    let hclen = ((bits.peek() & 0xF) as usize) + 4;
+    bits.consume(4);
+
+    // Read code length code lengths
+    const CODE_LENGTH_ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+    let mut code_length_lengths = [0u8; 19];
+    for i in 0..hclen {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+        code_length_lengths[CODE_LENGTH_ORDER[i]] = (bits.peek() & 7) as u8;
+        bits.consume(3);
+    }
+
+    // Build code length table
+    let cl_table = build_code_length_table(&code_length_lengths)?;
+
+    // Read literal/length and distance code lengths
+    let mut all_lengths = [0u8; 286 + 32];
+    let mut i = 0;
+    while i < hlit + hdist {
+        bits.refill();
+        let entry = cl_table[(bits.peek() & 0x7F) as usize];
+        let symbol = (entry >> 8) as u8;
+        let len = (entry & 0xFF) as u8;
+        bits.consume(len as u32);
+
+        match symbol {
+            0..=15 => {
+                all_lengths[i] = symbol;
+                i += 1;
+            }
+            16 => {
+                let repeat = 3 + (bits.peek() & 3) as usize;
+                bits.consume(2);
+                let prev = if i > 0 { all_lengths[i - 1] } else { 0 };
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = prev;
+                    i += 1;
+                }
+            }
+            17 => {
+                let repeat = 3 + (bits.peek() & 7) as usize;
+                bits.consume(3);
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            18 => {
+                let repeat = 11 + (bits.peek() & 0x7F) as usize;
+                bits.consume(7);
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Invalid code length symbol: {}", symbol),
+                ));
+            }
+        }
+    }
+
+    let litlen_lengths = &all_lengths[..hlit];
+    let dist_lengths = &all_lengths[hlit..];
+
+    // Build Huffman tables
+    let litlen_table = LitLenTable::build(litlen_lengths)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid litlen table"))?;
+    let dist_table = DistTable::build(dist_lengths)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid dist table"))?;
+
+    // Decode using ASM v3 decoder
+    crate::asm_decode::decode_huffman_asm_v3(bits, output, out_pos, &litlen_table, &dist_table)
+}
+
+// ============================================================================
+// ASM V4: LLVM-Parity Decoder Entry Points
+// ============================================================================
+
+/// Decode a deflate stream using ASM v4 (LLVM-parity)
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn inflate_consume_first_asm_v4(input: &[u8], output: &mut [u8]) -> Result<usize> {
+    let mut bits = Bits::new(input);
+    let out_size = inflate_consume_first_bits_asm_v4(&mut bits, output)?;
+    Ok(out_size)
+}
+
+/// Decode a deflate stream using ASM v4 (LLVM-parity)
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn inflate_consume_first_bits_asm_v4(bits: &mut Bits, output: &mut [u8]) -> Result<usize> {
+    let mut out_pos = 0;
+
+    loop {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+
+        let bfinal = (bits.peek() & 1) != 0;
+        let btype = ((bits.peek() >> 1) & 3) as u8;
+        bits.consume(3);
+
+        match btype {
+            0 => out_pos = decode_stored(bits, output, out_pos)?,
+            1 => out_pos = decode_fixed_asm_v4(bits, output, out_pos)?,
+            2 => out_pos = decode_dynamic_asm_v4(bits, output, out_pos)?,
+            3 => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type")),
+            _ => unreachable!(),
+        }
+
+        if bfinal {
+            break;
+        }
+    }
+
+    Ok(out_pos)
+}
+
+/// Decode fixed Huffman block using ASM v4
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn decode_fixed_asm_v4(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    let (litlen, dist) = crate::libdeflate_decode::get_fixed_tables();
+    crate::asm_decode::decode_huffman_asm_v4(bits, output, out_pos, litlen, dist)
+}
+
+/// Decode dynamic Huffman block using ASM v4
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn decode_dynamic_asm_v4(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    // Read dynamic Huffman table header
+    if bits.available() < 14 {
+        bits.refill();
+    }
+
+    let hlit = ((bits.peek() & 0x1F) as usize) + 257;
+    bits.consume(5);
+    let hdist = ((bits.peek() & 0x1F) as usize) + 1;
+    bits.consume(5);
+    let hclen = ((bits.peek() & 0xF) as usize) + 4;
+    bits.consume(4);
+
+    // Read code length code lengths
+    const CODE_LENGTH_ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+    let mut code_length_lengths = [0u8; 19];
+    for i in 0..hclen {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+        code_length_lengths[CODE_LENGTH_ORDER[i]] = (bits.peek() & 7) as u8;
+        bits.consume(3);
+    }
+
+    // Build code length table
+    let cl_table = build_code_length_table(&code_length_lengths)?;
+
+    // Read literal/length and distance code lengths
+    let mut all_lengths = [0u8; 286 + 32];
+    let mut i = 0;
+    while i < hlit + hdist {
+        bits.refill();
+        let entry = cl_table[(bits.peek() & 0x7F) as usize];
+        let symbol = (entry >> 8) as u8;
+        let len = (entry & 0xFF) as u8;
+        bits.consume(len as u32);
+
+        match symbol {
+            0..=15 => {
+                all_lengths[i] = symbol;
+                i += 1;
+            }
+            16 => {
+                if i == 0 {
+                    return Err(Error::new(ErrorKind::InvalidData, "Invalid repeat"));
+                }
+                let repeat = 3 + (bits.peek() & 3) as usize;
+                bits.consume(2);
+                let val = all_lengths[i - 1];
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = val;
+                    i += 1;
+                }
+            }
+            17 => {
+                let repeat = 3 + (bits.peek() & 7) as usize;
+                bits.consume(3);
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            18 => {
+                let repeat = 11 + (bits.peek() & 0x7F) as usize;
+                bits.consume(7);
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Invalid code length symbol: {}", symbol),
+                ));
+            }
+        }
+    }
+
+    let litlen_lengths = &all_lengths[..hlit];
+    let dist_lengths = &all_lengths[hlit..];
+
+    // Build Huffman tables
+    let litlen_table = LitLenTable::build(litlen_lengths)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid litlen table"))?;
+    let dist_table = DistTable::build(dist_lengths)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid dist table"))?;
+
+    // Decode using ASM v4 decoder
+    crate::asm_decode::decode_huffman_asm_v4(bits, output, out_pos, &litlen_table, &dist_table)
+}
+
+// ============================================================================
+// ASM v5 (LLVM-optimized with BFXIL, CCMP, batched literals)
+// ============================================================================
+
+/// Decode a deflate stream using ASM v5 (LLVM-optimized)
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn inflate_consume_first_asm_v5(input: &[u8], output: &mut [u8]) -> Result<usize> {
+    let mut bits = Bits::new(input);
+    let out_size = inflate_consume_first_bits_asm_v5(&mut bits, output)?;
+    Ok(out_size)
+}
+
+/// Decode a deflate stream using ASM v5 (LLVM-optimized)
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn inflate_consume_first_bits_asm_v5(bits: &mut Bits, output: &mut [u8]) -> Result<usize> {
+    let mut out_pos = 0;
+
+    loop {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+
+        let bfinal = (bits.peek() & 1) != 0;
+        let btype = ((bits.peek() >> 1) & 3) as u8;
+        bits.consume(3);
+
+        match btype {
+            0 => out_pos = decode_stored(bits, output, out_pos)?,
+            1 => out_pos = decode_fixed_asm_v5(bits, output, out_pos)?,
+            2 => out_pos = decode_dynamic_asm_v5(bits, output, out_pos)?,
+            3 => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type")),
+            _ => unreachable!(),
+        }
+
+        if bfinal {
+            break;
+        }
+    }
+
+    Ok(out_pos)
+}
+
+/// Decode fixed Huffman block using ASM v5
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn decode_fixed_asm_v5(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    let (litlen, dist) = crate::libdeflate_decode::get_fixed_tables();
+    crate::asm_decode::decode_huffman_asm_v5(bits, output, out_pos, litlen, dist)
+}
+
+/// Decode dynamic Huffman block using ASM v5
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn decode_dynamic_asm_v5(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    // Read dynamic Huffman table header
+    if bits.available() < 14 {
+        bits.refill();
+    }
+
+    let hlit = ((bits.peek() & 0x1F) as usize) + 257;
+    bits.consume(5);
+    let hdist = ((bits.peek() & 0x1F) as usize) + 1;
+    bits.consume(5);
+    let hclen = ((bits.peek() & 0xF) as usize) + 4;
+    bits.consume(4);
+
+    // Read code length code lengths
+    const CODE_LENGTH_ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+    let mut code_length_lengths = [0u8; 19];
+    for i in 0..hclen {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+        code_length_lengths[CODE_LENGTH_ORDER[i]] = (bits.peek() & 7) as u8;
+        bits.consume(3);
+    }
+
+    // Build code length table
+    let cl_table = build_code_length_table(&code_length_lengths)?;
+
+    // Read literal/length and distance code lengths
+    let mut all_lengths = [0u8; 286 + 32];
+    let mut i = 0;
+    while i < hlit + hdist {
+        bits.refill();
+        let entry = cl_table[(bits.peek() & 0x7F) as usize];
+        let symbol = entry >> 8;
+        let code_bits = entry & 0xFF;
+        bits.consume(code_bits as u32);
+
+        match symbol {
+            0..=15 => {
+                all_lengths[i] = symbol as u8;
+                i += 1;
+            }
+            16 => {
+                if i == 0 {
+                    return Err(Error::new(ErrorKind::InvalidData, "Invalid repeat"));
+                }
+                let repeat = 3 + (bits.peek() & 3) as usize;
+                bits.consume(2);
+                let last = all_lengths[i - 1];
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = last;
+                    i += 1;
+                }
+            }
+            17 => {
+                let repeat = 3 + (bits.peek() & 7) as usize;
+                bits.consume(3);
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            18 => {
+                let repeat = 11 + (bits.peek() & 0x7F) as usize;
+                bits.consume(7);
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Invalid code length symbol: {}", symbol),
+                ));
+            }
+        }
+    }
+
+    let litlen_lengths = &all_lengths[..hlit];
+    let dist_lengths = &all_lengths[hlit..];
+
+    // Build Huffman tables
+    let litlen_table = LitLenTable::build(litlen_lengths)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid litlen table"))?;
+    let dist_table = DistTable::build(dist_lengths)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid dist table"))?;
+
+    // Decode using ASM v5 decoder
+    crate::asm_decode::decode_huffman_asm_v5(bits, output, out_pos, &litlen_table, &dist_table)
+}
+
+// ============================================================================
+// ASM v6 (libdeflate C LLVM-compiled ASM in Rust)
+// ============================================================================
+
+/// Decode a deflate stream using ASM v6 (libdeflate C ASM)
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn inflate_consume_first_asm_v6(input: &[u8], output: &mut [u8]) -> Result<usize> {
+    let mut bits = Bits::new(input);
+    let out_size = inflate_consume_first_bits_asm_v6(&mut bits, output)?;
+    Ok(out_size)
+}
+
+/// Decode a deflate stream using ASM v6 (libdeflate C ASM)
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn inflate_consume_first_bits_asm_v6(bits: &mut Bits, output: &mut [u8]) -> Result<usize> {
+    let mut out_pos = 0;
+
+    loop {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+
+        let bfinal = (bits.peek() & 1) != 0;
+        let btype = ((bits.peek() >> 1) & 3) as u8;
+        bits.consume(3);
+
+        match btype {
+            0 => out_pos = decode_stored(bits, output, out_pos)?,
+            1 => out_pos = decode_fixed_asm_v6(bits, output, out_pos)?,
+            2 => out_pos = decode_dynamic_asm_v6(bits, output, out_pos)?,
+            3 => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type")),
+            _ => unreachable!(),
+        }
+
+        if bfinal {
+            break;
+        }
+    }
+
+    Ok(out_pos)
+}
+
+/// Decode fixed Huffman block using ASM v6
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn decode_fixed_asm_v6(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    let (litlen, dist) = crate::libdeflate_decode::get_fixed_tables();
+    crate::asm_decode::decode_huffman_asm_v6(bits, output, out_pos, litlen, dist)
+}
+
+/// Decode dynamic Huffman block using ASM v6
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn decode_dynamic_asm_v6(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    // Read dynamic Huffman table header
+    if bits.available() < 14 {
+        bits.refill();
+    }
+
+    let hlit = ((bits.peek() & 0x1F) as usize) + 257;
+    bits.consume(5);
+    let hdist = ((bits.peek() & 0x1F) as usize) + 1;
+    bits.consume(5);
+    let hclen = ((bits.peek() & 0xF) as usize) + 4;
+    bits.consume(4);
+
+    // Read code length code lengths
+    const CODE_LENGTH_ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+    let mut code_length_lengths = [0u8; 19];
+    for i in 0..hclen {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+        code_length_lengths[CODE_LENGTH_ORDER[i]] = (bits.peek() & 7) as u8;
+        bits.consume(3);
+    }
+
+    // Build code length table
+    let cl_table = build_code_length_table(&code_length_lengths)?;
+
+    // Read literal/length and distance code lengths
+    let mut all_lengths = [0u8; 286 + 32];
+    let mut i = 0;
+    while i < hlit + hdist {
+        bits.refill();
+        let entry = cl_table[(bits.peek() & 0x7F) as usize];
+        let symbol = entry >> 8;
+        let code_bits = entry & 0xFF;
+        bits.consume(code_bits as u32);
+
+        match symbol {
+            0..=15 => {
+                all_lengths[i] = symbol as u8;
+                i += 1;
+            }
+            16 => {
+                if i == 0 {
+                    return Err(Error::new(ErrorKind::InvalidData, "Invalid repeat"));
+                }
+                let repeat = 3 + (bits.peek() & 3) as usize;
+                bits.consume(2);
+                let last = all_lengths[i - 1];
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = last;
+                    i += 1;
+                }
+            }
+            17 => {
+                let repeat = 3 + (bits.peek() & 7) as usize;
+                bits.consume(3);
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            18 => {
+                let repeat = 11 + (bits.peek() & 0x7F) as usize;
+                bits.consume(7);
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Invalid code length symbol: {}", symbol),
+                ));
+            }
+        }
+    }
+
+    let litlen_lengths = &all_lengths[..hlit];
+    let dist_lengths = &all_lengths[hlit..];
+
+    // Build Huffman tables
+    let litlen_table = LitLenTable::build(litlen_lengths)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid litlen table"))?;
+    let dist_table = DistTable::build(dist_lengths)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid dist table"))?;
+
+    // Decode using ASM v6 decoder
+    crate::asm_decode::decode_huffman_asm_v6(bits, output, out_pos, &litlen_table, &dist_table)
+}
+
+// ============================================================================
+// ASM v7 (Hyperoptimized via mathematical analysis)
+// ============================================================================
+
+/// Decode a deflate stream using ASM v7 (hyperoptimized)
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+pub fn inflate_consume_first_asm_v7(input: &[u8], output: &mut [u8]) -> Result<usize> {
+    let mut bits = Bits::new(input);
+    let out_size = inflate_consume_first_bits_asm_v7(&mut bits, output)?;
+    Ok(out_size)
+}
+
+/// Decode a deflate stream using ASM v7 (hyperoptimized)
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn inflate_consume_first_bits_asm_v7(bits: &mut Bits, output: &mut [u8]) -> Result<usize> {
+    let mut out_pos = 0;
+
+    loop {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+
+        let bfinal = (bits.peek() & 1) != 0;
+        let btype = ((bits.peek() >> 1) & 3) as u8;
+        bits.consume(3);
+
+        match btype {
+            0 => out_pos = decode_stored(bits, output, out_pos)?,
+            1 => out_pos = decode_fixed_asm_v7(bits, output, out_pos)?,
+            2 => out_pos = decode_dynamic_asm_v7(bits, output, out_pos)?,
+            3 => return Err(Error::new(ErrorKind::InvalidData, "Reserved block type")),
+            _ => unreachable!(),
+        }
+
+        if bfinal {
+            break;
+        }
+    }
+
+    Ok(out_pos)
+}
+
+/// Decode fixed Huffman block using ASM v7
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn decode_fixed_asm_v7(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    let (litlen, dist) = crate::libdeflate_decode::get_fixed_tables();
+    crate::asm_decode::decode_huffman_asm_v7(bits, output, out_pos, litlen, dist)
+}
+
+/// Decode dynamic Huffman block using ASM v7
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn decode_dynamic_asm_v7(bits: &mut Bits, output: &mut [u8], out_pos: usize) -> Result<usize> {
+    // Read dynamic Huffman table header
+    if bits.available() < 14 {
+        bits.refill();
+    }
+
+    let hlit = ((bits.peek() & 0x1F) as usize) + 257;
+    bits.consume(5);
+    let hdist = ((bits.peek() & 0x1F) as usize) + 1;
+    bits.consume(5);
+    let hclen = ((bits.peek() & 0xF) as usize) + 4;
+    bits.consume(4);
+
+    // Read code length code lengths
+    const CODE_LENGTH_ORDER: [usize; 19] = [
+        16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
+    ];
+    let mut code_length_lengths = [0u8; 19];
+    for i in 0..hclen {
+        if bits.available() < 3 {
+            bits.refill();
+        }
+        code_length_lengths[CODE_LENGTH_ORDER[i]] = (bits.peek() & 7) as u8;
+        bits.consume(3);
+    }
+
+    // Build code length table
+    let cl_table = build_code_length_table(&code_length_lengths)?;
+
+    // Read literal/length and distance code lengths
+    let mut all_lengths = [0u8; 286 + 32];
+    let mut i = 0;
+    while i < hlit + hdist {
+        bits.refill();
+        let entry = cl_table[(bits.peek() & 0x7F) as usize];
+        let symbol = entry >> 8;
+        let code_bits = entry & 0xFF;
+        bits.consume(code_bits as u32);
+
+        match symbol {
+            0..=15 => {
+                all_lengths[i] = symbol as u8;
+                i += 1;
+            }
+            16 => {
+                if i == 0 {
+                    return Err(Error::new(ErrorKind::InvalidData, "Invalid repeat"));
+                }
+                let repeat = 3 + (bits.peek() & 3) as usize;
+                bits.consume(2);
+                let last = all_lengths[i - 1];
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = last;
+                    i += 1;
+                }
+            }
+            17 => {
+                let repeat = 3 + (bits.peek() & 7) as usize;
+                bits.consume(3);
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            18 => {
+                let repeat = 11 + (bits.peek() & 0x7F) as usize;
+                bits.consume(7);
+                for _ in 0..repeat {
+                    if i >= hlit + hdist {
+                        break;
+                    }
+                    all_lengths[i] = 0;
+                    i += 1;
+                }
+            }
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Invalid code length symbol: {}", symbol),
+                ));
+            }
+        }
+    }
+
+    let litlen_lengths = &all_lengths[..hlit];
+    let dist_lengths = &all_lengths[hlit..];
+
+    // Build Huffman tables
+    let litlen_table = LitLenTable::build(litlen_lengths)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid litlen table"))?;
+    let dist_table = DistTable::build(dist_lengths)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidData, "Invalid dist table"))?;
+
+    // Decode using ASM v7 decoder
+    crate::asm_decode::decode_huffman_asm_v7(bits, output, out_pos, &litlen_table, &dist_table)
 }
 
 /// Decode a deflate stream from a Bits reader
